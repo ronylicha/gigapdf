@@ -2,11 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   IMPORT_CONCURRENCY,
   MAX_IMPORT_FILE_SIZE_BYTES,
+  batchCurrentFileName,
+  batchPercent,
+  createBatchProgress,
   getFileExtension,
   isImageFile,
   isOfficeFile,
   isPdfFile,
   isTextModelFile,
+  progressWithCurrentFile,
+  progressWithFileFraction,
+  progressWithFileSettled,
   runWithConcurrency,
   stripExtension,
   summarizeOutcomes,
@@ -250,5 +256,94 @@ describe("summarizeOutcomes", () => {
     const summary = summarizeOutcomes(outcomes);
     expect(summary.successCount).toBe(0);
     expect(summary.failures).toHaveLength(1);
+  });
+});
+
+describe("batch upload progress model (byte-accurate)", () => {
+  const files = [
+    { name: "small.pdf", size: 100 },
+    { name: "big.pdf", size: 300 },
+  ];
+
+  it("createBatchProgress initializes counters, weights and fractions", () => {
+    const progress = createBatchProgress(files);
+    expect(progress.done).toBe(0);
+    expect(progress.total).toBe(2);
+    expect(progress.totalBytes).toBe(400);
+    expect(progress.fileNames).toEqual(["small.pdf", "big.pdf"]);
+    expect(progress.fileSizes).toEqual([100, 300]);
+    expect(progress.fileFractions).toEqual([0, 0]);
+    expect(progress.currentIndex).toBe(0);
+    expect(batchPercent(progress)).toBe(0);
+  });
+
+  it("weights the global percent by CUMULATED BYTES, not by file count", () => {
+    // small.pdf fully sent (100 B), big.pdf half sent (150 B of 300 B):
+    // (100 + 150) / 400 = 62.5% → 63. A per-file counter would say 50%.
+    let progress = createBatchProgress(files);
+    progress = progressWithFileFraction(progress, 0, 1);
+    progress = progressWithFileFraction(progress, 1, 0.5);
+    expect(batchPercent(progress)).toBe(63);
+  });
+
+  it("moves with a SINGLE large file (the historical stuck-at-0% bug)", () => {
+    let progress = createBatchProgress([{ name: "huge.pdf", size: 1_000 }]);
+    expect(batchPercent(progress)).toBe(0);
+    progress = progressWithFileFraction(progress, 0, 0.4);
+    expect(batchPercent(progress)).toBe(40);
+    progress = progressWithFileFraction(progress, 0, 0.9);
+    expect(batchPercent(progress)).toBe(90);
+  });
+
+  it("fractions are monotonic: a two-phase pipeline never moves the bar backwards", () => {
+    let progress = createBatchProgress(files);
+    progress = progressWithFileFraction(progress, 0, 0.8);
+    // Conversion done, the store upload restarts its own byte counter at 0.
+    progress = progressWithFileFraction(progress, 0, 0.2);
+    expect(progress.fileFractions[0]).toBe(0.8);
+  });
+
+  it("clamps fractions to 1", () => {
+    let progress = createBatchProgress(files);
+    progress = progressWithFileFraction(progress, 0, 3);
+    expect(progress.fileFractions[0]).toBe(1);
+  });
+
+  it("progressWithFileSettled bumps done and forces the fraction to 1", () => {
+    let progress = createBatchProgress(files);
+    progress = progressWithFileFraction(progress, 0, 0.3);
+    progress = progressWithFileSettled(progress, 0);
+    expect(progress.done).toBe(1);
+    expect(progress.fileFractions[0]).toBe(1);
+    expect(batchPercent(progress)).toBe(25); // 100/400 bytes
+  });
+
+  it("progressWithCurrentFile drives the file-name label", () => {
+    let progress = createBatchProgress(files);
+    progress = progressWithCurrentFile(progress, 1);
+    expect(batchCurrentFileName(progress)).toBe("big.pdf");
+  });
+
+  it("returns the same reference when nothing changes (no useless re-render)", () => {
+    const progress = createBatchProgress(files);
+    expect(progressWithFileFraction(progress, 0, 0)).toBe(progress);
+    expect(progressWithCurrentFile(progress, 0)).toBe(progress);
+  });
+
+  it("falls back to per-file granularity when no byte total is known", () => {
+    let progress = createBatchProgress([
+      { name: "a", size: 0 },
+      { name: "b", size: 0 },
+    ]);
+    expect(batchPercent(progress)).toBe(0);
+    progress = progressWithFileSettled(progress, 0);
+    expect(batchPercent(progress)).toBe(50);
+  });
+
+  it("is immutable: updates never touch the previous snapshot", () => {
+    const progress = createBatchProgress(files);
+    const updated = progressWithFileFraction(progress, 0, 0.5);
+    expect(progress.fileFractions).toEqual([0, 0]);
+    expect(updated.fileFractions).toEqual([0.5, 0]);
   });
 });

@@ -1,6 +1,6 @@
 {
   "name": "giga-pdf",
-  "version": "1.22.0",
+  "version": "1.23.0",
   "private": true,
   "packageManager": "pnpm@10.28.0",
   "description": "Giga-PDF - WYSIWYG PDF Editing Platform",

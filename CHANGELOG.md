@@ -5,6 +5,48 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.0] - 2026-07-03
+
+### Fixed — conversion fidelity, both directions (engine 0.115.0)
+
+- **Word bullet lists show their bullets** — and more broadly, the text layer
+  of every Office-converted document no longer garbles bullets, accents, € or
+  dashes (a font table bug declared `•` as `¥` in the extracted text of ALL
+  converted documents). Numbered lists keep their real format (`1.` vs `a)`),
+  start values and nesting, in imports AND exports.
+- **Exports to formats other than PDF keep their formatting** — exported Word
+  files open in Word/LibreOffice again (they were refused whenever a header
+  contained a line), margins are sane, a one-column letter no longer comes out
+  as two columns, images land at their exact position instead of inline at a
+  default size, page numbers become live fields, and PowerPoint exports carry
+  positioned images and shapes instead of empty slides.
+- **Real-world files open at all**: documents saved with streaming zip
+  archives (many real Word/Excel/PowerPoint files, and every LibreOffice
+  ODT/ODP) previously imported as empty; presentations now paginate one slide
+  per page (an 11-slide deck no longer collapses onto one unreadable page)
+  with their images and true 16:9 geometry.
+- **Opening a Word file looks like Word**: strikethrough, highlight,
+  superscript/subscript now render; tables get their cell shading, real
+  borders and merged cells; headers and footers repeat on every page with
+  live page numbers; two-column sections render in two columns.
+
+### Fixed — file upload: live progress and reliable completion
+
+- **The progress bar actually moves** during upload: progress is now measured
+  in bytes sent (per file and cumulative across a batch), not per completed
+  file — a single large file no longer sits at 0 % until the end.
+- **The import dialog and full-screen overlay always close**: post-upload
+  enrichment steps are time-boxed, every path (success, error, cancel) resets
+  the UI, failures are listed inline with a retry hint instead of locking the
+  dialog, and a working **Cancel** button aborts the batch.
+
+### Added — zero-downtime deployments (infrastructure)
+
+- Deploys now build in a separate release while the site keeps serving, then
+  switch atomically (blue/green with health gates and instant rollback).
+  Measured during the migration itself: 970/970 requests answered 200 —
+  the brief maintenance flashes some users saw during deploys are gone.
+
 ## [1.22.0] - 2026-07-03
 
 ### Added — the editor works on a phone

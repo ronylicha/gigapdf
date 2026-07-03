@@ -12,8 +12,13 @@ import {
   DialogTitle,
   Progress,
 } from "@giga-pdf/ui";
-import { UploadCloud, FilePlus2, X } from "lucide-react";
-import { MAX_IMPORT_FILE_SIZE_BYTES } from "@/lib/document-import";
+import { UploadCloud, FilePlus2, X, AlertCircle } from "lucide-react";
+import {
+  MAX_IMPORT_FILE_SIZE_BYTES,
+  batchCurrentFileName,
+  batchPercent,
+  type BatchUploadProgress,
+} from "@/lib/document-import";
 
 interface ImportDialogProps {
   open: boolean;
@@ -22,8 +27,15 @@ interface ImportDialogProps {
   onFilesSelected: (files: File[]) => void;
   /** True while a batch is uploading (drives the progress + disabled state). */
   uploading: boolean;
-  /** Exact batch progress (one tick per settled file), null when idle. */
-  progress: { done: number; total: number } | null;
+  /** Byte-accurate batch progress (real bytes sent), null when idle. */
+  progress: BatchUploadProgress | null;
+  /**
+   * Failures of the last settled batch (the dialog stays open on failure so
+   * the user can read the reasons and retry via re-drop / browse).
+   */
+  failures: ReadonlyArray<{ name: string; reason: string }> | null;
+  /** Abort the in-flight batch (Annuler button while uploading). */
+  onCancel: () => void;
   /** Destination folder display path (e.g. "/", "/Invoices"). */
   destinationPath: string;
 }
@@ -40,6 +52,8 @@ export function ImportDialog({
   onFilesSelected,
   uploading,
   progress,
+  failures,
+  onCancel,
   destinationPath,
 }: ImportDialogProps) {
   const t = useTranslations("documents.import");
@@ -86,9 +100,11 @@ export function ImportDialog({
   );
 
   const maxSizeMb = Math.floor(MAX_IMPORT_FILE_SIZE_BYTES / (1024 * 1024));
-  const percent = progress && progress.total > 0
-    ? Math.round((progress.done / progress.total) * 100)
-    : 0;
+  // Byte-accurate percent (real bytes sent, weighted by file size). When no
+  // byte total is known the bar falls back to an indeterminate pulse.
+  const percent = progress ? batchPercent(progress) : 0;
+  const indeterminate = progress !== null && progress.totalBytes <= 0;
+  const currentFileName = progress ? batchCurrentFileName(progress) : null;
 
   return (
     <Dialog
@@ -169,26 +185,68 @@ export function ImportDialog({
 
         {uploading && progress && (
           <div className="space-y-2" aria-live="polite">
+            {currentFileName && (
+              <p className="text-sm text-muted-foreground truncate">
+                {t("currentFile", { name: currentFileName })}
+              </p>
+            )}
             <div className="flex items-center justify-between text-sm text-muted-foreground">
               <span>{t("uploadingProgress", {
                 done: progress.done,
                 total: progress.total,
               })}</span>
-              <span>{percent}%</span>
+              {!indeterminate && <span>{percent}%</span>}
             </div>
-            <Progress value={percent} />
+            {indeterminate ? (
+              <Progress value={100} className="animate-pulse" />
+            ) : (
+              <Progress value={percent} />
+            )}
+          </div>
+        )}
+
+        {/* Last batch's failures: the dialog stays open on failure so the
+            user can read the per-file reasons and retry (re-drop / browse). */}
+        {!uploading && failures && failures.length > 0 && (
+          <div
+            role="alert"
+            className="space-y-1 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm"
+          >
+            <p className="flex items-center gap-2 font-medium text-destructive">
+              <AlertCircle className="h-4 w-4 shrink-0" aria-hidden="true" />
+              {t("failuresTitle")}
+            </p>
+            <ul className="space-y-0.5 text-muted-foreground">
+              {failures.map((failure, index) => (
+                <li key={`${failure.name}-${index}`} className="truncate">
+                  {failure.name} : {failure.reason}
+                </li>
+              ))}
+            </ul>
+            <p className="text-muted-foreground">{t("retryHint")}</p>
           </div>
         )}
 
         <DialogFooter>
-          <Button
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={uploading}
-          >
-            <X className="mr-2 h-4 w-4" aria-hidden="true" />
-            {t("close")}
-          </Button>
+          {uploading ? (
+            <Button
+              variant="outline"
+              onClick={onCancel}
+              className="pointer-coarse:min-h-11 pointer-coarse:min-w-11"
+            >
+              <X className="mr-2 h-4 w-4" aria-hidden="true" />
+              {t("cancel")}
+            </Button>
+          ) : (
+            <Button
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              className="pointer-coarse:min-h-11 pointer-coarse:min-w-11"
+            >
+              <X className="mr-2 h-4 w-4" aria-hidden="true" />
+              {t("close")}
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

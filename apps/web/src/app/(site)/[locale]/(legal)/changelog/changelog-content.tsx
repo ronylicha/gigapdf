@@ -15,6 +15,18 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.23.0",
+    date: "2026-07-03",
+    type: "minor",
+    changes: [
+      { type: "fix", description: "Word bullet lists show their bullets — and the text layer of every Office-converted document no longer garbles bullets, accents, € or dashes (a font-table bug declared • as ¥ in ALL converted documents). Numbered lists keep their real format (1. vs a)), start values and nesting, in imports AND exports (engine 0.115.0)." },
+      { type: "fix", description: "Exports to formats other than PDF keep their formatting: exported Word files open again in Word/LibreOffice, margins are sane, a one-column letter no longer comes out as two columns, images land at their exact position, page numbers become live fields, and PowerPoint exports carry positioned images and shapes instead of empty slides." },
+      { type: "fix", description: "Real-world Office files open at all: streaming zip archives (many real Word/Excel/PowerPoint files, every LibreOffice ODT/ODP) imported as empty; presentations now paginate one slide per page with their images and true 16:9 geometry. Opening a Word file looks like Word: strikethrough, highlight, super/subscript, table shading/borders/merges, headers and footers repeated on every page with live page numbers, real two-column sections." },
+      { type: "fix", description: "File upload: the progress bar moves in real time (bytes sent, cumulative across a batch) and the import dialog/overlay always close — every path (success, error, cancel) resets the UI, failures are listed inline with a retry hint, and a working Cancel button aborts the batch." },
+      { type: "improvement", description: "Zero-downtime deployments: the site keeps serving while a new release builds, then switches atomically (blue/green with health gates and instant rollback) — the brief maintenance flashes some users saw during deploys are gone." },
+    ],
+  },
+  {
     version: "1.22.0",
     date: "2026-07-03",
     type: "minor",

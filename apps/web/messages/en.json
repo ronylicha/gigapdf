@@ -1057,7 +1057,12 @@
       "image": {
         "conversionFailed": "Could not convert this image to PDF",
         "unavailable": "Image conversion is temporarily unavailable"
-      }
+      },
+      "cancel": "Cancel",
+      "cancelled": "Import cancelled",
+      "currentFile": "Uploading {name}…",
+      "failuresTitle": "Files not imported",
+      "retryHint": "Drop your files again or browse to retry."
     },
     "ocr": {
       "title": "Make searchable (OCR)",

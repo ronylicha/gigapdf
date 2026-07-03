@@ -8,6 +8,10 @@
 
 import type { DocumentObject } from "@giga-pdf/types";
 import { getAuthToken, invalidateAuthToken } from "./auth-token";
+import {
+  uploadWithProgress,
+  type UploadProgressEvent,
+} from "./upload-with-progress";
 
 export type { DocumentObject };
 export { getAuthToken, invalidateAuthToken };
@@ -221,6 +225,61 @@ class APIClient {
     return response.json();
   }
 
+  /**
+   * Multipart upload variant of `request()` with REAL byte-level progress.
+   * fetch() cannot report request-body progress, so uploads that drive a
+   * progress bar go through the XHR transport (`uploadWithProgress`) instead.
+   * Auth (Bearer + cookies), the single 401 retry, and error shaping are
+   * strictly identical to `request()`.
+   */
+  private async uploadRequest<T>(
+    endpoint: string,
+    formData: FormData,
+    options: {
+      onProgress?: (event: UploadProgressEvent) => void;
+      signal?: AbortSignal;
+    } = {},
+  ): Promise<T> {
+    const url = `${this.baseUrl}${endpoint}`;
+
+    const send = (bearer: string | null) =>
+      uploadWithProgress(url, formData, {
+        headers: bearer ? { Authorization: `Bearer ${bearer}` } : undefined,
+        onProgress: options.onProgress,
+        signal: options.signal,
+      });
+
+    const token = await getAuthToken();
+    let response = await send(token);
+
+    // On 401, invalidate token and retry once (token may have expired).
+    // FormData bodies are reusable, so resending the same instance is safe.
+    if (response.status === 401 && token) {
+      invalidateAuthToken();
+      const freshToken = await getAuthToken();
+      if (freshToken && freshToken !== token) {
+        response = await send(freshToken);
+      }
+    }
+
+    if (!response.ok) {
+      const error = await response
+        .json<{ detail?: string; message?: string }>()
+        .catch(() => ({}) as { detail?: string; message?: string });
+      const err = new Error(
+        error.detail || error.message || `HTTP ${response.status}`,
+      ) as Error & { status: number };
+      err.status = response.status;
+      throw err;
+    }
+
+    if (response.status === 204) {
+      return {} as T;
+    }
+
+    return response.json<T>();
+  }
+
   // ===== Storage/Documents API =====
 
   async listDocuments(params: {
@@ -320,14 +379,15 @@ class APIClient {
   async uploadDocumentThumbnail(
     storedDocumentId: string,
     image: Blob,
-    fileName: string = "thumbnail.png"
+    fileName: string = "thumbnail.png",
+    options: { signal?: AbortSignal } = {}
   ): Promise<{ thumbnail_url: string | null }> {
     const fd = new FormData();
     fd.append("file", image, fileName);
 
     const response = await this.request<APIResponse<{ thumbnail_url: string | null }>>(
       `/api/v1/storage/documents/${storedDocumentId}/thumbnail`,
-      { method: "POST", body: fd }
+      { method: "POST", body: fd, signal: options.signal }
     );
     return response.data;
   }
@@ -399,6 +459,10 @@ class APIClient {
     versionComment?: string;
     /** Plain text content for full-text search (truncated server-side to 500k chars). */
     extractedText?: string;
+    /** Byte-level upload progress (XHR transport — fetch cannot report it). */
+    onProgress?: (event: UploadProgressEvent) => void;
+    /** Abort the in-flight upload (user cancel). */
+    signal?: AbortSignal;
   }): Promise<{
     stored_document_id: string;
     name: string;
@@ -415,15 +479,15 @@ class APIClient {
     if (params.extractedText) fd.append("extracted_text", params.extractedText);
 
     // NOTE: no Content-Type header — the browser sets multipart/form-data with boundary automatically
-    const response = await this.request<APIResponse<{
+    const response = await this.uploadRequest<APIResponse<{
       stored_document_id: string;
       name: string;
       page_count: number;
       version_number: number;
       created_at: string;
-    }>>("/api/v1/storage/documents", {
-      method: "POST",
-      body: fd,
+    }>>("/api/v1/storage/documents", fd, {
+      onProgress: params.onProgress,
+      signal: params.signal,
     });
     return response.data;
   }
@@ -537,6 +601,10 @@ class APIClient {
     extract_text?: boolean;
     ocr_enabled?: boolean;
     generate_previews?: boolean;
+    /** Byte-level upload progress (XHR transport — fetch cannot report it). */
+    onProgress?: (event: UploadProgressEvent) => void;
+    /** Abort the in-flight upload (user cancel). */
+    signal?: AbortSignal;
   } = {}): Promise<{
     document_id: string;
     status: string;
@@ -556,7 +624,7 @@ class APIClient {
     formData.append("ocr_enabled", String(options.ocr_enabled ?? false));
     formData.append("generate_previews", String(options.generate_previews ?? true));
 
-    const response = await this.request<APIResponse<{
+    const response = await this.uploadRequest<APIResponse<{
       document_id: string;
       status: string;
       document: {
@@ -567,9 +635,9 @@ class APIClient {
           is_encrypted: boolean;
         };
       };
-    }>>("/api/v1/documents/upload", {
-      method: "POST",
-      body: formData,
+    }>>("/api/v1/documents/upload", formData, {
+      onProgress: options.onProgress,
+      signal: options.signal,
     });
     return response.data;
   }

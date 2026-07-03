@@ -192,6 +192,117 @@ export async function runWithConcurrency<T, R>(
   return results;
 }
 
+// ---------------------------------------------------------------------------
+// Byte-accurate batch progress model (pure, immutable, unit-tested).
+//
+// The old model counted settled FILES (done/total): with a single large file
+// the bar sat at 0% for the whole transfer then jumped to 100%. This model
+// weights every file by its byte size and tracks a 0..1 upload fraction per
+// file, so the global percent moves with the actual bytes sent.
+// ---------------------------------------------------------------------------
+
+/** Immutable snapshot of a batch import's progress. */
+export interface BatchUploadProgress {
+  /** Files fully settled (success OR failure). */
+  done: number;
+  /** Total files in the batch. */
+  total: number;
+  /** Sum of the original file sizes (bytes) — the progress weights. */
+  totalBytes: number;
+  /** Original file names, by batch index. */
+  fileNames: readonly string[];
+  /** Original file sizes (bytes), by batch index. */
+  fileSizes: readonly number[];
+  /** Monotonic 0..1 upload fraction per file, by batch index. */
+  fileFractions: readonly number[];
+  /** Index of the most recently started file (for the "uploading X…" label). */
+  currentIndex: number | null;
+}
+
+/** Fresh progress snapshot for a new batch. */
+export function createBatchProgress(
+  files: ReadonlyArray<{ name: string; size: number }>,
+): BatchUploadProgress {
+  const fileSizes = files.map((file) => Math.max(0, file.size));
+  return {
+    done: 0,
+    total: files.length,
+    totalBytes: fileSizes.reduce((acc, size) => acc + size, 0),
+    fileNames: files.map((file) => file.name),
+    fileSizes,
+    fileFractions: files.map(() => 0),
+    currentIndex: files.length > 0 ? 0 : null,
+  };
+}
+
+/** Mark a file as the one currently in flight (drives the file-name label). */
+export function progressWithCurrentFile(
+  progress: BatchUploadProgress,
+  index: number,
+): BatchUploadProgress {
+  if (progress.currentIndex === index) return progress;
+  return { ...progress, currentIndex: index };
+}
+
+/**
+ * Record an upload fraction (0..1) for one file. Monotonic: a fraction lower
+ * than the recorded one is ignored, so a two-phase pipeline (conversion upload
+ * then store upload) can never make the global bar move backwards.
+ */
+export function progressWithFileFraction(
+  progress: BatchUploadProgress,
+  index: number,
+  fraction: number,
+): BatchUploadProgress {
+  const previous = progress.fileFractions[index] ?? 0;
+  const next = Math.min(1, Math.max(previous, fraction));
+  if (next === previous) return progress;
+  return {
+    ...progress,
+    fileFractions: progress.fileFractions.map((value, i) =>
+      i === index ? next : value,
+    ),
+  };
+}
+
+/** Mark a file as settled (success or failure): fraction 1, done + 1. */
+export function progressWithFileSettled(
+  progress: BatchUploadProgress,
+  index: number,
+): BatchUploadProgress {
+  return {
+    ...progress,
+    done: progress.done + 1,
+    fileFractions: progress.fileFractions.map((value, i) =>
+      i === index ? 1 : value,
+    ),
+  };
+}
+
+/**
+ * Global completion percent (0–100), weighted by file bytes. Falls back to
+ * per-file granularity when no byte total is known (all zero-size weights).
+ */
+export function batchPercent(progress: BatchUploadProgress): number {
+  if (progress.total === 0) return 0;
+  if (progress.totalBytes <= 0) {
+    return Math.round((progress.done / progress.total) * 100);
+  }
+  const loadedBytes = progress.fileSizes.reduce(
+    (acc, size, index) => acc + size * (progress.fileFractions[index] ?? 0),
+    0,
+  );
+  return Math.round(Math.min(1, loadedBytes / progress.totalBytes) * 100);
+}
+
+/** Name of the file currently in flight, or null when unknown. */
+export function batchCurrentFileName(
+  progress: BatchUploadProgress,
+): string | null {
+  if (progress.currentIndex === null) return null;
+  return progress.fileNames[progress.currentIndex] ?? null;
+}
+
 /** Outcome of importing one file (never throws). */
 export type ImportOutcome =
   | { ok: true; name: string }

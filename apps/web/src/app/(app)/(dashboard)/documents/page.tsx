@@ -30,16 +30,29 @@ import {
 import {
   IMPORT_CONCURRENCY,
   MAX_IMPORT_FILE_SIZE_BYTES,
+  batchCurrentFileName,
+  batchPercent,
+  createBatchProgress,
   isImageFile,
   isOfficeFile,
   isPdfFile,
   isTextModelFile,
+  progressWithCurrentFile,
+  progressWithFileFraction,
+  progressWithFileSettled,
   runWithConcurrency,
   stripExtension,
   summarizeOutcomes,
   validateImportFile,
+  type BatchUploadProgress,
   type ImportOutcome,
 } from "@/lib/document-import";
+import {
+  isAbortError,
+  uploadWithProgress,
+  withTimeoutSignal,
+  type UploadProgressEvent,
+} from "@/lib/upload-with-progress";
 
 /**
  * Auto-index a scanned (image-only) PDF for semantic search (#85). OCRs every
@@ -130,12 +143,41 @@ const THUMBNAIL_MAX_WIDTH = 480;
 const THUMBNAIL_MAX_HEIGHT = 640;
 const EXTRACTED_TEXT_MAX_CHARS = 500_000;
 
+// Hard deadline for the best-effort enrichment calls (thumbnail render, text
+// extraction, thumbnail upload). Without it a single hung request kept
+// `uploading` true forever: the overlay never dismissed and the import dialog
+// (which blocks closing mid-upload) locked the page until a reload.
+const ENRICHMENT_TIMEOUT_MS = 60_000;
+
+/** Progress/cancellation plumbing threaded through one file's import. */
+interface ImportFileContext {
+  /** Batch-level cancellation (user pressed Annuler). */
+  signal: AbortSignal;
+  /** Report this file's monotonic upload fraction (0..1). */
+  onFraction: (fraction: number) => void;
+}
+
+/** Map a byte-level progress event onto a [base, base+span] fraction window. */
+function fractionInWindow(
+  event: UploadProgressEvent,
+  base: number,
+  span: number,
+): number | null {
+  if (event.total === null || event.total <= 0) return null;
+  return base + span * Math.min(1, event.loaded / event.total);
+}
+
 /**
  * Render page 1 of a PDF as a PNG thumbnail via POST /api/pdf/preview
  * (mode=thumbnail, magic-bytes friendly PNG). Best-effort: returns null on
  * any failure and never throws — a missing thumbnail must not fail an import.
  */
-async function renderPdfThumbnail(pdfFile: File): Promise<Blob | null> {
+async function renderPdfThumbnail(
+  pdfFile: File,
+  parentSignal?: AbortSignal,
+): Promise<Blob | null> {
+  // Time-boxed: a hung preview request must never freeze the import pipeline.
+  const { signal, dispose } = withTimeoutSignal(parentSignal, ENRICHMENT_TIMEOUT_MS);
   try {
     const fd = new FormData();
     fd.append("file", pdfFile);
@@ -149,6 +191,7 @@ async function renderPdfThumbnail(pdfFile: File): Promise<Blob | null> {
       method: "POST",
       credentials: "include",
       body: fd,
+      signal,
     });
     if (!res.ok) {
       clientLogger.warn("documents.thumbnail-render-failed", res.status);
@@ -158,6 +201,8 @@ async function renderPdfThumbnail(pdfFile: File): Promise<Blob | null> {
   } catch (err) {
     clientLogger.warn("documents.thumbnail-render-failed", err);
     return null;
+  } finally {
+    dispose();
   }
 }
 
@@ -168,7 +213,12 @@ async function renderPdfThumbnail(pdfFile: File): Promise<Blob | null> {
  * text content of every parsed text element is concatenated per page.
  * Best-effort: returns null on any failure and never throws.
  */
-async function extractPdfText(pdfFile: File): Promise<string | null> {
+async function extractPdfText(
+  pdfFile: File,
+  parentSignal?: AbortSignal,
+): Promise<string | null> {
+  // Time-boxed: a hung parse request must never freeze the import pipeline.
+  const { signal, dispose } = withTimeoutSignal(parentSignal, ENRICHMENT_TIMEOUT_MS);
   try {
     const fd = new FormData();
     fd.append("file", pdfFile);
@@ -183,6 +233,7 @@ async function extractPdfText(pdfFile: File): Promise<string | null> {
       method: "POST",
       credentials: "include",
       body: fd,
+      signal,
     });
     if (!res.ok) {
       clientLogger.warn("documents.text-extract-failed", res.status);
@@ -217,6 +268,8 @@ async function extractPdfText(pdfFile: File): Promise<string | null> {
   } catch (err) {
     clientLogger.warn("documents.text-extract-failed", err);
     return null;
+  } finally {
+    dispose();
   }
 }
 
@@ -235,38 +288,53 @@ class OfficeConversionError extends Error {
   }
 }
 
+/** Progress/cancellation options threaded into a conversion upload. */
+interface ConvertToPdfOptions {
+  signal?: AbortSignal;
+  onProgress?: (event: UploadProgressEvent) => void;
+}
+
 /**
- * Convert an Office document to an editable PDF via POST /api/office/upload
- * (server-side magic-byte validation + native WASM `convertOfficeToPdf`). The
- * returned PDF is wrapped as a `<base>.pdf` File (application/pdf) so the rest
- * of the import pipeline treats it exactly like an uploaded PDF — and the
- * editor, which parses stored PDFs, opens it as editable pages.
+ * Convert a file to an editable PDF via a Next.js conversion route (server-side
+ * magic-byte/extension validation + native WASM engine). The returned PDF is
+ * wrapped as a `<base>.pdf` File (application/pdf) so the rest of the import
+ * pipeline treats it exactly like an uploaded PDF — and the editor opens it as
+ * editable pages. Goes through the XHR transport so the conversion upload
+ * feeds the real byte-level progress bar and honours the batch cancel signal.
+ *
+ * 503 = engine unavailable; everything else (400/413/422/500) is treated as a
+ * content/conversion failure from the user's perspective.
  *
  * @throws {OfficeConversionError} on any non-2xx response (precise per-file reason)
+ * @throws {DOMException} AbortError when the batch was cancelled (rethrown as-is)
  */
-async function convertOfficeFileToPdf(file: File): Promise<File> {
+async function convertFileToPdfViaRoute(
+  file: File,
+  route: string,
+  logKey: string,
+  options: ConvertToPdfOptions = {},
+): Promise<File> {
   const baseName = stripExtension(file.name) || file.name;
   const form = new FormData();
   form.append("file", file);
 
-  let res: Response;
+  let res: Awaited<ReturnType<typeof uploadWithProgress>>;
   try {
-    res = await fetch("/api/office/upload", {
-      method: "POST",
-      credentials: "include",
-      body: form,
+    res = await uploadWithProgress(route, form, {
+      signal: options.signal,
+      onProgress: options.onProgress,
     });
   } catch (err) {
-    clientLogger.warn("documents.office-convert-network-failed", err);
-    throw new OfficeConversionError("office conversion network error", "unavailable");
+    // A user cancel is not a service failure — let the caller handle it.
+    if (isAbortError(err)) throw err;
+    clientLogger.warn(`${logKey}-network-failed`, err);
+    throw new OfficeConversionError(`${logKey} network error`, "unavailable");
   }
 
   if (!res.ok) {
-    clientLogger.warn("documents.office-convert-failed", res.status);
-    // 503 = engine unavailable; everything else (400/413/422/500) is treated
-    // as a content/conversion failure from the user's perspective.
+    clientLogger.warn(`${logKey}-failed`, res.status);
     throw new OfficeConversionError(
-      `office conversion failed (${res.status})`,
+      `${logKey} failed (${res.status})`,
       res.status === 503 ? "unavailable" : "conversion",
     );
   }
@@ -275,88 +343,43 @@ async function convertOfficeFileToPdf(file: File): Promise<File> {
   return new File([pdfBlob], `${baseName}.pdf`, { type: "application/pdf" });
 }
 
-/**
- * Convert a Markdown/CSV document to an editable PDF via
- * POST /api/convert/text-format (server-side extension validation + native WASM
- * `mdToModel`/`csvToModel` → `modelToPdf`). The returned PDF is wrapped as a
- * `<base>.pdf` File (application/pdf) so the rest of the import pipeline treats
- * it exactly like an uploaded PDF — and the editor opens it as editable pages.
- *
- * Reuses {@link OfficeConversionError} for a consistent per-file failure shape
- * (a 422 here = an empty/malformed text file → "conversion"; everything else is
- * also a content/conversion failure from the user's perspective).
- *
- * @throws {OfficeConversionError} on any non-2xx response (precise per-file reason)
- */
-async function convertTextModelFileToPdf(file: File): Promise<File> {
-  const baseName = stripExtension(file.name) || file.name;
-  const form = new FormData();
-  form.append("file", file);
-
-  let res: Response;
-  try {
-    res = await fetch("/api/convert/text-format", {
-      method: "POST",
-      credentials: "include",
-      body: form,
-    });
-  } catch (err) {
-    clientLogger.warn("documents.text-format-convert-network-failed", err);
-    throw new OfficeConversionError("text-format conversion network error", "unavailable");
-  }
-
-  if (!res.ok) {
-    clientLogger.warn("documents.text-format-convert-failed", res.status);
-    throw new OfficeConversionError(
-      `text-format conversion failed (${res.status})`,
-      res.status === 503 ? "unavailable" : "conversion",
-    );
-  }
-
-  const pdfBlob = await res.blob();
-  return new File([pdfBlob], `${baseName}.pdf`, { type: "application/pdf" });
+/** Office/RTF → editable PDF (POST /api/office/upload, WASM `convertOfficeToPdf`). */
+function convertOfficeFileToPdf(
+  file: File,
+  options: ConvertToPdfOptions = {},
+): Promise<File> {
+  return convertFileToPdfViaRoute(
+    file,
+    "/api/office/upload",
+    "documents.office-convert",
+    options,
+  );
 }
 
-/**
- * Convert a raster image (PNG/JPEG/GIF/WebP/AVIF) to a single-page editable PDF
- * via POST /api/convert/image (server-side magic-byte validation + native WASM
- * `imageToPdf`). The returned PDF is wrapped as a `<base>.pdf` File
- * (application/pdf) so the rest of the import pipeline treats it exactly like an
- * uploaded PDF — and the editor opens it as an editable page.
- *
- * Reuses {@link OfficeConversionError} for a consistent per-file failure shape
- * (a 422 here = an unrecognized/corrupt image → "conversion"; everything else is
- * also a content/conversion failure from the user's perspective).
- *
- * @throws {OfficeConversionError} on any non-2xx response (precise per-file reason)
- */
-async function convertImageFileToPdf(file: File): Promise<File> {
-  const baseName = stripExtension(file.name) || file.name;
-  const form = new FormData();
-  form.append("file", file);
+/** Markdown/CSV → editable PDF (POST /api/convert/text-format, WASM model pipeline). */
+function convertTextModelFileToPdf(
+  file: File,
+  options: ConvertToPdfOptions = {},
+): Promise<File> {
+  return convertFileToPdfViaRoute(
+    file,
+    "/api/convert/text-format",
+    "documents.text-format-convert",
+    options,
+  );
+}
 
-  let res: Response;
-  try {
-    res = await fetch("/api/convert/image", {
-      method: "POST",
-      credentials: "include",
-      body: form,
-    });
-  } catch (err) {
-    clientLogger.warn("documents.image-convert-network-failed", err);
-    throw new OfficeConversionError("image conversion network error", "unavailable");
-  }
-
-  if (!res.ok) {
-    clientLogger.warn("documents.image-convert-failed", res.status);
-    throw new OfficeConversionError(
-      `image conversion failed (${res.status})`,
-      res.status === 503 ? "unavailable" : "conversion",
-    );
-  }
-
-  const pdfBlob = await res.blob();
-  return new File([pdfBlob], `${baseName}.pdf`, { type: "application/pdf" });
+/** Raster image → single-page editable PDF (POST /api/convert/image, WASM `imageToPdf`). */
+function convertImageFileToPdf(
+  file: File,
+  options: ConvertToPdfOptions = {},
+): Promise<File> {
+  return convertFileToPdfViaRoute(
+    file,
+    "/api/convert/image",
+    "documents.image-convert",
+    options,
+  );
 }
 
 /** Build the /documents URL preserving folder and tag query params. */
@@ -395,11 +418,17 @@ export default function DocumentsPage() {
   const [userTags, setUserTags] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  // Exact batch progress: one tick per settled file (success or failure).
-  const [uploadProgress, setUploadProgress] = useState<{
-    done: number;
-    total: number;
-  } | null>(null);
+  // Byte-accurate batch progress: per-file upload fractions weighted by file
+  // size (real bytes sent), plus the settled-files counter for the i/N label.
+  const [uploadProgress, setUploadProgress] =
+    useState<BatchUploadProgress | null>(null);
+  // Failures of the LAST batch, shown inline in the import dialog (which stays
+  // open on failure so the user can retry). Cleared on new batch / dialog close.
+  const [lastFailures, setLastFailures] = useState<
+    Array<{ name: string; reason: string }> | null
+  >(null);
+  // Cancels every in-flight transfer of the current batch (Annuler button).
+  const importAbortRef = useRef<AbortController | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Search and pagination
@@ -618,7 +647,9 @@ export default function DocumentsPage() {
   // format is stored as-is. Never throws: every failure is returned with a
   // precise per-file reason, so one bad file cannot abort the batch.
   const importSingleFile = useCallback(
-    async (file: File): Promise<ImportOutcome> => {
+    async (file: File, context: ImportFileContext): Promise<ImportOutcome> => {
+      const { signal, onFraction } = context;
+
       // Client-side validation: size cap only (every format is accepted).
       const validation = validateImportFile(file, MAX_IMPORT_FILE_SIZE_BYTES);
       if (!validation.ok) {
@@ -632,54 +663,45 @@ export default function DocumentsPage() {
       // Office / RTF, text-model (Markdown, CSV), and raster images → editable
       // PDF. On failure we abort THIS file with a precise reason (never store
       // broken/un-openable bytes silently). A given file matches at most one of
-      // these branches.
+      // these branches. Converted files transfer their bytes twice (conversion
+      // upload then store upload) → each phase maps to half the file's weight.
       let fileToStore = file;
       const office = isOfficeFile(file);
       const textModel = isTextModelFile(file);
       const image = isImageFile(file);
-      if (office) {
+      const needsConversion = office || textModel || image;
+      const storeBase = needsConversion ? 0.5 : 0;
+      const storeSpan = needsConversion ? 0.5 : 1;
+      const conversionOptions: ConvertToPdfOptions = {
+        signal,
+        onProgress: (event) => {
+          const fraction = fractionInWindow(event, 0, 0.5);
+          if (fraction !== null) onFraction(fraction);
+        },
+      };
+
+      if (needsConversion) {
         try {
-          fileToStore = await convertOfficeFileToPdf(file);
+          if (office) {
+            fileToStore = await convertOfficeFileToPdf(file, conversionOptions);
+          } else if (textModel) {
+            fileToStore = await convertTextModelFileToPdf(file, conversionOptions);
+          } else {
+            fileToStore = await convertImageFileToPdf(file, conversionOptions);
+          }
         } catch (err) {
+          // Batch cancel: bubble up so the caller records a neutral outcome.
+          if (isAbortError(err)) throw err;
           const kind =
             err instanceof OfficeConversionError ? err.kind : "conversion";
+          const nsKey = office ? "office" : textModel ? "textFormat" : "image";
           return {
             ok: false,
             name: file.name,
             reason:
               kind === "unavailable"
-                ? t("import.office.unavailable")
-                : t("import.office.conversionFailed"),
-          };
-        }
-      } else if (textModel) {
-        try {
-          fileToStore = await convertTextModelFileToPdf(file);
-        } catch (err) {
-          const kind =
-            err instanceof OfficeConversionError ? err.kind : "conversion";
-          return {
-            ok: false,
-            name: file.name,
-            reason:
-              kind === "unavailable"
-                ? t("import.textFormat.unavailable")
-                : t("import.textFormat.conversionFailed"),
-          };
-        }
-      } else if (image) {
-        try {
-          fileToStore = await convertImageFileToPdf(file);
-        } catch (err) {
-          const kind =
-            err instanceof OfficeConversionError ? err.kind : "conversion";
-          return {
-            ok: false,
-            name: file.name,
-            reason:
-              kind === "unavailable"
-                ? t("import.image.unavailable")
-                : t("import.image.conversionFailed"),
+                ? t(`import.${nsKey}.unavailable`)
+                : t(`import.${nsKey}.conversionFailed`),
           };
         }
       }
@@ -691,11 +713,12 @@ export default function DocumentsPage() {
 
       try {
         // PDF-only enrichment, kicked off in parallel with the upload. Both
-        // helpers are best-effort (resolve to null, never reject), so they
-        // cannot fail the import; non-PDFs skip them entirely. For Office files
+        // helpers are best-effort (resolve to null, never reject) AND
+        // time-boxed (ENRICHMENT_TIMEOUT_MS), so they can neither fail nor
+        // hang the import; non-PDFs skip them entirely. For Office files
         // these run on the freshly converted PDF (`fileToStore`).
-        const thumbnailPromise = pdf ? renderPdfThumbnail(fileToStore) : null;
-        const extractedTextPromise = pdf ? extractPdfText(fileToStore) : null;
+        const thumbnailPromise = pdf ? renderPdfThumbnail(fileToStore, signal) : null;
+        const extractedTextPromise = pdf ? extractPdfText(fileToStore, signal) : null;
 
         const extractedText = extractedTextPromise
           ? await extractedTextPromise
@@ -703,18 +726,25 @@ export default function DocumentsPage() {
 
         // Store the document: the original bytes for already-PDF / unconverted
         // formats, or the freshly converted PDF for Office/RTF, Markdown/CSV and
-        // images. The title keeps the original base name.
+        // images. The title keeps the original base name. The XHR transport
+        // reports real byte progress into this file's fraction window.
         const saved = await api.saveDocument({
           file: fileToStore,
           name: baseName,
           tags: [],
           folderId: currentFolderId || undefined,
           extractedText: extractedText ?? undefined,
+          signal,
+          onProgress: (event) => {
+            const fraction = fractionInWindow(event, storeBase, storeSpan);
+            if (fraction !== null) onFraction(fraction);
+          },
         });
 
         // Best-effort thumbnail upload (needs the stored document id, hence
-        // after save). A failure is logged and silently ignored.
+        // after save). Time-boxed; a failure is logged and silently ignored.
         if (thumbnailPromise) {
+          const bounded = withTimeoutSignal(signal, ENRICHMENT_TIMEOUT_MS);
           try {
             const thumbnail = await thumbnailPromise;
             if (thumbnail) {
@@ -722,10 +752,13 @@ export default function DocumentsPage() {
                 saved.stored_document_id,
                 thumbnail,
                 `${baseName}.png`,
+                { signal: bounded.signal },
               );
             }
           } catch (thumbErr) {
             clientLogger.warn("documents.thumbnail-upload-failed", thumbErr);
+          } finally {
+            bounded.dispose();
           }
         }
 
@@ -744,6 +777,8 @@ export default function DocumentsPage() {
 
         return { ok: true, name: file.name };
       } catch (err) {
+        // Batch cancel: bubble up so the caller records a neutral outcome.
+        if (isAbortError(err)) throw err;
         clientLogger.error("documents.import-file-failed", err);
         return {
           ok: false,
@@ -761,6 +796,9 @@ export default function DocumentsPage() {
   const processFiles = useCallback(
     async (files: File[]) => {
       if (files.length === 0) return;
+      // One batch at a time: a second drop mid-upload would otherwise steal
+      // the abort controller (Annuler would only cancel the newest batch).
+      if (importAbortRef.current) return;
 
       // Drop-overlay safety net. The explorer's scoped drop zone calls
       // stopPropagation, so a drop on the listing never bubbles up to the page
@@ -772,18 +810,51 @@ export default function DocumentsPage() {
       dragDepthRef.current = 0;
       setIsDraggingFiles(false);
 
+      // One controller per batch: the Annuler button (overlay + dialog) aborts
+      // every in-flight conversion/upload transfer at once.
+      const controller = new AbortController();
+      importAbortRef.current = controller;
+
       setUploading(true);
       setError(null);
-      setUploadProgress({ done: 0, total: files.length });
+      setLastFailures(null);
+      setUploadProgress(createBatchProgress(files));
 
       try {
         const outcomes = await runWithConcurrency(
           files,
           IMPORT_CONCURRENCY,
-          async (file) => {
-            const outcome = await importSingleFile(file);
+          async (file, index) => {
             setUploadProgress((prev) =>
-              prev ? { ...prev, done: prev.done + 1 } : prev,
+              prev ? progressWithCurrentFile(prev, index) : prev,
+            );
+            let outcome: ImportOutcome;
+            try {
+              outcome = await importSingleFile(file, {
+                signal: controller.signal,
+                onFraction: (fraction) => {
+                  setUploadProgress((prev) =>
+                    prev
+                      ? progressWithFileFraction(prev, index, fraction)
+                      : prev,
+                  );
+                },
+              });
+            } catch (err) {
+              // Only AbortError bubbles up from importSingleFile (everything
+              // else is folded into a per-file outcome). Record a neutral
+              // outcome so the batch summary logic stays uniform.
+              if (!isAbortError(err)) {
+                clientLogger.error("documents.import-file-failed", err);
+              }
+              outcome = {
+                ok: false,
+                name: file.name,
+                reason: t("import.cancelled"),
+              };
+            }
+            setUploadProgress((prev) =>
+              prev ? progressWithFileSettled(prev, index) : prev,
             );
             return outcome;
           },
@@ -791,11 +862,24 @@ export default function DocumentsPage() {
 
         const { successCount, failures } = summarizeOutcomes(outcomes);
 
+        if (controller.signal.aborted) {
+          // User cancel: neutral toast (no scary failure list), refresh the
+          // listing if some files landed before the abort.
+          toast({ title: t("import.cancelled") });
+          if (successCount > 0) await loadDocuments();
+          return;
+        }
+
         if (failures.length === 0) {
           toast({
             title: t("import.summaryAllSuccess", { count: successCount }),
           });
+          // Full success: the dialog closes on its own.
+          setImportDialogOpen(false);
         } else {
+          // Any failure keeps the dialog open with the inline failure list so
+          // the user can read the reasons and retry (re-drop / browse again).
+          setLastFailures(failures);
           toast({
             variant: "destructive",
             title:
@@ -818,18 +902,24 @@ export default function DocumentsPage() {
         }
 
         if (successCount > 0) {
-          // Close the dialog once at least one file landed; the explorer-wide
-          // drop zone keeps working independently of the dialog.
-          setImportDialogOpen(false);
           await loadDocuments();
         }
       } finally {
+        // ALL paths (success, failure, cancel, unexpected throw) reset the
+        // uploading state — the full-screen overlay always dismisses and the
+        // dialog becomes closable again.
+        importAbortRef.current = null;
         setUploading(false);
         setUploadProgress(null);
       }
     },
     [importSingleFile, loadDocuments, t, toast],
   );
+
+  // Cancel the in-flight import batch (aborts every transfer).
+  const handleCancelImport = useCallback(() => {
+    importAbortRef.current?.abort();
+  }, []);
 
   const handleCreateFolder = async (name: string, parentId: string | null) => {
     await api.createFolder(name, parentId);
@@ -934,12 +1024,14 @@ export default function DocumentsPage() {
   const canGoForward = historyIndex < navigationHistory.length - 1;
 
   // Batch upload completion percentage (0–100) for the full-screen import
-  // overlay progress bar. One tick per settled file, so this is per-file
-  // granularity (not bytes transferred).
-  const uploadPercent =
-    uploadProgress && uploadProgress.total > 0
-      ? Math.round((uploadProgress.done / uploadProgress.total) * 100)
-      : 0;
+  // overlay progress bar — byte-accurate (real bytes sent, weighted by file
+  // size), with a per-file fallback when no byte total is known.
+  const uploadPercent = uploadProgress ? batchPercent(uploadProgress) : 0;
+  const uploadIndeterminate =
+    uploadProgress !== null && uploadProgress.totalBytes <= 0;
+  const uploadCurrentFileName = uploadProgress
+    ? batchCurrentFileName(uploadProgress)
+    : null;
 
   return (
     <div
@@ -994,9 +1086,10 @@ export default function DocumentsPage() {
         </div>
       )}
 
-      {/* Upload overlay with a real progress bar — visible for the whole
-          import. processFiles' `finally` resets uploading/uploadProgress on
-          success AND error, so this overlay always dismisses on its own. */}
+      {/* Upload overlay with a REAL byte-level progress bar — visible for the
+          whole import. processFiles' `finally` resets uploading/uploadProgress
+          on success, error AND cancel, so this overlay always dismisses on its
+          own; the Annuler button aborts every in-flight transfer. */}
       {uploading && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-background/70 backdrop-blur-sm">
           <div
@@ -1006,6 +1099,11 @@ export default function DocumentsPage() {
             <p className="text-lg font-semibold">{t("import.uploading")}</p>
             {uploadProgress && (
               <>
+                {uploadCurrentFileName && (
+                  <p className="text-sm text-muted-foreground truncate">
+                    {t("import.currentFile", { name: uploadCurrentFileName })}
+                  </p>
+                )}
                 <div className="flex justify-between text-sm text-muted-foreground">
                   <span>
                     {t("import.uploadingProgress", {
@@ -1013,11 +1111,24 @@ export default function DocumentsPage() {
                       total: uploadProgress.total,
                     })}
                   </span>
-                  <span>{uploadPercent}%</span>
+                  {!uploadIndeterminate && <span>{uploadPercent}%</span>}
                 </div>
-                <Progress value={uploadPercent} />
+                {uploadIndeterminate ? (
+                  <Progress value={100} className="animate-pulse" />
+                ) : (
+                  <Progress value={uploadPercent} />
+                )}
               </>
             )}
+            <div className="flex justify-end">
+              <Button
+                variant="outline"
+                onClick={handleCancelImport}
+                className="pointer-coarse:min-h-11 pointer-coarse:min-w-11"
+              >
+                {t("import.cancel")}
+              </Button>
+            </div>
           </div>
         </div>
       )}
@@ -1224,10 +1335,16 @@ export default function DocumentsPage() {
       {/* Universal import dialog (single entry point: every file type). */}
       <ImportDialog
         open={importDialogOpen}
-        onOpenChange={setImportDialogOpen}
+        onOpenChange={(open) => {
+          setImportDialogOpen(open);
+          // Leaving the dialog discards the last batch's failure list.
+          if (!open) setLastFailures(null);
+        }}
         onFilesSelected={(files) => void processFiles(files)}
         uploading={uploading}
         progress={uploadProgress}
+        failures={lastFailures}
+        onCancel={handleCancelImport}
         destinationPath={getCurrentPath()}
       />
 
