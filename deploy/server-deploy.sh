@@ -13,10 +13,24 @@
 #   shared/env/gigapdf.env  single source of env (ubuntu:gigapdf 640)
 #   shared/venv/            Python venv (uvicorn/celery/alembic)
 #   shared/bin/             ocr_serve + cached copy of this script
-#   shared/state/           active-color, history, hashes
+#   shared/state/           active-color, active-ports.env, history, hashes
 #   blue -> releases/X      color slot (ports web 3000 / admin 3001 / api 8000)
 #   green -> releases/Y     color slot (ports web 3010 / admin 3011 / api 8010)
 #   current -> releases/Z   ACTIVE release (celery/ocr WorkingDirectory)
+#
+# PORT PAIRING (v1.23.0 incident, 2026-07-03): systemd EnvironmentFile= ALWAYS
+# overrides Environment= lines regardless of their order in the unit, so the
+# per-color ports MUST NOT be defined in gigapdf.env. ensure_shared_env
+# neutralizes APP_PORT / PYTHON_BACKEND_URL / NEXTJS_INTERNAL_URL there; each
+# color's units then impose their own pairing via Environment=:
+#   api-$color   → APP_PORT=$p_api (uvicorn also gets an explicit --port $p_api)
+#                  NEXTJS_INTERNAL_URL=http://127.0.0.1:$p_web  (API → TS engine)
+#   web-$color   → PYTHON_BACKEND_URL=http://127.0.0.1:$p_api  (Next routes → API)
+#   admin-$color → PYTHON_BACKEND_URL=http://127.0.0.1:$p_api  (future-proof)
+# Uncolored workers (celery, celery-billing) follow the ACTIVE color via
+# shared/state/active-ports.env (EnvironmentFile=-, written at every switch,
+# read at their restart). gigapdf-ocr calls neither the API nor the web app
+# (it only serves OCR_BIND) — it does not consume that file.
 #
 # The legacy flat clone files at /opt/gigapdf root are FROZEN (emergency
 # fallback only — see deploy/README.md). This script never touches them.
@@ -109,6 +123,21 @@ ensure_shared_env() {
   if grep -qE '^PORT=' "$ENV_FILE"; then
     die "$ENV_FILE contains a PORT= key — remove it (ports are per-color, set by systemd units)"
   fi
+  # Same systemd rule for the keys the units/state file now own (see header,
+  # "PORT PAIRING"). These were bootstrapped from the legacy flat .env
+  # (APP_PORT=8000 caused the v1.23.0 port-pairing incident): neutralize them
+  # idempotently — commented out, value kept for reference, backup written once.
+  local k backed_up=0
+  for k in APP_PORT PYTHON_BACKEND_URL NEXTJS_INTERNAL_URL; do
+    if grep -qE "^$k=" "$ENV_FILE"; then
+      if [ "$backed_up" = 0 ]; then
+        cp "$ENV_FILE" "$ENV_FILE.bak-portpairing.$(date -u +%Y%m%dT%H%M%SZ)"
+        backed_up=1
+      fi
+      sed -i "s|^$k=|# [per-color — managed by server-deploy.sh units] $k=|" "$ENV_FILE"
+      warn "$ENV_FILE: neutralized $k= (per-color value is set by the systemd units)"
+    fi
+  done
   sudo chown ubuntu:"$APP_GROUP" "$ENV_FILE"
   sudo chmod 640 "$ENV_FILE"
 }
@@ -301,6 +330,12 @@ WorkingDirectory=$ROOT/$color/apps/web
 EnvironmentFile=$ENV_FILE
 Environment="NODE_ENV=production"
 Environment="PORT=$p_web"
+# Same-color API pairing: the Next.js routes (/api/pdf/*, lib/document-bytes)
+# fall back to a hard-coded http://127.0.0.1:8000 when unset — that is BLUE's
+# port, so a green web would call a stopped API (the v1.23.0 502 incident).
+# gigapdf.env must NOT define this key (ensure_shared_env neutralizes it —
+# EnvironmentFile= would override this line).
+Environment="PYTHON_BACKEND_URL=http://127.0.0.1:$p_api"
 ExecStart=/usr/bin/node $ROOT/$color/apps/web/.next/standalone/apps/web/server.js
 Restart=on-failure
 RestartSec=5
@@ -335,6 +370,9 @@ WorkingDirectory=$ROOT/$color/apps/admin
 EnvironmentFile=$ENV_FILE
 Environment="NODE_ENV=production"
 Environment="PORT=$p_admin"
+# Same-color API pairing (admin has no internal API caller today — kept for
+# parity with web so a future one cannot regress to the hard-coded 8000).
+Environment="PYTHON_BACKEND_URL=http://127.0.0.1:$p_api"
 ExecStart=/usr/bin/node $ROOT/$color/apps/admin/.next/standalone/apps/admin/server.js
 Restart=on-failure
 RestartSec=5
@@ -368,6 +406,15 @@ Group=$APP_GROUP
 WorkingDirectory=$ROOT/$color
 Environment="PATH=$VENV/bin:/usr/bin:/bin"
 EnvironmentFile=$ENV_FILE
+# Per-color port pairing (v1.23.0 incident). The bind itself uses the explicit
+# --port flag below; APP_PORT covers any code path reading settings.app_port
+# (app/config.py) — both MUST carry the same value. gigapdf.env must NOT
+# define these keys (ensure_shared_env neutralizes them — EnvironmentFile=
+# would override these lines).
+Environment="APP_PORT=$p_api"
+# API → Next.js TS engine (app/services/document_service.py, /api/pdf/preview):
+# same-color web, never the hard-coded default localhost:3000 (= blue).
+Environment="NEXTJS_INTERNAL_URL=http://127.0.0.1:$p_web"
 ExecStart=$VENV/bin/uvicorn app.main:app --host 0.0.0.0 --port $p_api --workers 4
 Restart=on-failure
 RestartSec=5
@@ -400,6 +447,10 @@ Group=$APP_GROUP
 WorkingDirectory=$ROOT/current
 Environment="PATH=$VENV/bin:/usr/bin:/bin"
 EnvironmentFile=$ENV_FILE
+# Uncolored worker: follows the ACTIVE color's ports (export tasks call the
+# Next.js TS engine via NEXTJS_INTERNAL_URL). Written by write_active_ports
+# at every switch, BEFORE this unit is restarted. Later file wins in systemd.
+EnvironmentFile=-$STATE/active-ports.env
 ExecStart=$VENV/bin/celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4 --queues=default,export,infra
 Restart=on-failure
 RestartSec=10
@@ -432,6 +483,8 @@ Group=$APP_GROUP
 WorkingDirectory=$ROOT/current
 Environment="PATH=$VENV/bin:/usr/bin:/bin"
 EnvironmentFile=$ENV_FILE
+# Uncolored worker: follows the ACTIVE color's ports (see gigapdf-celery).
+EnvironmentFile=-$STATE/active-ports.env
 ExecStart=$VENV/bin/celery -A app.tasks.celery_app worker --loglevel=info --queues=billing --concurrency=2
 Restart=on-failure
 RestartSec=10
@@ -521,6 +574,26 @@ port_free() { # $1=port — true if nothing listens
   ! ss -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
 }
 
+assert_port_owner() { # $1=port $2=unit — the LISTEN socket on :$1 must belong
+  # to $2 (cgroup check — uvicorn/node workers live in the unit's cgroup).
+  # Anti-regression for the v1.23.0 port-pairing incident: a color whose API
+  # silently bound the OTHER color's port would pass a naive is-active gate.
+  local port="$1" unit="$2" pids pid found=0
+  pids=$(sudo ss -tlnp sport = ":$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  if [ -z "$pids" ]; then
+    warn "nothing listens on :$port (expected $unit)"
+    return 1
+  fi
+  for pid in $pids; do
+    if grep -q "/${unit}.service" "/proc/$pid/cgroup" 2>/dev/null; then found=1; break; fi
+  done
+  if [ "$found" != 1 ]; then
+    warn "port :$port is bound by pid(s) $(echo "$pids" | tr '\n' ' ')— NOT by $unit (wrong process owns the port)"
+    return 1
+  fi
+  ok "port :$port bound by $unit"
+}
+
 start_color_and_gate() { # $1=color — start api → health → web+admin → health
   local color="$1"
   local p_web p_admin p_api
@@ -556,6 +629,11 @@ start_color_and_gate() { # $1=color — start api → health → web+admin → h
   for unit in $(color_units "$color"); do
     gate_unit "$unit" || fail=1
   done
+  # Port-ownership gate: each expected port must be bound by THE process of
+  # its unit (never by the other color, legacy, or a stray process).
+  assert_port_owner "$p_api"   "gigapdf-api-$color"   || fail=1
+  assert_port_owner "$p_web"   "gigapdf-web-$color"   || fail=1
+  assert_port_owner "$p_admin" "gigapdf-admin-$color" || fail=1
   if [ "$fail" = 1 ]; then
     sudo systemctl stop "gigapdf-web-$color" "gigapdf-admin-$color" "gigapdf-api-$color" || true
     die "$color instances unstable — site untouched, still on $(active_color)"
@@ -662,6 +740,24 @@ flip_link() { # $1=link path $2=target — atomic replace
   local link="$1" target="$2" tmp="$1.tmp.$$"
   ln -sfn "$target" "$tmp"
   mv -T "$tmp" "$link"
+}
+
+write_active_ports() { # $1=color — port pairing for UNCOLORED workers
+  # Celery export tasks call the Next.js TS engine (settings.nextjs_internal_url,
+  # app/services/document_service.py) and read settings.app_port; both must
+  # follow the ACTIVE color. Written BEFORE restart_workers so the restarted
+  # workers pick it up (EnvironmentFile=-…/active-ports.env in their units).
+  # gigapdf-ocr consumes nothing from this file (it only serves OCR_BIND).
+  local color="$1" p_api p_web
+  p_api=$(port_of api "$color"); p_web=$(port_of web "$color")
+  cat > "$STATE/active-ports.env" <<EOF
+# Managed by server-deploy.sh — ports of the ACTIVE color ($color, $(date -u +%FT%TZ)).
+# Consumed by uncolored units (celery workers) via EnvironmentFile=.
+APP_PORT=$p_api
+PYTHON_BACKEND_URL=http://127.0.0.1:$p_api
+NEXTJS_INTERNAL_URL=http://127.0.0.1:$p_web
+EOF
+  ok "active-ports.env → $color (api:$p_api web:$p_web)"
 }
 
 restart_workers() { # $1=skip_celery(true/false)
@@ -794,6 +890,7 @@ cmd_deploy() {
   enable_color "$target"
 
   flip_link "$ROOT/current" "$rel"
+  write_active_ports "$target"
   restart_workers "$skip_celery"
   record_state "$target" "$rel" "$sha"
   install_ci_hook "$rel"
@@ -813,6 +910,10 @@ cmd_switch() {
   acquire_lock
   ensure_layout
   self_install
+  # ensure_shared_env is REQUIRED here too: the per-color Environment= pairing
+  # in the units only takes effect if gigapdf.env does not define those keys
+  # (EnvironmentFile= always wins) — neutralization must run before any start.
+  ensure_shared_env
   ensure_units
 
   local prev; prev=$(active_color)
@@ -834,6 +935,8 @@ cmd_switch() {
     switch_nginx blue ""       # legacy listens on the blue ports
     drain_nginx
     stop_previous "$prev"
+    write_active_ports blue    # legacy = blue ports; workers keep running but
+                               # any later manual restart must pair with 8000/3000
     echo "legacy" > "$STATE/active-color"
     printf "%s | %s | %s | %s\n" "$(date -u +%FT%TZ)" legacy "$ROOT (flat clone)" "-" >> "$STATE/history"
     warn "LEGACY fallback active — celery/ocr still run the release in $ROOT/current"
@@ -853,6 +956,7 @@ cmd_switch() {
   stop_previous "$prev"
   enable_color "$to"
   flip_link "$ROOT/current" "$rel"
+  write_active_ports "$to"
   restart_workers false        # celery/ocr must run the same code as the web/api
   record_state "$to" "$rel" "$(cat "$rel/.release-sha" 2>/dev/null || echo '-')"
   report
