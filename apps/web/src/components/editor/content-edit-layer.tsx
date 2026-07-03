@@ -1242,6 +1242,14 @@ export function ContentEditZones({ pageIndex, getPdfCanvas }: ContentEditZonesPr
                 hoveredZoneId: elementId,
               }))
             }
+            // Tactile : un tap révèle les actions de la zone (le hover
+            // n'existe pas au doigt). Redondant mais inoffensif à la souris.
+            onPointerDown={() =>
+              setZoneState((prev) => ({
+                ...prev,
+                hoveredZoneId: elementId,
+              }))
+            }
             onMouseLeave={() =>
               setZoneState((prev) => ({
                 ...prev,
@@ -1338,17 +1346,17 @@ export function ContentEditZones({ pageIndex, getPdfCanvas }: ContentEditZonesPr
 
                     {/* Hover actions */}
                     {isHovered && (
-                      <div className="absolute -top-7 right-0 flex items-center gap-0.5">
+                      <div className="absolute -top-7 pointer-coarse:-top-12 right-0 flex items-center gap-0.5">
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
                             handleDeleteZone(element, e);
                           }}
-                          className="flex items-center rounded p-0.5 text-red-500 hover:bg-red-50 transition-colors"
+                          className="flex items-center justify-center rounded p-0.5 pointer-coarse:min-h-11 pointer-coarse:min-w-11 pointer-coarse:bg-background/90 text-red-500 hover:bg-red-50 transition-colors"
                           aria-label="Delete element"
                           title="Delete zone (right-click shortcut)"
                         >
-                          <Trash2 className="h-3 w-3" />
+                          <Trash2 className="h-3 w-3 pointer-coarse:h-5 pointer-coarse:w-5" />
                         </button>
                       </div>
                     )}
@@ -1437,16 +1445,16 @@ export function ContentEditZones({ pageIndex, getPdfCanvas }: ContentEditZonesPr
 
                     {/* Hover actions */}
                     {isHovered && (
-                      <div className="absolute -top-7 right-0 flex items-center gap-0.5">
+                      <div className="absolute -top-7 pointer-coarse:-top-12 right-0 flex items-center gap-0.5">
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
                             handleDeleteZone(element, e);
                           }}
-                          className="flex items-center rounded p-0.5 text-red-500 hover:bg-red-50 transition-colors"
+                          className="flex items-center justify-center rounded p-0.5 pointer-coarse:min-h-11 pointer-coarse:min-w-11 pointer-coarse:bg-background/90 text-red-500 hover:bg-red-50 transition-colors"
                           aria-label="Delete image element"
                         >
-                          <Trash2 className="h-3 w-3" />
+                          <Trash2 className="h-3 w-3 pointer-coarse:h-5 pointer-coarse:w-5" />
                         </button>
                       </div>
                     )}
@@ -1506,16 +1514,16 @@ export function ContentEditZones({ pageIndex, getPdfCanvas }: ContentEditZonesPr
                             Click to edit style
                           </div>
                         </div>
-                        <div className="absolute -top-7 right-0 flex items-center gap-0.5">
+                        <div className="absolute -top-7 pointer-coarse:-top-12 right-0 flex items-center gap-0.5">
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
                               handleDeleteZone(element, e);
                             }}
-                            className="flex items-center rounded p-0.5 text-red-500 hover:bg-red-50 transition-colors"
+                            className="flex items-center justify-center rounded p-0.5 pointer-coarse:min-h-11 pointer-coarse:min-w-11 pointer-coarse:bg-background/90 text-red-500 hover:bg-red-50 transition-colors"
                             aria-label="Delete shape"
                           >
-                            <Trash2 className="h-3 w-3" />
+                            <Trash2 className="h-3 w-3 pointer-coarse:h-5 pointer-coarse:w-5" />
                           </button>
                         </div>
                         <ZoneTooltip element={element} />
@@ -1568,16 +1576,16 @@ export function ContentEditZones({ pageIndex, getPdfCanvas }: ContentEditZonesPr
                             {element.content ? "Click to edit" : element.annotationType}
                           </div>
                         </div>
-                        <div className="absolute -top-7 right-0 flex items-center gap-0.5">
+                        <div className="absolute -top-7 pointer-coarse:-top-12 right-0 flex items-center gap-0.5">
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
                               handleDeleteZone(element, e);
                             }}
-                            className="flex items-center rounded p-0.5 text-red-500 hover:bg-red-50 transition-colors"
+                            className="flex items-center justify-center rounded p-0.5 pointer-coarse:min-h-11 pointer-coarse:min-w-11 pointer-coarse:bg-background/90 text-red-500 hover:bg-red-50 transition-colors"
                             aria-label="Delete annotation"
                           >
-                            <Trash2 className="h-3 w-3" />
+                            <Trash2 className="h-3 w-3 pointer-coarse:h-5 pointer-coarse:w-5" />
                           </button>
                         </div>
                         <ZoneTooltip element={element} />
@@ -1662,16 +1670,16 @@ export function ContentEditZones({ pageIndex, getPdfCanvas }: ContentEditZonesPr
                             {element.fieldType}: {element.fieldName}
                           </div>
                         </div>
-                        <div className="absolute -top-7 right-0 flex items-center gap-0.5">
+                        <div className="absolute -top-7 pointer-coarse:-top-12 right-0 flex items-center gap-0.5">
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
                               handleDeleteZone(element, e);
                             }}
-                            className="flex items-center rounded p-0.5 text-red-500 hover:bg-red-50 transition-colors"
+                            className="flex items-center justify-center rounded p-0.5 pointer-coarse:min-h-11 pointer-coarse:min-w-11 pointer-coarse:bg-background/90 text-red-500 hover:bg-red-50 transition-colors"
                             aria-label="Delete form field"
                           >
-                            <Trash2 className="h-3 w-3" />
+                            <Trash2 className="h-3 w-3 pointer-coarse:h-5 pointer-coarse:w-5" />
                           </button>
                         </div>
                         <ZoneTooltip element={element} />

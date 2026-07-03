@@ -34,6 +34,7 @@ import React, {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -62,6 +63,9 @@ import {
 } from "./lib/page-layout";
 import type { PageMargins } from "./lib/page-margins";
 import type { RulerUnit } from "./lib/ruler-ticks";
+// Tactile (mobile lot 2): per-tool touch-action gating + app pinch-to-zoom.
+import { touchActionForTool } from "./lib/touch-interaction";
+import { attachPinchZoom } from "./lib/pinch-zoom";
 
 /** Pages of buffer kept mounted on each side of the visible window. */
 const BUFFER_PAGES = 2;
@@ -174,6 +178,12 @@ export interface ContinuousPageViewProps {
   /** Zoom recomputed by a fit mode — same contract as EditorCanvas.onFitZoomChange. */
   onFitZoomChange?: (zoom: number) => void;
   /**
+   * MANUAL zoom requested by a user gesture on the scroller (two-finger
+   * pinch). Same contract as the toolbar's manual zoom: the caller must clear
+   * fitMode then setZoom. When omitted, pinch-to-zoom is disabled.
+   */
+  onManualZoomChange?: (zoom: number) => void;
+  /**
    * Element CREATED at mouse on the ACTIVE page. Wired to the same page.tsx
    * handler as the single-page editor (scene graph + queue + apply-elements
    * bake → save).
@@ -262,6 +272,7 @@ function ContinuousPageViewImpl(
     onRedactionMarksChanged,
     fitMode,
     onFitZoomChange,
+    onManualZoomChange,
     onElementAdded,
     onInkDrawn,
     onElementModified,
@@ -697,6 +708,92 @@ function ContinuousPageViewImpl(
     };
   }, []);
 
+  // ── Pinch-to-zoom (tactile) sur le scroll root ─────────────────────────────
+  // Deux pointeurs TOUCH → zoom MANUEL borné [MIN_ZOOM, MAX_ZOOM] via
+  // onManualZoomChange (page.tsx : setFitMode(null) + setZoom). L'ancrage au
+  // midpoint des doigts se fait en deux temps : on capture ICI la position de
+  // l'ancre dans la géométrie COURANTE (slot + fraction verticale), puis le
+  // useLayoutEffect [slots] ci-dessous re-projette le scroll après que React a
+  // recalculé le layout au nouveau zoom — le point sous les doigts reste sous
+  // les doigts. Souris/stylet ignorés (desktop intact).
+  const pendingPinchAnchorRef = useRef<{
+    index: number;
+    frac: number;
+    viewX: number;
+    viewY: number;
+    contentX: number;
+    ratio: number;
+  } | null>(null);
+
+  // Miroir ref du callback : l'attache pinch ne dépend que de sa PRÉSENCE.
+  // Ré-attacher sur chaque identité tuerait le geste en cours (la Map de
+  // pointeurs est vidée au detach) dès que le zoom re-rend le parent.
+  const onManualZoomChangeRef = useRef(onManualZoomChange);
+  useEffect(() => {
+    onManualZoomChangeRef.current = onManualZoomChange;
+  }, [onManualZoomChange]);
+  const pinchEnabled = Boolean(onManualZoomChange);
+
+  useEffect(() => {
+    const root = scrollRef.current;
+    if (!root || !pinchEnabled) {
+      return;
+    }
+    return attachPinchZoom(root, {
+      getZoom: () => zoomRef.current || 1,
+      minZoom: MIN_ZOOM,
+      maxZoom: MAX_ZOOM,
+      onPinchZoom: (nextZoom, center) => {
+        const oldZoom = zoomRef.current || 1;
+        if (Math.abs(nextZoom - oldZoom) < 0.0005) {
+          return;
+        }
+        const rect = root.getBoundingClientRect();
+        const viewX = center.x - rect.left;
+        const viewY = center.y - rect.top;
+        const contentY = root.scrollTop + viewY;
+        const currentSlots = slotsRef.current;
+        // Page la plus proche de l'ancre + fraction verticale dans son slot
+        // (peut déborder [0,1] dans les gouttières — extrapolation linéaire).
+        const index = pageIndexAtScroll(currentSlots, contentY, 0);
+        const slot = currentSlots[index];
+        const frac =
+          slot && slot.height > 0 ? (contentY - slot.top) / slot.height : 0;
+        pendingPinchAnchorRef.current = {
+          index,
+          frac,
+          viewX,
+          viewY,
+          contentX: root.scrollLeft + viewX,
+          ratio: nextZoom / oldZoom,
+        };
+        onManualZoomChangeRef.current?.(nextZoom);
+      },
+    });
+  }, [pinchEnabled]);
+
+  // Re-projection du scroll APRÈS le re-layout au nouveau zoom (layout effect :
+  // avant le paint, donc sans frame intermédiaire visible). Vertical : ancrage
+  // exact slot+fraction ; horizontal : proportionnel (best-effort — le contenu
+  // est centré, le navigateur clampe la valeur).
+  useLayoutEffect(() => {
+    const pending = pendingPinchAnchorRef.current;
+    if (!pending) {
+      return;
+    }
+    pendingPinchAnchorRef.current = null;
+    const root = scrollRef.current;
+    const slot = slots[pending.index];
+    if (!root || !slot) {
+      return;
+    }
+    root.scrollTop = Math.max(
+      0,
+      slot.top + pending.frac * slot.height - pending.viewY,
+    );
+    root.scrollLeft = Math.max(0, pending.contentX * pending.ratio - pending.viewX);
+  }, [slots]);
+
   // ── Imperative scrollToPage (used by sidebar / TOC / header / keyboard) ────
   useImperativeHandle(
     ref,
@@ -718,9 +815,13 @@ function ContinuousPageViewImpl(
   );
 
   return (
+    // Tactile : `overscroll-contain` bloque le pull-to-refresh ; touch-action
+    // suit l'outil (tracé → none : le doigt dessine sur la page active ;
+    // navigation → pan-x pan-y : scroll natif, le pinch app garde le zoom).
     <div
       ref={scrollRef}
-      className="h-full w-full overflow-auto bg-gray-200"
+      className="h-full w-full overflow-auto overscroll-contain bg-gray-200"
+      style={{ touchAction: touchActionForTool(tool) }}
       onScroll={handleScroll}
     >
       {/* Pre-sized content surface: total document height, absolute children. */}

@@ -55,6 +55,13 @@ import { runsToFabricStyles } from "./lib/text-runs";
 // Single source of truth for the text-baseline anchoring geometry, shared with
 // the save-time inverse in fabric-element-io.ts (was a bare `0.22` copied here).
 import { baselineTopFromBoundsY } from "./lib/text-baseline";
+// Tactile (mobile lot 2): larger touch handles on coarse pointers + a minimum
+// on-screen hit floor for tiny form-field widgets. No-ops on fine pointers.
+import {
+  coarseControlProps,
+  installFormFieldHitFloor,
+  type HitFloorTarget,
+} from "./lib/touch-interaction";
 import {
   composeDisplayText,
   leftIndentOffset,
@@ -1400,6 +1407,9 @@ export async function renderElementsOverlay(
               cornerStrokeColor: "#ffffff",
               cornerSize: 8,
               transparentCorners: false,
+              // Pointeur grossier : poignées tactiles élargies (touchCornerSize
+              // + padding) — {} sur pointeur fin, visuel desktop inchangé.
+              ...coarseControlProps(),
             });
             // Fit the word to its exact /Widths box for ANY font (embedded too): the
             // browser draws it at the FontFace's hmtx advance, a hair wider than the
@@ -1483,6 +1493,8 @@ export async function renderElementsOverlay(
           cornerStrokeColor: "#ffffff",
           cornerSize: 8,
           transparentCorners: false,
+          // Pointeur grossier : poignées tactiles élargies ({} sur desktop).
+          ...coarseControlProps(),
         });
         // Fit the run to its exact /Widths box for ANY font (embedded too). Even the
         // exact embedded subset renders at the FontFace's hmtx advance, which is a
@@ -1685,6 +1697,8 @@ export async function renderElementsOverlay(
           cornerStrokeColor: "#ffffff",
           cornerSize: 8,
           transparentCorners: false,
+          // Pointeur grossier : poignées tactiles élargies ({} sur desktop).
+          ...coarseControlProps(),
         };
         const w = shapeElement.bounds.width;
         const h = shapeElement.bounds.height;
@@ -2017,6 +2031,14 @@ export async function renderElementsOverlay(
             fieldName: formElement.fieldName,
             fieldType: formElement.fieldType,
           };
+          // Tactile : plancher du HIT à ~24 px écran (pointeur grossier
+          // uniquement — no-op sur desktop). Le rect VISUEL ne change pas,
+          // seul containsPoint (target finding Fabric) est élargi, en suivant
+          // le zoom live.
+          installFormFieldHitFloor(
+            hitRect as unknown as HitFloorTarget,
+            () => canvas.getZoom() || 1,
+          );
           canvas.add(hitRect as unknown as FabricObject);
         }
 
@@ -2747,6 +2769,8 @@ export function beginParagraphEditSession(
     cornerStrokeColor: "#ffffff",
     cornerSize: 8,
     transparentCorners: false,
+    // Pointeur grossier : poignées tactiles élargies ({} sur desktop).
+    ...coarseControlProps(),
   });
   if (Object.keys(styles).length > 0) {
     (tb as unknown as { set: (k: string, v: unknown) => void }).set(

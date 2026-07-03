@@ -4,6 +4,7 @@ export * from "./dialog";
 export * from "./command";
 export * from "./dropdown-menu";
 export * from "./select";
+export * from "./sheet";
 export * from "./tabs";
 export * from "./tooltip";
 export * from "./slider";

@@ -14,7 +14,14 @@ import type {
   DocumentLanguageInfo,
 } from "@giga-pdf/types";
 import type { RulerUnit, DocumentFontOption } from "@giga-pdf/editor";
-import { FontPicker, DEFAULT_FONTS } from "@giga-pdf/ui";
+import {
+  FontPicker,
+  DEFAULT_FONTS,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@giga-pdf/ui";
 import type { FontOption } from "@giga-pdf/ui";
 import {
   MousePointer2,
@@ -84,6 +91,8 @@ import {
   X,
   Presentation,
   Grid2x2,
+  Wrench,
+  type LucideIcon,
 } from "lucide-react";
 import { MergeDialog } from "./merge-dialog";
 import { SplitDialog } from "./split-dialog";
@@ -435,7 +444,8 @@ function ToolButton({
       disabled={disabled}
       title={label}
       className={`
-        p-2 rounded-lg transition-colors flex items-center gap-0.5
+        p-2 rounded-lg transition-colors flex items-center justify-center gap-0.5
+        pointer-coarse:min-h-11 pointer-coarse:min-w-11
         ${
           isActive
             ? "bg-primary text-primary-foreground"
@@ -472,8 +482,10 @@ function Dropdown({ isOpen, onClose, children }: DropdownProps) {
       }
     }
 
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
+    // pointerdown couvre souris ET tactile (mousedown seul laissait le
+    // dropdown bloqué ouvert au doigt).
+    document.addEventListener("pointerdown", handleClickOutside);
+    return () => document.removeEventListener("pointerdown", handleClickOutside);
   }, [isOpen, onClose]);
 
   if (!isOpen) return null;
@@ -861,8 +873,83 @@ export function EditorToolbar({
       <MessageSquare size={20} />
     );
 
+  // "PDF tools" — SINGLE source of truth rendered on two surfaces:
+  // - lg+  : the historical row of individual ToolButtons;
+  // - < lg : ONE Radix "Outils" dropdown (same handlers, same icons, same
+  //          labels) so the toolbar stays within 2-3 wrapped rows on mobile.
+  // Pure CSS switching (hidden lg:contents / lg:hidden): no breakpoint JS, no
+  // hydration risk. Every dialog stays mounted below regardless of surface.
+  const pdfToolItems: {
+    key: string;
+    icon: LucideIcon;
+    label: string;
+    onSelect: () => void;
+    disabled?: boolean;
+    isActive?: boolean;
+  }[] = [
+    { key: "merge", icon: Merge, label: t("merge"), onSelect: () => setShowMergeDialog(true) },
+    { key: "split", icon: Scissors, label: t("split"), onSelect: () => setShowSplitDialog(true) },
+    { key: "encrypt", icon: Lock, label: t("encrypt"), onSelect: () => setShowEncryptDialog(true) },
+    { key: "sign", icon: FileSignature, label: t("sign"), onSelect: () => setShowSignDialog(true) },
+    { key: "forms", icon: FileText, label: t("forms"), onSelect: () => onToggleFormsPanel?.() },
+    { key: "metadata", icon: FileSearch, label: t("metadata"), onSelect: () => setShowMetadataDialog(true) },
+    { key: "pageLabels", icon: Hash, label: tPageLabels("toolbarLabel"), onSelect: () => setShowPageLabelsDialog(true) },
+    { key: "convert", icon: FileCode, label: t("convert"), onSelect: () => setShowConvertDialog(true) },
+    { key: "flatten", icon: Layers, label: t("flatten"), onSelect: () => onFlattenPdf?.() },
+    { key: "compress", icon: Minimize2, label: t("compress"), onSelect: () => setShowCompressDialog(true) },
+    { key: "search", icon: Search, label: "Rechercher", onSelect: () => setShowSearchDialog(true) },
+    { key: "watermark", icon: Droplet, label: "Filigrane", onSelect: () => setShowWatermarkDialog(true) },
+    { key: "ocr", icon: ScanText, label: "OCR", onSelect: () => setShowOcrDialog(true) },
+    ...(onIndexOcr
+      ? [
+          {
+            key: "indexOcr",
+            icon: ScanSearch,
+            label: t("indexOcr"),
+            disabled: indexOcrBusy,
+            onSelect: () => onIndexOcr(),
+          },
+        ]
+      : []),
+    { key: "pdfa", icon: FileCheck2, label: "PDF/A", onSelect: () => setShowPdfADialog(true) },
+    { key: "presentation", icon: Presentation, label: tPresentation("toolbarLabel"), onSelect: () => setShowPresentationDialog(true) },
+    { key: "imposition", icon: Grid2x2, label: tImposition("toolbarLabel"), onSelect: () => setShowImpositionDialog(true) },
+    // Word-style running headers & footers — parity single ↔ continuous (see
+    // the original comment near the render). Zone flow preferred; legacy flat
+    // dialog kept when the zone flow isn't wired.
+    ...(onToggleHeaderFooterZones
+      ? [
+          {
+            key: "headersFooters",
+            icon: PanelTop,
+            label: tHeadersFooters("toolbarLabel"),
+            isActive: headerFooterEditing,
+            onSelect: onToggleHeaderFooterZones,
+          },
+        ]
+      : onToggleHeadersFooters
+        ? [
+            {
+              key: "headersFooters",
+              icon: PanelTop,
+              label: tHeadersFooters("toolbarLabel"),
+              isActive: headersFootersEnabled,
+              onSelect: () => {
+                if (!headersFootersEnabled) {
+                  onToggleHeadersFooters();
+                }
+                setShowHeadersFootersDialog(true);
+              },
+            },
+          ]
+        : []),
+  ];
+
   return (
-    <div className="editor-toolbar flex items-center gap-1 p-2 bg-background border-b">
+    // flex-wrap (NON-NEGOTIABLE): the toolbar folds onto extra rows instead of
+    // overflowing off-screen. NEVER add overflow-x-auto/overflow-hidden here —
+    // the home-made dropdowns are absolutely positioned and would be clipped.
+    <div className="editor-toolbar flex flex-wrap items-center gap-x-1 gap-y-1 pointer-coarse:gap-x-2 pointer-coarse:gap-y-2 p-2 bg-background border-b">
       {/* Undo/Redo */}
       <ToolButton
         icon={<Undo2 size={20} />}
@@ -1001,29 +1088,82 @@ export function EditorToolbar({
                 <span>{t(labelKey)}</span>
               </button>
             ))}
+            {/* Replis <md : les boutons individuels draw/redact sont masqués
+                sous md (voir plus bas) — les MÊMES outils restent accessibles
+                via ces entrées (jamais de fonctionnalité retirée). */}
+            <button
+              type="button"
+              data-testid="annotation-dropdown-draw"
+              onClick={() => {
+                onToolChange("draw");
+                setShowAnnotationDropdown(false);
+              }}
+              className={`
+                md:hidden flex items-center gap-2 px-2 py-1.5 rounded text-sm transition-colors
+                ${
+                  activeTool === "draw"
+                    ? "bg-primary text-primary-foreground"
+                    : "hover:bg-muted"
+                }
+              `}
+            >
+              <PenTool size={16} />
+              <span>{t("draw")}</span>
+            </button>
+            {onRedactApply ? (
+              <button
+                type="button"
+                data-testid="annotation-dropdown-redact"
+                onClick={() => {
+                  onToolChange("redact");
+                  setShowAnnotationDropdown(false);
+                }}
+                className={`
+                  md:hidden flex items-center gap-2 px-2 py-1.5 rounded text-sm transition-colors
+                  ${
+                    activeTool === "redact"
+                      ? "bg-primary text-primary-foreground"
+                      : "hover:bg-muted"
+                  }
+                `}
+              >
+                <Eraser size={16} />
+                <span>{t("redact")}</span>
+              </button>
+            ) : null}
           </div>
         </Dropdown>
       </div>
 
       {/* Outil crayon (draw tool) — tracé main-levée baké en annotation /Ink.
-          Réutilise le sélecteur couleur/épaisseur global (strokeColor/strokeWidth). */}
-      <ToolButton
-        icon={<PenTool size={20} />}
-        label={t("draw")}
-        isActive={activeTool === "draw"}
-        onClick={() => onToolChange("draw")}
-      />
+          Réutilise le sélecteur couleur/épaisseur global (strokeColor/strokeWidth).
+          Sous md le bouton individuel disparaît : l'outil reste accessible via
+          les entrées md:hidden du dropdown annotations (aucune perte de
+          fonctionnalité, juste moins de lignes wrap à 360px). */}
+      <span className="hidden md:contents">
+        <ToolButton
+          icon={<PenTool size={20} />}
+          label={t("draw")}
+          isActive={activeTool === "draw"}
+          onClick={() => onToolChange("draw")}
+        />
+      </span>
 
       {/* Outil rédaction (PII) — dessine des zones noires irréversibles.
-          Le bouton n'est rendu que si le handler d'application est fourni. */}
+          Le bouton n'est rendu que si le handler d'application est fourni.
+          Même repli md: que draw (entrée dans le dropdown annotations) ; le
+          cluster Appliquer/Effacer reste rendu à toutes les tailles dès que
+          l'outil rédaction est actif. */}
       {onRedactApply && (
         <>
-          <ToolButton
-            icon={<Eraser size={20} />}
-            label={t("redact")}
-            isActive={activeTool === "redact"}
-            onClick={() => onToolChange("redact")}
-          />
+          <span className="hidden md:contents">
+            <ToolButton
+              icon={<Eraser size={20} />}
+              label={t("redact")}
+              isActive={activeTool === "redact"}
+              onClick={() => onToolChange("redact")}
+            />
+          </span>
           {/* Cluster Appliquer / Effacer — visible uniquement en mode rédaction. */}
           {activeTool === "redact" && (
             <div className="flex items-center gap-1">
@@ -1539,125 +1679,55 @@ export function EditorToolbar({
         onClick={() => onToggleContentEdit?.()}
       />
 
-      <Separator />
+      {/* PDF Tools — lg+ surface: the historical row of individual buttons.
+          `lg:contents` keeps each button an independent flex item so the
+          toolbar's flex-wrap can break BETWEEN tools (a plain wrapper div
+          would wrap as one unbreakable ~800px chunk). */}
+      <div className="hidden lg:contents">
+        <Separator />
+        {pdfToolItems.map(({ key, icon: Icon, label, onSelect, disabled, isActive }) => (
+          <ToolButton
+            key={key}
+            icon={<Icon size={20} />}
+            label={label}
+            onClick={onSelect}
+            {...(disabled !== undefined ? { disabled } : {})}
+            {...(isActive !== undefined ? { isActive } : {})}
+          />
+        ))}
+      </div>
 
-      {/* PDF Tools */}
-      <ToolButton
-        icon={<Merge size={20} />}
-        label={t("merge")}
-        onClick={() => setShowMergeDialog(true)}
-      />
-      <ToolButton
-        icon={<Scissors size={20} />}
-        label={t("split")}
-        onClick={() => setShowSplitDialog(true)}
-      />
-      <ToolButton
-        icon={<Lock size={20} />}
-        label={t("encrypt")}
-        onClick={() => setShowEncryptDialog(true)}
-      />
-      <ToolButton
-        icon={<FileSignature size={20} />}
-        label={t("sign")}
-        onClick={() => setShowSignDialog(true)}
-      />
-      <ToolButton
-        icon={<FileText size={20} />}
-        label={t("forms")}
-        onClick={() => onToggleFormsPanel?.()}
-      />
-      <ToolButton
-        icon={<FileSearch size={20} />}
-        label={t("metadata")}
-        onClick={() => setShowMetadataDialog(true)}
-      />
-      <ToolButton
-        icon={<Hash size={20} />}
-        label={tPageLabels("toolbarLabel")}
-        onClick={() => setShowPageLabelsDialog(true)}
-      />
-      <ToolButton
-        icon={<FileCode size={20} />}
-        label={t("convert")}
-        onClick={() => setShowConvertDialog(true)}
-      />
-      <ToolButton
-        icon={<Layers size={20} />}
-        label={t("flatten")}
-        onClick={() => onFlattenPdf?.()}
-      />
-      <ToolButton
-        icon={<Minimize2 size={20} />}
-        label={t("compress")}
-        onClick={() => setShowCompressDialog(true)}
-      />
-      <ToolButton
-        icon={<Search size={20} />}
-        label="Rechercher"
-        onClick={() => setShowSearchDialog(true)}
-      />
-      <ToolButton
-        icon={<Droplet size={20} />}
-        label="Filigrane"
-        onClick={() => setShowWatermarkDialog(true)}
-      />
-      <ToolButton
-        icon={<ScanText size={20} />}
-        label="OCR"
-        onClick={() => setShowOcrDialog(true)}
-      />
-      {onIndexOcr && (
-        <ToolButton
-          icon={<ScanSearch size={20} />}
-          label={t("indexOcr")}
-          disabled={indexOcrBusy}
-          onClick={() => onIndexOcr()}
-        />
-      )}
-      <ToolButton
-        icon={<FileCheck2 size={20} />}
-        label="PDF/A"
-        onClick={() => setShowPdfADialog(true)}
-      />
-      <ToolButton
-        icon={<Presentation size={20} />}
-        label={tPresentation("toolbarLabel")}
-        onClick={() => setShowPresentationDialog(true)}
-      />
-      <ToolButton
-        icon={<Grid2x2 size={20} />}
-        label={tImposition("toolbarLabel")}
-        onClick={() => setShowImpositionDialog(true)}
-      />
-      {/* Word-style running headers & footers — available in BOTH the
-          continuous AND the single-page view (parity). The editable bands mount
-          on the active sheet in either mode (page.tsx wires <HeaderFooterZone>
-          into the continuous PageSlot overlay and the single-page EditorCanvas
-          overlay alike). The button is active when bands are on; clicking it
-          opens the editor (turning the feature on if it was off). */}
-      {onToggleHeaderFooterZones ? (
-        // SL2 — the toggle enters/leaves the editable header/footer ZONE mode.
-        <ToolButton
-          icon={<PanelTop size={20} />}
-          label={tHeadersFooters("toolbarLabel")}
-          isActive={headerFooterEditing}
-          onClick={onToggleHeaderFooterZones}
-        />
-      ) : onToggleHeadersFooters ? (
-        // Legacy flat-dialog path (kept when the zone flow isn't wired).
-        <ToolButton
-          icon={<PanelTop size={20} />}
-          label={tHeadersFooters("toolbarLabel")}
-          isActive={headersFootersEnabled}
-          onClick={() => {
-            if (!headersFootersEnabled) {
-              onToggleHeadersFooters();
-            }
-            setShowHeadersFootersDialog(true);
-          }}
-        />
-      ) : null}
+      {/* PDF Tools — <lg surface: ONE collapsed "Outils" menu (same handlers,
+          icons and labels as the buttons above — no functionality removed). */}
+      <div className="flex items-center lg:hidden">
+        <Separator />
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              title={t("tools")}
+              className="p-2 rounded-lg transition-colors flex items-center justify-center gap-1 pointer-coarse:min-h-11 pointer-coarse:min-w-11 hover:bg-muted text-muted-foreground hover:text-foreground cursor-pointer"
+            >
+              <Wrench size={20} />
+              {/* Le label textuel disparaît sous sm (le title/aria reste). */}
+              <span className="hidden text-sm sm:inline">{t("tools")}</span>
+              <ChevronDown size={12} />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-60 max-h-[70vh] overflow-y-auto">
+            {pdfToolItems.map(({ key, icon: Icon, label, onSelect, disabled }) => (
+              <DropdownMenuItem
+                key={key}
+                onClick={onSelect}
+                {...(disabled !== undefined ? { disabled } : {})}
+              >
+                <Icon className="mr-2 h-4 w-4" />
+                <span>{label}</span>
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
 
       {/* PDF operation dialogs */}
       <MergeDialog

@@ -59,6 +59,14 @@ import { PageMarginOverlay } from "./page-margin-overlay";
 import { PageRulers } from "./page-rulers";
 import type { PageMargins } from "./lib/page-margins";
 import type { RulerUnit } from "./lib/ruler-ticks";
+// Tactile editing (mobile lot 2): per-tool touch-action, Fabric touch flags,
+// touch-safe client coordinates (hand-tool pan) and app-level pinch-to-zoom.
+import {
+  touchActionForTool,
+  allowTouchScrollingForTool,
+  clientPointFromEvent,
+} from "./lib/touch-interaction";
+import { attachPinchZoom } from "./lib/pinch-zoom";
 
 /** Zoom hard bounds (10% – 800%) shared by wheel, toolbar and fit modes. */
 const MIN_ZOOM = 0.1;
@@ -470,8 +478,10 @@ const FIELD_DEFAULT_SIZES: Record<FieldCreationKind, { width: number; height: nu
   text: { width: 200, height: 30 },
   multiline: { width: 200, height: 80 },
   date: { width: 200, height: 30 },
-  checkbox: { width: 20, height: 20 },
-  radio_group: { width: 18, height: 18 },
+  // 24×24 minimum : cible tactile utilisable dès la création (lot 2 mobile) —
+  // en deçà, cocher au doigt une case fraîchement posée est une loterie.
+  checkbox: { width: 24, height: 24 },
+  radio_group: { width: 24, height: 24 },
   dropdown: { width: 200, height: 30 },
   // Liste à sélection visible : plusieurs lignes affichées d'un coup, donc
   // plus haute que la liste déroulante (combo) qui ne montre qu'une ligne.
@@ -1834,7 +1844,18 @@ export function EditorCanvas({
         backgroundColor: "#ffffff",
         selection: tool === "select",
         preserveObjectStacking: true,
+        // Tactile : sans ce flag, Fabric preventDefault CHAQUE touchstart/
+        // touchmove (listeners passive:false) + pose touch-action:none inline
+        // sur les canvases → scroll au doigt ET pinch morts sur toute la
+        // surface de la page. `true` pose touch-action:manipulation sur les
+        // canvases ; le gating par outil (tracé = pas de scroll) est porté par
+        // le wrapper (`touchActionForTool`) + le toggle JS runtime ci-dessous.
+        allowTouchScrolling: true,
       });
+      // Outils de tracé (draw/shape/…): Fabric doit re-preventDefault et
+      // streamer les touchmove (le crayon libre en dépend). Propriété lue à
+      // CHAQUE touchstart → toggle runtime sûr (l'effet [tool] la maintient).
+      canvas.allowTouchScrolling = allowTouchScrollingForTool(toolRef.current);
       // Architecture scale-pur dès l'init : sans ça, un zoom initial ≠ 1
       // (mode fit restauré) rendrait le contenu non-scalé dans un canvas
       // DOM déjà dimensionné à page×zoom.
@@ -2451,17 +2472,21 @@ export function EditorCanvas({
       // behaviour stays consistent (scrollbars visible, keyboard arrows still
       // work for fine adjustment).
       canvas.on("mouse:down", (opt) => {
-        const e = opt.e as MouseEvent;
+        // Fabric (mode touch events) forwarde des TouchEvent bruts : lire
+        // clientX dessus donne undefined → NaN dans le pan. Normalisation
+        // Mouse/Pointer/Touch via clientPointFromEvent (touches[0]).
+        const e = opt.e as MouseEvent | TouchEvent;
+        const point = clientPointFromEvent(e);
         const shouldPan =
-          e.button === 1 || // middle-click
+          (e as MouseEvent).button === 1 || // middle-click (undefined on touch)
           isSpaceDownRef.current ||
           toolRef.current === "hand";
-        if (!shouldPan) return;
+        if (!shouldPan || !point) return;
         const wrapper = scrollWrapperRef.current;
         isPanningRef.current = true;
         panStartRef.current = {
-          clientX: e.clientX,
-          clientY: e.clientY,
+          clientX: point.x,
+          clientY: point.y,
           scrollLeft: wrapper?.scrollLeft ?? 0,
           scrollTop: wrapper?.scrollTop ?? 0,
         };
@@ -2487,13 +2512,14 @@ export function EditorCanvas({
           return;
         }
         if (!isPanningRef.current || !panStartRef.current) return;
-        const e = opt.e as MouseEvent;
+        // Même normalisation Mouse/Pointer/Touch que le mouse:down du pan.
+        const point = clientPointFromEvent(opt.e);
         const wrapper = scrollWrapperRef.current;
-        if (!wrapper) return;
+        if (!wrapper || !point) return;
         wrapper.scrollLeft =
-          panStartRef.current.scrollLeft - (e.clientX - panStartRef.current.clientX);
+          panStartRef.current.scrollLeft - (point.x - panStartRef.current.clientX);
         wrapper.scrollTop =
-          panStartRef.current.scrollTop - (e.clientY - panStartRef.current.clientY);
+          panStartRef.current.scrollTop - (point.y - panStartRef.current.clientY);
       });
 
       // Snap léger (4 px) des champs de formulaire sur les bords des autres
@@ -2875,8 +2901,38 @@ export function EditorCanvas({
     // object underneath — the Fabric-native equivalent of isDrawingMode for our
     // manual polyline capture.
     fabricRef.current.skipTargetFind = tool === "draw";
+    // Tactile : outils de tracé → Fabric preventDefault + streame les
+    // touchmove (crayon libre) ; outils de navigation → scroll natif au doigt.
+    // Le gating CSS équivalent vit sur le wrapper (touchActionForTool en JSX).
+    fabricRef.current.allowTouchScrolling = allowTouchScrollingForTool(tool);
     fabricRef.current.renderAll();
   }, [tool]);
+
+  // Pinch-to-zoom applicatif (mode standalone uniquement — en mode intégré le
+  // défileur continu possède le zoom et attache son propre pinch sur son
+  // scroll root). Deux pointeurs TOUCH sur le viewport → zoom borné
+  // [MIN_ZOOM, MAX_ZOOM] ancré au midpoint des doigts, via le MÊME chemin que
+  // le Ctrl+molette (applyZoomAtClientPoint + zoomFromWheelRef + onZoomChanged
+  // → le parent remet fitMode à null). Souris/stylet ignorés (desktop intact).
+  useEffect(() => {
+    if (embedded) return;
+    const wrapper = scrollWrapperRef.current;
+    if (!wrapper) return;
+    return attachPinchZoom(wrapper, {
+      getZoom: () => fabricRef.current?.getZoom() || zoomRef.current || 1,
+      minZoom: MIN_ZOOM,
+      maxZoom: MAX_ZOOM,
+      onPinchZoom: (nextZoom, center) => {
+        const canvas = fabricRef.current;
+        if (!canvas) return;
+        const currentZoom = canvas.getZoom() || 1;
+        if (Math.abs(nextZoom - currentZoom) < 0.0005) return;
+        const applied = applyZoomAtClientPointRef.current(nextZoom, center);
+        zoomFromWheelRef.current = true;
+        onZoomChangedRef.current?.(applied);
+      },
+    });
+  }, [embedded]);
 
   // Hold-Space-to-pan : track Space key globally so the user can grab the
   // page from any tool without switching. We ignore the keystroke when an
@@ -3824,6 +3880,11 @@ export function EditorCanvas({
       style={{
         width: canvasWidth * zoom,
         height: canvasHeight * zoom,
+        // Tactile : gate le geste par outil. Fabric pose `manipulation` inline
+        // sur ses canvases (allowTouchScrolling:true) ; l'intersection avec ce
+        // wrapper donne : tracé → none (le doigt dessine, pas de scroll) ;
+        // select/hand/… → pan-x pan-y (scroll natif, pinch capté par l'app).
+        touchAction: touchActionForTool(tool),
       }}
     >
       {/* Le <canvas> Fabric est créé IMPÉRATIVEMENT et attaché à containerRef
@@ -3943,7 +4004,7 @@ export function EditorCanvas({
     // au scroll (c'était le bug « impossible de bouger dans la page »).
     <div
       ref={scrollWrapperRef}
-      className="editor-canvas-wrapper h-full w-full flex overflow-auto bg-gray-100 dark:bg-gray-900"
+      className="editor-canvas-wrapper h-full w-full flex overflow-auto overscroll-contain bg-gray-100 dark:bg-gray-900"
     >
       {/* m-auto : centre la page quand elle est plus petite que le viewport
           (les marges auto se replient à 0 en cas d'overflow → coin haut-

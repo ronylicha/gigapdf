@@ -2152,7 +2152,8 @@
         "date": "Date"
       },
       "squiggly": "Squiggly",
-      "freetext": "Free text"
+      "freetext": "Free text",
+      "tools": "Tools"
     },
     "tools": {
       "select": "Select",

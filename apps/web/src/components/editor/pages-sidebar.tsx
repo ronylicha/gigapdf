@@ -134,8 +134,9 @@ export function PagesSidebar({
               {index + 1}
             </div>
 
-            {/* Actions (visible on hover) */}
-            <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col gap-1">
+            {/* Actions — hover souris ; toujours visibles au doigt
+                (pointer-coarse), sinon inaccessibles faute de hover. */}
+            <div className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 pointer-coarse:opacity-100 transition-opacity flex flex-col gap-1">
               {/* Move up */}
               {onPageReorder && index > 0 && (
                 <button
@@ -145,7 +146,7 @@ export function PagesSidebar({
                     handleMoveUp(index);
                   }}
                   title={t("moveUp")}
-                  className="p-1 bg-background/80 rounded hover:bg-background"
+                  className="p-1 pointer-coarse:p-2 bg-background/80 rounded hover:bg-background"
                 >
                   <ChevronUp size={12} />
                 </button>
@@ -159,7 +160,7 @@ export function PagesSidebar({
                     handleMoveDown(index);
                   }}
                   title={t("moveDown")}
-                  className="p-1 bg-background/80 rounded hover:bg-background"
+                  className="p-1 pointer-coarse:p-2 bg-background/80 rounded hover:bg-background"
                 >
                   <ChevronDown size={12} />
                 </button>
@@ -173,7 +174,7 @@ export function PagesSidebar({
                     onPageDuplicate(index);
                   }}
                   title={t("duplicate")}
-                  className="p-1 bg-background/80 rounded hover:bg-primary hover:text-primary-foreground"
+                  className="p-1 pointer-coarse:p-2 bg-background/80 rounded hover:bg-primary hover:text-primary-foreground"
                 >
                   <Copy size={12} />
                 </button>
@@ -187,7 +188,7 @@ export function PagesSidebar({
                     onPageRotate(index);
                   }}
                   title={t("rotate")}
-                  className="p-1 bg-background/80 rounded hover:bg-muted transition-colors"
+                  className="p-1 pointer-coarse:p-2 bg-background/80 rounded hover:bg-muted transition-colors"
                 >
                   <RotateCw size={12} />
                 </button>
@@ -201,7 +202,7 @@ export function PagesSidebar({
                     onPageResize(index);
                   }}
                   title={t("resize")}
-                  className="p-1 bg-background/80 rounded hover:bg-muted transition-colors"
+                  className="p-1 pointer-coarse:p-2 bg-background/80 rounded hover:bg-muted transition-colors"
                 >
                   <Scaling size={12} />
                 </button>
@@ -215,7 +216,7 @@ export function PagesSidebar({
                     onPageExtract(index);
                   }}
                   title={t("extract")}
-                  className="p-1 bg-background/80 rounded hover:bg-muted transition-colors"
+                  className="p-1 pointer-coarse:p-2 bg-background/80 rounded hover:bg-muted transition-colors"
                 >
                   <FileOutput size={12} />
                 </button>
@@ -229,7 +230,7 @@ export function PagesSidebar({
                     onPageDelete(index);
                   }}
                   title={t("delete")}
-                  className="p-1 bg-background/80 rounded hover:bg-destructive hover:text-destructive-foreground"
+                  className="p-1 pointer-coarse:p-2 bg-background/80 rounded hover:bg-destructive hover:text-destructive-foreground"
                 >
                   <Trash2 size={12} />
                 </button>

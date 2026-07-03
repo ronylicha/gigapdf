@@ -167,7 +167,7 @@ export function ConvertDialog({ isOpen, onClose }: ConvertDialogProps) {
       aria-modal="true"
       aria-labelledby="convert-dialog-title"
     >
-      <div className="relative w-full max-w-lg rounded-xl bg-background shadow-2xl border border-border flex flex-col max-h-[90vh]">
+      <div className="relative w-full max-w-[calc(100vw-2rem)] sm:max-w-lg rounded-xl bg-background shadow-2xl border border-border flex flex-col max-h-[90dvh]">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border shrink-0">
           <div className="flex items-center gap-2">

@@ -54,3 +54,6 @@ export type {
 } from "./continuous-page-view";
 export { PageSlot } from "./page-slot";
 export type { PageSlotProps } from "./page-slot";
+
+export { MobileZoomControls } from "./mobile-zoom-controls";
+export type { MobileZoomControlsProps } from "./mobile-zoom-controls";

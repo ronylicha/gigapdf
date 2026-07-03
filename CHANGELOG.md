@@ -5,6 +5,32 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.22.0] - 2026-07-03
+
+### Added — the editor works on a phone
+
+- **The toolbar wraps onto multiple lines instead of running off-screen.** Its
+  ~50 tools used to sit on one ~1,800 px row that overflowed even on a laptop;
+  it now wraps (2 lines on desktop, ~3 on a phone), and on smaller screens the
+  17 document tools (merge, split, compress, OCR…) fold into a single "Tools"
+  menu — nothing was removed, every tool keeps its exact behaviour.
+- **The side panels become slide-in drawers on mobile.** Pages, Properties,
+  Document info and Forms used to claim 700+ fixed pixels, leaving no room for
+  the document below ~900 px. They are now hidden on small screens and open as
+  touch-friendly drawers; the canvas gets the whole width, with the fit-to-width
+  zoom recomputed as the layout changes. The header and footer compact
+  themselves too.
+- **Real touch editing.** Touch scrolling and panning now work across the whole
+  document (the canvas used to swallow every touch), **pinch-to-zoom** zooms the
+  document anchored under your fingers in both view modes, the Hand tool works
+  with a finger, selection handles and form fields get larger touch targets,
+  menus close on tap, and hover-only actions (page thumbnails, content-edit
+  zones) are reachable on touch screens.
+- **Dialogs fit small screens** — capped to the visible height with internal
+  scrolling and safe margins (the signature capture pad adapts too) — and a
+  **floating zoom pill** (−  %  +) sits bottom-right on mobile, thumb-reach,
+  with a tap on the percentage cycling fit-width → fit-page → 100 %.
+
 ## [1.21.0] - 2026-07-03
 
 ### Added — edit whole paragraphs, like Adobe (engine 0.114.x)

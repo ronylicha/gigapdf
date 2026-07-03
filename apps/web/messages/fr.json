@@ -2152,7 +2152,8 @@
         "date": "Date"
       },
       "squiggly": "Ondulé",
-      "freetext": "Texte libre"
+      "freetext": "Texte libre",
+      "tools": "Outils"
     },
     "tools": {
       "select": "Sélectionner",

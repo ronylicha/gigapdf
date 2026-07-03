@@ -1053,7 +1053,7 @@ export function DocumentTable({
         open={previewOpen}
         onOpenChange={(open) => (open ? setPreviewOpen(true) : closePreview())}
       >
-        <DialogContent className="max-w-5xl h-[90vh] flex flex-col p-0">
+        <DialogContent className="sm:max-w-5xl h-[90dvh] flex flex-col p-0">
           <DialogHeader className="px-6 py-4 border-b flex-shrink-0">
             <DialogTitle className="truncate pr-4">{selectedDoc?.name}</DialogTitle>
           </DialogHeader>

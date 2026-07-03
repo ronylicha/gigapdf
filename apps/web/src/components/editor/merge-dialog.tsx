@@ -109,7 +109,10 @@ export function MergeDialog({ open, onClose }: MergeDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={(isOpen) => { if (!isOpen) handleClose(); }}>
-      <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
+      {/* Explicit mobile-safety classes (also the Tailwind emission anchor for
+          the same class strings used by the shared @giga-pdf/ui DialogContent,
+          whose pre-bundled source is not scanned by the consumer's Tailwind). */}
+      <DialogContent className="max-w-[calc(100vw-2rem)] sm:max-w-lg max-h-[90dvh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>{t("title")}</DialogTitle>
           <DialogDescription>{t("description")}</DialogDescription>

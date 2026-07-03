@@ -1011,7 +1011,7 @@ export function DocumentExplorer({
 
       {/* Move Dialog */}
       <Dialog open={moveDialogOpen} onOpenChange={setMoveDialogOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>{t("moveDialog.title")}</DialogTitle>
             <DialogDescription>

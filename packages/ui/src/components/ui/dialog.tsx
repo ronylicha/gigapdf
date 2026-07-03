@@ -48,8 +48,16 @@ const DialogContent = React.forwardRef<
         transform: "translate(-50%, -50%)",
         zIndex: 50,
       }}
+      // Mobile safety (small screens): 1rem side margins, height capped to the
+      // DYNAMIC viewport (dvh — mobile browser bars) and internal scroll so
+      // content is never clipped. These utility classes are emitted through the
+      // SAME channel as the existing ones (max-w-lg, p-6, …): the consuming
+      // app's Tailwind scan of ITS OWN sources — apps/web references the exact
+      // same class strings (merge/convert/signature dialogs), which keeps them
+      // generated. Width overrides from consumers must use the sm: variant
+      // (e.g. `sm:max-w-5xl`) so the base mobile margin is preserved.
       className={cn(
-        "grid w-full max-w-lg gap-4 border bg-background p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 sm:rounded-lg",
+        "grid w-full max-w-[calc(100vw-2rem)] max-h-[90dvh] gap-4 overflow-y-auto border bg-background p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 sm:max-w-lg sm:rounded-lg",
         className
       )}
       {...props}

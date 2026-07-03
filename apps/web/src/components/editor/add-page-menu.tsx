@@ -52,11 +52,13 @@ export function AddPageMenu({ onAddPage }: AddPageMenuProps) {
 
   useEffect(() => {
     if (!open) return;
-    function onDocMouseDown(e: MouseEvent) {
+    function onDocPointerDown(e: MouseEvent) {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     }
-    document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
+    // pointerdown couvre souris ET tactile (mousedown seul laissait le menu
+    // bloqué ouvert au doigt).
+    document.addEventListener("pointerdown", onDocPointerDown);
+    return () => document.removeEventListener("pointerdown", onDocPointerDown);
   }, [open]);
 
   const confirm = () => {

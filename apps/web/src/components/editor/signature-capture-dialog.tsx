@@ -414,7 +414,7 @@ export function SignatureCaptureDialog({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="relative w-full max-w-lg rounded-xl border border-border bg-background shadow-2xl flex flex-col max-h-[90vh] overflow-y-auto">
+      <div className="relative w-full max-w-[calc(100vw-2rem)] sm:max-w-lg rounded-xl border border-border bg-background shadow-2xl flex flex-col max-h-[90dvh] overflow-y-auto">
         {/* Header */}
         <div className="flex items-start justify-between gap-4 px-6 pt-5 pb-2">
           <div className="flex items-center gap-2">
@@ -492,10 +492,14 @@ export function SignatureCaptureDialog({
           {tab === "draw" && (
             <div className="space-y-2">
               <p className="text-xs text-muted-foreground">{t("drawHint")}</p>
+              {/* Adaptive drawing height: shorter on small screens so the
+                  dialog (kind toggle + tabs + footer) fits a 360×740 viewport
+                  without clipping. The init effect sizes the DPR backing store
+                  from clientWidth/clientHeight, and the ink-trim export crops
+                  to the drawn bounding box — neither depends on a fixed size. */}
               <canvas
                 ref={canvasRef}
-                style={{ height: 200 }}
-                className="w-full rounded-md border border-input bg-white touch-none cursor-crosshair"
+                className="h-[160px] sm:h-[200px] w-full rounded-md border border-input bg-white touch-none cursor-crosshair"
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
                 onPointerUp={handlePointerUp}

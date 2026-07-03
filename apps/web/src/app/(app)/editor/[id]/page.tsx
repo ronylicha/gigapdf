@@ -48,6 +48,8 @@ import {
   RotateCcw,
   FileText,
   Sheet,
+  PanelLeft,
+  SlidersHorizontal,
   Presentation,
   FileImage,
   FileCode,
@@ -63,7 +65,17 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  // Aliased: the lucide `Sheet` icon above already owns the bare name.
+  Sheet as UiSheet,
+  SheetContent,
+  SheetTitle,
+  SheetClose,
 } from "@giga-pdf/ui";
+import {
+  useMediaQuery,
+  MOBILE_MEDIA_QUERY,
+  COMPACT_MEDIA_QUERY,
+} from "@/hooks/use-media-query";
 
 import { useDocument } from "@/hooks/use-document";
 import { useDocumentSave } from "@/hooks/use-document-save";
@@ -81,6 +93,7 @@ import {
   CollaboratorsList,
   DocumentInfoSidebar,
   ContinuousPageView,
+  MobileZoomControls,
 } from "@/components/editor";
 import type { ContinuousPageViewHandle, BookmarkInput } from "@/components/editor";
 import type {
@@ -334,6 +347,14 @@ export default function EditorPage() {
 
   // Share dialog (GED) — partage le document STOCKÉ (storedDocumentId)
   const [showShareDialog, setShowShareDialog] = useState(false);
+
+  // Mobile layout — the side panels become drawers (Sheet) on small screens.
+  // Both media hooks default to DESKTOP (false) at SSR/jsdom, so the server
+  // markup and existing tests keep the desktop layout with no matchMedia mock.
+  const isMobile = useMediaQuery(MOBILE_MEDIA_QUERY); // < md (768px)
+  const isCompact = useMediaQuery(COMPACT_MEDIA_QUERY); // < lg (1024px)
+  const [showPagesSheet, setShowPagesSheet] = useState(false);
+  const [showPropertiesSheet, setShowPropertiesSheet] = useState(false);
 
   // Canvas store — tool, zoom, tool options
   const {
@@ -5085,14 +5106,14 @@ export default function EditorPage() {
       />
 
       {/* Header */}
-      <header className="flex items-center justify-between border-b px-4 py-2">
-        <div className="flex items-center gap-3">
+      <header className="flex items-center justify-between gap-2 border-b px-2 py-2 md:px-4">
+        <div className="flex min-w-0 items-center gap-3">
           <Link href="/documents">
             <Button variant="ghost" size="icon" title={t("back")}>
               <ArrowLeft className="h-4 w-4" />
             </Button>
           </Link>
-          <div>
+          <div className="min-w-0">
             {isEditingName ? (
               <div className="flex items-center gap-1">
                 <input
@@ -5102,7 +5123,7 @@ export default function EditorPage() {
                   onChange={(e) => setEditedName(e.target.value)}
                   onKeyDown={handleNameKeyDown}
                   onBlur={handleConfirmRename}
-                  className="text-base font-semibold bg-transparent border-b-2 border-primary outline-none px-1 py-0.5 min-w-[200px]"
+                  className="text-base font-semibold bg-transparent border-b-2 border-primary outline-none px-1 py-0.5 min-w-[120px] sm:min-w-[200px]"
                   placeholder={t("untitled")}
                 />
                 <Button
@@ -5125,8 +5146,8 @@ export default function EditorPage() {
                 </Button>
               </div>
             ) : (
-              <div className="flex items-center gap-1 group cursor-pointer" onClick={handleStartRename}>
-                <h1 className="text-base font-semibold hover:text-primary transition-colors">
+              <div className="flex min-w-0 items-center gap-1 group cursor-pointer" onClick={handleStartRename}>
+                <h1 className="min-w-0 truncate text-base font-semibold hover:text-primary transition-colors">
                   {name || t("untitled")}
                   {isDirty && <span className="ml-1 text-muted-foreground">*</span>}
                 </h1>
@@ -5142,7 +5163,7 @@ export default function EditorPage() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex shrink-0 items-center gap-2 md:gap-3">
           {/* Collaborateurs connectés */}
           {collaboratorCount > 0 && (
             <CollaboratorsList collaborators={collaborators} maxVisible={4} />
@@ -5160,10 +5181,13 @@ export default function EditorPage() {
             )}
           </div>
 
+          {/* Below md these three actions collapse into the "Actions document"
+              menu (mirror items marked md:hidden inside it) to keep the header
+              compact; the canvas stays the priority on mobile. */}
           <Button
             variant="outline"
             size="sm"
-            className="gap-2"
+            className="hidden gap-2 md:inline-flex"
             onClick={() => setShowShareDialog(true)}
             disabled={!storedDocumentId}
           >
@@ -5173,7 +5197,7 @@ export default function EditorPage() {
           <Button
             variant="outline"
             size="sm"
-            className="gap-2"
+            className="hidden gap-2 md:inline-flex"
             onClick={handleExport}
           >
             <Download className="h-4 w-4" />
@@ -5181,7 +5205,7 @@ export default function EditorPage() {
           </Button>
           <Button
             size="sm"
-            className="gap-2"
+            className="hidden gap-2 md:inline-flex"
             onClick={save}
             disabled={saving || !isDirty}
           >
@@ -5212,6 +5236,33 @@ export default function EditorPage() {
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-64">
+              {/* Mobile mirrors of the header actions (hidden from md up where
+                  the dedicated buttons are visible). Same handlers/guards. */}
+              <DropdownMenuItem
+                className="md:hidden"
+                onClick={() => setShowShareDialog(true)}
+                disabled={!storedDocumentId}
+              >
+                <Users className="mr-2 h-4 w-4" />
+                <span>{t("share")}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem className="md:hidden" onClick={handleExport}>
+                <Download className="mr-2 h-4 w-4" />
+                <span>{t("export")}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                className="md:hidden"
+                onClick={save}
+                disabled={saving || !isDirty}
+              >
+                {saving ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Save className="mr-2 h-4 w-4" />
+                )}
+                <span>{t("save")}</span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator className="md:hidden" />
               <DropdownMenuItem
                 onClick={handleRestoreOriginal}
                 disabled={!storedDocumentId || restoring}
@@ -5489,10 +5540,14 @@ export default function EditorPage() {
         tableCount={documentTables.length}
       />
 
-      {/* Main content */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* Pages sidebar */}
-        <PagesSidebar
+      {/* Main content — `relative` so the floating mobile zoom cluster can
+          anchor bottom-right of the canvas row (above the footer) in BOTH view
+          modes (continuous main is overflow-hidden, single-page main scrolls). */}
+      <div className="relative flex flex-1 overflow-hidden">
+        {/* Pages sidebar — inline from md up; below md the SAME component is
+            served through the left Sheet (footer PanelLeft button). */}
+        <div className="hidden md:flex">
+          <PagesSidebar
           pages={pages}
           currentPageIndex={effectivePageIndex}
           onPageSelect={(index) => navigateToPage(index, "start")}
@@ -5505,7 +5560,8 @@ export default function EditorPage() {
           onPageExtract={handlePageExtract}
           onPageResize={handlePageResize}
           thumbnails={thumbnails}
-        />
+          />
+        </div>
 
         {/* Canvas — continuous virtualised scroller OR legacy single page.
             Continuous mode owns its own scroll container, so the <main> does
@@ -5514,9 +5570,11 @@ export default function EditorPage() {
         <main
           ref={canvasRef}
           className={
+            // min-w-0: allow the canvas to shrink inside the flex row instead
+            // of forcing horizontal page scroll on narrow viewports.
             isContinuous
-              ? "relative flex-1 overflow-hidden"
-              : "relative flex-1 overflow-auto"
+              ? "relative min-w-0 flex-1 overflow-hidden"
+              : "relative min-w-0 flex-1 overflow-auto"
           }
           onMouseMove={isContinuous ? undefined : handleMouseMove}
         >
@@ -5573,6 +5631,9 @@ export default function EditorPage() {
               onRedactionMarksChanged={setRedactionMarkCount}
               fitMode={fitMode}
               onFitZoomChange={setZoom}
+              // Pinch tactile = zoom MANUEL : sort du mode fit puis setZoom
+              // (même contrat que la molette / les presets de la toolbar).
+              onManualZoomChange={handleManualZoomChange}
               onElementAdded={handleElementAdded}
               onInkDrawn={handleAddInk}
               onElementModified={handleElementModified}
@@ -5726,8 +5787,23 @@ export default function EditorPage() {
           </ContentEditProvider>
         </main>
 
-        {/* Properties panel */}
-        <PropertiesPanel
+        {/* Floating thumb-reachable zoom cluster (mobile only, md:hidden).
+            Sibling of <main> anchored to the relative row, so it never scrolls
+            with the single-page canvas and stays clear of the footer. Same
+            manual-zoom contract as the toolbar (exits fit mode). */}
+        <MobileZoomControls
+          zoom={zoom}
+          fitMode={fitMode}
+          onZoomChange={handleManualZoomChange}
+          onFitPage={handleFitPage}
+          onFitWidth={handleFitWidth}
+        />
+
+        {/* Properties panel — inline from lg up; below lg the SAME component
+            opens in a right Sheet on demand (footer button), so a selection
+            never steals the canvas automatically. */}
+        <div className="hidden lg:flex">
+          <PropertiesPanel
           documentFonts={documentFontOptions}
           selectedElements={selectedElements}
           onElementUpdate={handleElementUpdate}
@@ -5747,11 +5823,14 @@ export default function EditorPage() {
           }
           onApplyTextStyle={handleApplyTextStyle}
           onReplaceImage={handleReplaceImage}
-        />
+          />
+        </div>
 
         {/* Document info sidebar (TOC, Layers, Embedded Files). Layers reflect
-            the active page (the focused page in continuous mode). */}
-        <DocumentInfoSidebar
+            the active page (the focused page in continuous mode). Secondary
+            feature: simply hidden below xl (no drawer). */}
+        <div className="hidden xl:flex">
+          <DocumentInfoSidebar
           outlines={outlines}
           layers={layers}
           documentLanguage={documentLanguage}
@@ -5788,11 +5867,14 @@ export default function EditorPage() {
           onListAnnotations={handleListAnnotations}
           onRemoveAnnotation={handleRemoveAnnotation}
           pageCount={pages.length}
-        />
+          />
+        </div>
 
-        {/* Forms panel (conditionally shown) */}
+        {/* Forms panel (conditionally shown) — inline from lg up; below lg the
+            same toggle opens it in a right Sheet (see mobile drawers below). */}
         {showFormsPanel && (
-          <FormsPanel
+          <div className="hidden lg:flex">
+            <FormsPanel
             currentFile={currentPdfFile}
             mode={formsMode}
             onModeChange={(nextMode) => {
@@ -5811,9 +5893,130 @@ export default function EditorPage() {
               // restait STALE après un remplissage via le panneau formulaire.
               adoptModifiedPdf(blob, { reparse: true });
             }}
-          />
+            />
+          </div>
         )}
       </div>
+
+      {/* ── Mobile drawers ──────────────────────────────────────────────────
+          The SAME panel components as the inline instances above, served in
+          Radix Sheets on small screens. Open states are additionally gated by
+          the media hooks so a drawer left open never lingers over the desktop
+          layout after a resize. Content is portaled + unmounted when closed. */}
+      <UiSheet
+        open={showPagesSheet && isMobile}
+        onOpenChange={setShowPagesSheet}
+      >
+        <SheetContent side="left" showClose={false} style={{ width: "13rem" }}>
+          <div className="flex shrink-0 items-center justify-between border-b pl-3">
+            <SheetTitle>{t("pages.title")}</SheetTitle>
+            <SheetClose
+              aria-label={t("cancel")}
+              className="flex h-11 w-11 cursor-pointer items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <X className="h-4 w-4" />
+            </SheetClose>
+          </div>
+          <div className="flex min-h-0 flex-1">
+            <PagesSidebar
+              pages={pages}
+              currentPageIndex={effectivePageIndex}
+              onPageSelect={(index) => {
+                navigateToPage(index, "start");
+                setShowPagesSheet(false);
+              }}
+              onPageAdd={handleAddPage}
+              onPageDelete={handleDeletePage}
+              onPageReorder={handleReorderPages}
+              onPageDuplicate={handleDuplicatePage}
+              previewBaseUrl={process.env.NEXT_PUBLIC_API_URL}
+              onPageRotate={handlePageRotate}
+              onPageExtract={handlePageExtract}
+              onPageResize={handlePageResize}
+              thumbnails={thumbnails}
+            />
+          </div>
+        </SheetContent>
+      </UiSheet>
+
+      <UiSheet
+        open={showPropertiesSheet && isCompact}
+        onOpenChange={setShowPropertiesSheet}
+      >
+        <SheetContent side="right" showClose={false} style={{ width: "17rem" }}>
+          <div className="flex shrink-0 items-center justify-between border-b pl-3">
+            <SheetTitle>{t("properties.title")}</SheetTitle>
+            <SheetClose
+              aria-label={t("cancel")}
+              className="flex h-11 w-11 cursor-pointer items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <X className="h-4 w-4" />
+            </SheetClose>
+          </div>
+          <div className="flex min-h-0 flex-1">
+            <PropertiesPanel
+              documentFonts={documentFontOptions}
+              selectedElements={selectedElements}
+              onElementUpdate={handleElementUpdate}
+              pageInfo={pageInfo}
+              zoom={zoom}
+              allFieldNames={allFieldNames}
+              userLayers={userLayers}
+              onAssignElementToLayer={handleAssignElementToLayer}
+              pageNumber={effectivePageIndex + 1}
+              getDocumentBytes={getPreparedBlob}
+              onPageBoxesApplied={(bytes) =>
+                updateCurrentPdfFile(
+                  new File(
+                    [new Uint8Array(bytes)],
+                    currentPdfFile?.name ?? "document.pdf",
+                    { type: "application/pdf" },
+                  ),
+                )
+              }
+              onApplyTextStyle={handleApplyTextStyle}
+              onReplaceImage={handleReplaceImage}
+            />
+          </div>
+        </SheetContent>
+      </UiSheet>
+
+      <UiSheet
+        open={showFormsPanel && isCompact}
+        onOpenChange={(open) => {
+          if (!open) toggleFormsPanel();
+        }}
+      >
+        <SheetContent side="right" showClose={false} style={{ width: "19rem" }}>
+          <div className="flex shrink-0 items-center justify-between border-b pl-3">
+            <SheetTitle>{t("forms.title")}</SheetTitle>
+            <SheetClose
+              aria-label={t("cancel")}
+              className="flex h-11 w-11 cursor-pointer items-center justify-center text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <X className="h-4 w-4" />
+            </SheetClose>
+          </div>
+          <div className="flex min-h-0 flex-1">
+            <FormsPanel
+              currentFile={currentPdfFile}
+              mode={formsMode}
+              onModeChange={(nextMode) => {
+                setFormsMode(nextMode);
+                setFocusedFormField(null);
+              }}
+              onFieldsLoaded={setLoadedFormFields}
+              focusedFieldName={focusedFormField}
+              designFields={designFields}
+              onDesignFieldSelect={handleDesignFieldSelect}
+              onDesignFieldReorder={handleDesignFieldReorder}
+              onPdfUpdated={(blob) => {
+                adoptModifiedPdf(blob, { reparse: true });
+              }}
+            />
+          </div>
+        </SheetContent>
+      </UiSheet>
 
       {/* Share dialog (GED) — partage le document STOCKÉ, pas la copie de session */}
       <ShareDialog
@@ -5866,16 +6069,36 @@ export default function EditorPage() {
         onInsert={handleSignatureInsert}
       />
 
-      {/* Status bar */}
-      <footer className="flex items-center justify-between border-t px-4 py-1.5 text-xs text-muted-foreground">
-        <div className="flex items-center gap-4">
+      {/* Status bar — flex-wrap so it never forces horizontal page scroll. */}
+      <footer className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t px-2 py-1.5 text-xs text-muted-foreground md:px-4">
+        <div className="flex items-center gap-2 md:gap-4">
+          {/* Mobile drawer openers (pure-CSS hidden on larger screens where
+              the panels are inline). ≥44px targets on coarse pointers. */}
+          <button
+            type="button"
+            onClick={() => setShowPagesSheet(true)}
+            title={t("pages.title")}
+            aria-label={t("pages.title")}
+            className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground pointer-coarse:h-11 pointer-coarse:w-11 md:hidden"
+          >
+            <PanelLeft className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowPropertiesSheet(true)}
+            title={t("properties.title")}
+            aria-label={t("properties.title")}
+            className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground pointer-coarse:h-11 pointer-coarse:w-11 lg:hidden"
+          >
+            <SlidersHorizontal className="h-4 w-4" />
+          </button>
           <span>
             {t("pageIndicator", {
               current: currentPageIndex + 1,
               total: pages.length,
             })}
           </span>
-          <span className="text-muted-foreground/60">
+          <span className="hidden text-muted-foreground/60 md:inline">
             {t("shortcuts.hint")} (V: Select, T: Text, S: Shape, I: Image, F:
             Form)
           </span>

@@ -23,11 +23,35 @@ vi.mock("next-intl", () => ({
   useTranslations: (ns: string) => (key: string) => `${ns}.${key}`,
 }));
 
-// @giga-pdf/ui — only FontPicker + DEFAULT_FONTS are runtime imports.
-vi.mock("@giga-pdf/ui", () => ({
-  FontPicker: () => null,
-  DEFAULT_FONTS: [],
-}));
+// @giga-pdf/ui — FontPicker/DEFAULT_FONTS + the Radix dropdown primitives used
+// by the collapsed "Outils" menu (passthroughs: children render inline; the
+// menu items carry NO `title` attribute, so getByTitle stays unique).
+vi.mock("@giga-pdf/ui", async () => {
+  const React = await import("react");
+  const passthrough = ({ children }: { children?: React.ReactNode }) =>
+    React.createElement(React.Fragment, null, children);
+  return {
+    FontPicker: () => null,
+    DEFAULT_FONTS: [],
+    DropdownMenu: passthrough,
+    DropdownMenuTrigger: passthrough,
+    DropdownMenuContent: passthrough,
+    DropdownMenuItem: ({
+      children,
+      onClick,
+      disabled,
+    }: {
+      children?: React.ReactNode;
+      onClick?: () => void;
+      disabled?: boolean;
+    }) =>
+      React.createElement(
+        "button",
+        { type: "button", role: "menuitem", onClick, disabled },
+        children,
+      ),
+  };
+});
 
 // Stub the toolbar's heavy child modules to inert components. We test the
 // toolbar's gating logic, not its children (covered by their own suites).

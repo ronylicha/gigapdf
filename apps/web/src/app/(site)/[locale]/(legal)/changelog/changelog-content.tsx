@@ -15,6 +15,16 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.22.0",
+    date: "2026-07-03",
+    type: "minor",
+    changes: [
+      { type: "improvement", description: "The editor toolbar wraps onto multiple lines instead of running off-screen (its ~50 tools overflowed even on a laptop). On smaller screens the 17 document tools (merge, split, compress, OCR…) fold into a single 'Tools' menu — nothing removed, same behaviours." },
+      { type: "feature", description: "The editor works on a phone: side panels (Pages, Properties, Forms, Document info) become slide-in drawers so the document gets the whole width; the header and footer compact themselves; dialogs fit the visible height with internal scrolling; a floating zoom pill (− % +) sits bottom-right at thumb reach, with a tap on the percentage cycling fit-width → fit-page → 100%." },
+      { type: "feature", description: "Real touch editing: touch scrolling and panning work across the whole document (the canvas used to swallow every touch), pinch-to-zoom anchors under your fingers in both view modes, the Hand tool works with a finger, selection handles and form fields get larger touch targets, and hover-only actions are reachable on touch screens." },
+    ],
+  },
+  {
     version: "1.21.0",
     date: "2026-07-03",
     type: "minor",

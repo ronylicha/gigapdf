@@ -227,9 +227,10 @@ function TextFormatCluster({
         setShowSpacing(false);
       }
     }
-    document.addEventListener("mousedown", handleClickOutside);
+    // pointerdown couvre souris ET tactile (fermeture au doigt).
+    document.addEventListener("pointerdown", handleClickOutside);
     return () =>
-      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("pointerdown", handleClickOutside);
   }, [showSpacing]);
 
   useEffect(() => {
@@ -242,9 +243,10 @@ function TextFormatCluster({
         setShowParagraph(false);
       }
     }
-    document.addEventListener("mousedown", handleClickOutside);
+    // pointerdown couvre souris ET tactile (fermeture au doigt).
+    document.addEventListener("pointerdown", handleClickOutside);
     return () =>
-      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("pointerdown", handleClickOutside);
   }, [showParagraph]);
 
   // Source of truth for the active states = the primary (first) selection.

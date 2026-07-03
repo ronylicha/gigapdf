@@ -66,7 +66,7 @@ function ToolButton({
       title={label}
       aria-label={label}
       aria-pressed={isActive}
-      className={`p-2 rounded-lg transition-colors flex items-center gap-1 ${
+      className={`p-2 rounded-lg transition-colors flex items-center justify-center gap-1 pointer-coarse:min-h-11 pointer-coarse:min-w-11 ${
         isActive
           ? "bg-primary text-primary-foreground"
           : "hover:bg-muted text-muted-foreground hover:text-foreground"
@@ -105,7 +105,9 @@ export function EditorEditTools({
   const tTable = useTranslations("editor.tableEdit");
 
   return (
-    <div className="flex items-center gap-1 px-3 py-1.5 border-b border-border bg-background/60">
+    // flex-wrap: same non-negotiable rule as the main toolbar — fold onto
+    // extra rows, never overflow. No overflow-x on this bar either.
+    <div className="flex flex-wrap items-center gap-x-1 gap-y-1 pointer-coarse:gap-x-2 pointer-coarse:gap-y-2 px-3 py-1.5 border-b border-border bg-background/60">
       <ToolButton
         icon={<Replace size={18} />}
         label={t("findReplace.open")}

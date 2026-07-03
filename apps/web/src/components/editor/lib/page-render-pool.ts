@@ -169,8 +169,15 @@ export class PageRenderPool {
     }
 
     const recycled = this.freeList.shift();
+    // `allowTouchScrolling: true` — les pages INACTIVES du mode continu
+    // couvrent l'essentiel de la surface tactile : sans ce flag, Fabric pose
+    // touch-action:none + preventDefault sur chaque touchstart/touchmove et le
+    // scroll au doigt est mort partout sauf dans les gouttières entre pages.
     const canvas: FabricCanvas =
-      recycled ?? (new fabric.Canvas(el) as unknown as FabricCanvas);
+      recycled ??
+      (new fabric.Canvas(el, {
+        allowTouchScrolling: true,
+      }) as unknown as FabricCanvas);
 
     // A recycled canvas is bound to its original element; the host re-mounts a
     // fresh <canvas> per page, so rebind the recycled instance to `el`.
