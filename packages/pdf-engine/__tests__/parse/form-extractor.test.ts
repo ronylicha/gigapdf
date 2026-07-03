@@ -56,7 +56,9 @@ describe('extractFormFieldElements (native engine)', () => {
         expect(typeof field.properties.multiline).toBe('boolean');
         expect(typeof field.properties.password).toBe('boolean');
         expect(typeof field.properties.comb).toBe('boolean');
-        expect(field.style.fontSize).toBeGreaterThan(0);
+        // `/DA` size propagated verbatim: `0` = auto-size (a real, meaningful
+        // value — the overlay computes a fitting size, the bake keeps auto).
+        expect(field.style.fontSize).toBeGreaterThanOrEqual(0);
         expect(field.format.type).toBe('none');
         expect(field.transform.rotation).toBe(0);
         expect(field.locked).toBe(false);

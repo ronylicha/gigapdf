@@ -20,6 +20,8 @@ import {
   fabricObjectToElement,
   fabricObjectToElements,
   readFormFieldValue,
+  commitParagraphSession,
+  refreshParagraphSessionAfterCommit,
 } from "../fabric-element-io";
 import type { TextElement } from "@giga-pdf/types";
 
@@ -283,6 +285,135 @@ describe("readFormFieldValue", () => {
       value: "kept",
     };
     expect(readFormFieldValue(fabricStub({}), field)).toBe("kept");
+  });
+
+  it("serialises a NAMED-state checkbox as its export string (checked) or '' (unchecked)", () => {
+    // Multi-widget CERFA pairs (Oui/non): the widget's on-state is a NAMED
+    // export — a boolean would lose WHICH state was picked. The bake routes
+    // the string through setCheckboxState (per-widget /AS).
+    const field = {
+      ...base,
+      fieldType: "checkbox" as const,
+      fieldName: "RAT",
+      onValue: "non",
+    };
+    expect(
+      readFormFieldValue(fabricStub({ data: { fieldChecked: true } }), field),
+    ).toBe("non");
+    expect(
+      readFormFieldValue(fabricStub({ data: { fieldChecked: false } }), field),
+    ).toBe("");
+  });
+
+  it("keeps the boolean shape for a plain (unnamed) checkbox", () => {
+    const field = {
+      ...base,
+      fieldType: "checkbox" as const,
+      onValue: null,
+    };
+    expect(
+      readFormFieldValue(fabricStub({ data: { fieldChecked: true } }), field),
+    ).toBe(true);
+  });
+});
+
+describe("fabricObjectToElement — multiline field Textbox claim", () => {
+  it("claims a MULTILINE field Textbox as form_field BEFORE the textbox/text branch", () => {
+    // The multiline overlay is a Fabric Textbox (type "textbox"); without the
+    // early form-field guard it would serialise as free `type:"text"` and
+    // destroy the field identity (fieldName/properties/AcroForm reconstruction).
+    const field = {
+      ...textFieldElement("ligne 1\nligne 2"),
+      properties: {
+        required: false,
+        readOnly: false,
+        maxLength: null,
+        multiline: true,
+        password: false,
+        comb: false,
+      },
+    };
+    const obj = fabricStub({
+      type: "textbox",
+      text: "ligne 1\nligne 2",
+      data: {
+        elementId: "f1",
+        type: "form_field",
+        fieldType: "text",
+        fieldName: "lastName",
+        fieldPlaceholder: "Last name",
+        formFieldElement: field as never,
+      },
+    });
+    const el = fabricObjectToElement(obj)!;
+    expect(el.type).toBe("form_field");
+    const ff = el as unknown as { fieldName: string; value: unknown };
+    expect(ff.fieldName).toBe("lastName");
+    expect(ff.value).toBe("ligne 1\nligne 2");
+  });
+
+  it("returns null for a form-field HIT-TARGET (chrome, never an element)", () => {
+    const obj = fabricStub({
+      type: "rect",
+      data: {
+        elementId: "hit:f1",
+        type: "form_field",
+        isFieldHitTarget: true,
+        hitForElementId: "f1",
+      },
+    });
+    expect(fabricObjectToElement(obj)).toBeNull();
+  });
+});
+
+describe("fabricObjectToElement — widget-rect preservation (form fields)", () => {
+  it("round-trips the STORED widget rect for an untouched field (not the IText bbox)", () => {
+    const field = textFieldElement("Dupont");
+    const obj = fabricStub({
+      type: "i-text",
+      text: "Dupont",
+      // Live IText bbox: inset + content-sized — NOT the widget rect.
+      left: 12,
+      top: 22,
+      width: 43,
+      height: 12,
+      data: {
+        elementId: "f1",
+        type: "form_field",
+        fieldType: "text",
+        fieldName: "lastName",
+        fieldWidgetBounds: { x: 10, y: 20, width: 120, height: 16 },
+        fieldAnchor0: { left: 12, top: 22 },
+        formFieldElement: field as never,
+      },
+    });
+    const el = fabricObjectToElement(obj)!;
+    // Untouched (anchor unchanged) → the exact widget rect. This is what lets
+    // the bake see "geometry unchanged" and route the value to the REAL fill
+    // instead of the destructive redact + re-add.
+    expect(el.bounds).toEqual({ x: 10, y: 20, width: 120, height: 16 });
+  });
+
+  it("translates the widget rect by the drag delta when the field was moved", () => {
+    const field = textFieldElement("Dupont");
+    const obj = fabricStub({
+      type: "i-text",
+      text: "Dupont",
+      left: 12 + 30, // dragged +30 / +5
+      top: 22 + 5,
+      width: 43,
+      data: {
+        elementId: "f1",
+        type: "form_field",
+        fieldType: "text",
+        fieldName: "lastName",
+        fieldWidgetBounds: { x: 10, y: 20, width: 120, height: 16 },
+        fieldAnchor0: { left: 12, top: 22 },
+        formFieldElement: field as never,
+      },
+    });
+    const el = fabricObjectToElement(obj)!;
+    expect(el.bounds).toEqual({ x: 40, y: 25, width: 120, height: 16 });
   });
 });
 
@@ -617,5 +748,237 @@ describe("fabricObjectToElement — image opacity decoupling", () => {
     };
     // No stash → keep what the (visible) new image is actually drawn at.
     expect(el.style.opacity).toBe(0.85);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// commitParagraphSession — the edit-intent commit (session Textbox → sources)
+// ---------------------------------------------------------------------------
+
+/** Build a session Textbox stub over the given per-line source runs. */
+function sessionTextbox(
+  text: string,
+  lines: Array<
+    Array<{
+      elementId: string;
+      index?: number;
+      x: number;
+      y: number;
+      width: number;
+      content: string;
+      style?: Record<string, unknown>;
+    }>
+  >,
+  over: Partial<FabricObjectWithData> & {
+    text?: string;
+    textLines?: string[];
+    sessionLineTexts?: string[];
+  } = {},
+): FabricObjectWithData {
+  const lineRuns = lines.map((line) =>
+    line.map((r) => ({
+      elementId: r.elementId,
+      ...(r.index !== undefined ? { index: r.index } : {}),
+      bounds: { x: r.x, y: r.y, width: r.width, height: 12 },
+      content: r.content,
+      style: {
+        fontFamily: "Times New Roman",
+        fontSize: 10,
+        fontWeight: "normal",
+        fontStyle: "normal",
+        color: "#112233",
+        opacity: 1,
+        textAlign: "left",
+        lineHeight: 1.05,
+        letterSpacing: 0,
+        writingMode: "horizontal-tb",
+        underline: false,
+        strikethrough: false,
+        backgroundColor: null,
+        verticalAlign: "baseline",
+        originalFont: "ABCDEF+TimesNewRoman",
+        ...(r.style ?? {}),
+      },
+    })),
+  );
+  const sessionLineTexts =
+    over.sessionLineTexts ??
+    lines.map((line) => line.map((r) => r.content).join(" "));
+  const { textLines, sessionLineTexts: _slt, ...rest } = over;
+  return fabricStub({
+    type: "textbox",
+    text,
+    ...(textLines ? { textLines } : {}),
+    left: 40,
+    top: 100,
+    width: 300,
+    fontSize: 10,
+    lineHeight: 1.05,
+    data: {
+      elementId: lines[0]![0]!.elementId,
+      type: "text",
+      isParagraph: true,
+      isParagraphSession: true,
+      originalFont: "ABCDEF+TimesNewRoman",
+      lineRuns,
+      paragraphRuns: lineRuns.flat(),
+      sessionLineTexts,
+      sessionOriginalText: sessionLineTexts.join("\n"),
+      sessionOrigin: { left: 40, top: 100 },
+    },
+    ...rest,
+  } as never);
+}
+
+describe("commitParagraphSession", () => {
+  it("returns 'unchanged' when the text and position are the session baseline", () => {
+    const obj = sessionTextbox("Nom : DUPONT\nLigne deux", [
+      [
+        { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
+        { elementId: "b", index: 2, x: 95, y: 100, width: 60, content: "DUPONT" },
+      ],
+      [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+    ]);
+    expect(commitParagraphSession(obj)).toEqual({ kind: "unchanged" });
+    // The generic serialiser forwards NOTHING for an unchanged session.
+    expect(fabricObjectToElements(obj)).toEqual([]);
+  });
+
+  it("UPDATE: an edited multi-run line puts the FULL line text on its first run and erases the siblings", () => {
+    const obj = sessionTextbox("Nom : MARTIN\nLigne deux", [
+      [
+        { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
+        { elementId: "b", index: 2, x: 95, y: 100, width: 60, content: "DUPONT" },
+      ],
+      [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+    ]);
+    const commit = commitParagraphSession(obj);
+    expect(commit.kind).toBe("update");
+    const els = (commit as { elements: TextElement[] }).elements;
+    // Line 2 untouched → ZERO write for it; line 1 → replace + erase.
+    expect(els).toHaveLength(2);
+    expect(els[0]!.elementId).toBe("a");
+    expect(els[0]!.index).toBe(1);
+    expect(els[0]!.content).toBe("Nom : MARTIN");
+    // The run keeps its OWN stashed style (lossless replaceText routing).
+    expect(els[0]!.style.originalFont).toBe("ABCDEF+TimesNewRoman");
+    expect(els[0]!.style.fontSize).toBe(10);
+    expect(els[1]!.elementId).toBe("b");
+    expect(els[1]!.index).toBe(2);
+    expect(els[1]!.content).toBe("");
+    // Source bounds preserved (block not moved).
+    expect(els[0]!.bounds).toMatchObject({ x: 40, y: 100 });
+    expect(els[1]!.bounds).toMatchObject({ x: 95, y: 100 });
+  });
+
+  it("UPDATE: a pure block MOVE emits every run verbatim with translated bounds", () => {
+    const obj = sessionTextbox(
+      "Nom : DUPONT\nLigne deux",
+      [
+        [
+          { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
+          { elementId: "b", index: 2, x: 95, y: 100, width: 60, content: "DUPONT" },
+        ],
+        [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+      ],
+      { left: 50, top: 120 }, // +10 / +20 vs sessionOrigin
+    );
+    const commit = commitParagraphSession(obj);
+    expect(commit.kind).toBe("update");
+    const els = (commit as { elements: TextElement[] }).elements;
+    expect(els).toHaveLength(3);
+    // Contents untouched (pure moveElement), bounds translated by the delta.
+    expect(els.map((e) => e.content)).toEqual(["Nom :", "DUPONT", "Ligne deux"]);
+    expect(els.map((e) => e.bounds.x)).toEqual([50, 105, 50]);
+    expect(els.map((e) => e.bounds.y)).toEqual([120, 120, 134]);
+    expect(els.map((e) => e.index)).toEqual([1, 2, 3]);
+  });
+
+  it("REFLOW: a changed line count removes EVERY source run and adds one run per re-wrapped line", () => {
+    const obj = sessionTextbox(
+      // The user pressed Enter inside line 1 → 3 logical lines now.
+      "Nom :\nMARTIN\nLigne deux",
+      [
+        [
+          { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
+          { elementId: "b", index: 2, x: 95, y: 100, width: 60, content: "DUPONT" },
+        ],
+        [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+      ],
+    );
+    const commit = commitParagraphSession(obj);
+    expect(commit.kind).toBe("reflow");
+    const { removedElementIds, addedElements } = commit as {
+      removedElementIds: string[];
+      addedElements: TextElement[];
+    };
+    // ALL source runs of the group are removed (apply-operations orders the
+    // removeElement calls in descending index itself).
+    expect(removedElementIds).toEqual(["a", "b", "c"]);
+    // One NEW run per line, stacked at fontSize × lineHeight from the box top,
+    // sized to the session frame width, with NO engine index (add path).
+    expect(addedElements).toHaveLength(3);
+    expect(addedElements.map((e) => e.content)).toEqual([
+      "Nom :",
+      "MARTIN",
+      "Ligne deux",
+    ]);
+    expect(addedElements.every((e) => e.index === undefined)).toBe(true);
+    expect(addedElements.map((e) => e.bounds.y)).toEqual([
+      100,
+      100 + 10 * 1.05,
+      100 + 2 * 10 * 1.05,
+    ]);
+    expect(addedElements.every((e) => e.bounds.x === 40)).toBe(true);
+    expect(addedElements.every((e) => e.bounds.width === 300)).toBe(true);
+  });
+
+  it("REFLOW: uses Fabric's WRAPPED textLines when they differ from the logical lines", () => {
+    const obj = sessionTextbox(
+      "un texte long qui wrappe\nLigne deux",
+      [
+        [
+          {
+            elementId: "a",
+            index: 1,
+            x: 40,
+            y: 100,
+            width: 300,
+            content: "un texte long qui wrappe",
+          },
+        ],
+        [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+      ],
+      {
+        // Fabric wrapped the (edited) first logical line into two visual lines.
+        text: "un texte long qui wrappe désormais\nLigne deux",
+        textLines: ["un texte long qui", "wrappe désormais", "Ligne deux"],
+        sessionLineTexts: ["un texte long qui wrappe", "Ligne deux"],
+      },
+    );
+    const commit = commitParagraphSession(obj);
+    expect(commit.kind).toBe("reflow");
+    const { addedElements } = commit as { addedElements: TextElement[] };
+    expect(addedElements.map((e) => e.content)).toEqual([
+      "un texte long qui",
+      "wrappe désormais",
+      "Ligne deux",
+    ]);
+  });
+
+  it("refreshParagraphSessionAfterCommit re-anchors the baseline after an update", () => {
+    const obj = sessionTextbox("Nom : MARTIN\nLigne deux", [
+      [
+        { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
+        { elementId: "b", index: 2, x: 95, y: 100, width: 60, content: "DUPONT" },
+      ],
+      [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+    ]);
+    const commit = commitParagraphSession(obj);
+    refreshParagraphSessionAfterCommit(obj, commit);
+    // Committed → the box is now UNCHANGED against its refreshed baseline.
+    expect(commitParagraphSession(obj)).toEqual({ kind: "unchanged" });
+    const lineRuns = obj.data!.lineRuns as Array<Array<{ content: string }>>;
+    expect(lineRuns[0]!.map((r) => r.content)).toEqual(["Nom : MARTIN", ""]);
   });
 });

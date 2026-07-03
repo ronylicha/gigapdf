@@ -48,6 +48,10 @@ function isFontDynamicLoadEnabled(): boolean {
 // (@giga-pdf/editor must not depend on @giga-pdf/api).
 
 export interface ExtractedFontMetadata {
+  /**
+   * PHYSICAL program identity (engine `EmbeddedFontV2.fontId`, matching the
+   * per-run `TextStyle.fontId`) — cache + fetch key.
+   */
   fontId: string;
   originalName: string;
   postscriptName: string | null;
@@ -57,6 +61,12 @@ export interface ExtractedFontMetadata {
   isSubset: boolean;
   format: 'ttf' | 'otf' | 'cff' | null;
   sizeBytes: number | null;
+  /**
+   * EVERY `/BaseFont` alias wrapped around this physical program (a CERFA
+   * program carries up to 35). A run's `/BaseFont` matches the program when it
+   * equals ANY alias. Optional — older backends only send `originalName`.
+   */
+  baseFonts?: string[];
 }
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
@@ -69,6 +79,38 @@ export interface LoadedFont {
   fontFaceName: string;
   status: FontLoadStatus;
   error?: string;
+  /**
+   * Provenance of the REGISTERED bytes: the document's own embedded program
+   * ('embedded') or the Google-Fonts substitute proxy ('google'). Set when the
+   * font reaches 'loaded'; legacy IndexedDB entries without a recorded source
+   * are treated as 'embedded'. Drives `FontFaceMatch.embedded` so a Google
+   * face is NEVER mislabelled as original bytes.
+   */
+  source?: 'embedded' | 'google';
+  /** Mirror of `metadata.baseFonts` (every `/BaseFont` alias of the program). */
+  baseFonts?: string[];
+}
+
+/**
+ * Result of {@link UseEmbeddedFontsResult.getFontFaceName}: the registered CSS
+ * face to use, plus what the caller must still synthesise.
+ */
+export interface FontFaceMatch {
+  /** Registered FontFace CSS family name (`gigapdf-{documentId}-{fontId}`). */
+  name: string;
+  /**
+   * True when the face carries the document's OWN embedded bytes (source
+   * 'embedded'); false for a Google-Fonts substitute. The renderer's width-fit
+   * clamp only applies to non-embedded faces.
+   */
+  embedded: boolean;
+  /**
+   * True when the face already carries the run's identity or weight/style
+   * variant (identity match by fontId / exact `/BaseFont`, or a variant-exact
+   * subset) — the caller must NOT apply a synthetic bold/italic on top. False
+   * for a loose family match: the caller keeps its synthetic weight/style.
+   */
+  exact: boolean;
 }
 
 export interface UseEmbeddedFontsOptions {
@@ -113,34 +155,39 @@ export interface UseEmbeddedFontsResult {
   /** Set if the font metadata fetch itself failed */
   error: Error | null;
   /**
-   * Resolve a raw PDF font originalName to the CSS font-family name
-   * registered with the FontFace API (embedded bytes or Google substitute).
-   * Returns null when the font failed to load (neither embedded bytes nor
-   * a Google Fonts substitute were available).
+   * Resolve a run's font to the registered FontFace, ALWAYS preferring the
+   * document's own embedded bytes (product directive: the original embedded
+   * font is served EVEN when its subset is incomplete — missing glyphs render
+   * `.notdef`; Google/CSS is the LAST resort, only when no embedded byte is
+   * servable). Returns a {@link FontFaceMatch} (`{ name, embedded, exact }`)
+   * or null when NO FontFace of the family is loaded at all.
    *
-   * `wantVariant` is the weight/style INTENT of the run being rendered. A PDF
-   * routinely embeds many subsets of the SAME family (Times New Roman regular,
-   * bold, italic, bold-italic — Ameli/admin forms have 20-40), and the scene
-   * graph collapses each run's family to a bare name ("Times New Roman"). Passed
-   * a variant, the resolver first looks for the subset whose own (weight-bearing)
-   * name matches that bold/italic intent, so a regular run no longer resolves to
-   * the first-loaded BOLD subset (the "gras parasite" / wrong-metrics bug). When
-   * omitted, or when no variant-exact subset exists, it falls back to the loose
-   * family match (previous behaviour — no regression for single-variant fonts).
+   * Cascade:
+   *  1. IDENTITY — `fontId` (4th arg, the run's physical program id) matches a
+   *     loaded font's `metadata.fontId`, OR the run's exact `/BaseFont`
+   *     (`originalName`, subset prefix kept) matches the font's originalName /
+   *     postscriptName / any `baseFonts` alias. Returned UNCONDITIONALLY —
+   *     zero coverage gating — with `exact: true` (the face IS the run's own
+   *     program, weight/style included).
+   *  2. VARIANT — `wantVariant` is the run's weight/style intent; candidates
+   *     are the same-family subsets whose OWN name (any alias) advertises that
+   *     bold/italic. Glyph coverage of `text` (3rd arg) is a RANKING, never a
+   *     rejection: full coverage > most covered codepoints > unknown coverage
+   *     last — the best candidate is ALWAYS returned (`exact: true`).
+   *  3. LOOSE — first loaded subset of the family (any name, collapsed
+   *     `fontFamily` included) with `exact: false`: the caller keeps its
+   *     synthetic weight/style.
    *
-   * `text` (3rd arg, optional) is the run's text. When a PDF embeds several
-   * DISJOINT subsets of the same family+variant (CERFA forms carry ~15
-   * `TimesNewRoman,Bold` subsets, each mapping only the glyphs it painted), the
-   * resolver returns the variant-exact subset that FULLY covers the run; if none
-   * does, it returns null so the renderer applies a synthetic UNIFORM weight
-   * (uniformly bold) instead of a patchy real-bold/fallback mix. Omitting `text`
-   * keeps the prior "first matching subset" behaviour (single-variant PDFs).
+   * `embedded` reflects the loaded face's byte provenance (`source`), so a
+   * Google substitute registered under the font's conventional name reports
+   * `embedded: false` (it is a fallback, not the original bytes).
    */
   getFontFaceName: (
     originalName: string,
     wantVariant?: { bold?: boolean; italic?: boolean },
     text?: string,
-  ) => string | null;
+    fontId?: string,
+  ) => FontFaceMatch | null;
   /** Retry a failed font load by fontId. Clears the cache entry first. */
   retry: (fontId: string) => Promise<void>;
 }
@@ -382,9 +429,11 @@ type FontMetadataWire = {
   is_subset?: boolean; isSubset?: boolean;
   format?: 'ttf' | 'otf' | 'cff' | null;
   size_bytes?: number | null; sizeBytes?: number | null;
+  base_fonts?: string[]; baseFonts?: string[];
 };
 
 function normaliseMetadata(raw: FontMetadataWire): ExtractedFontMetadata {
+  const baseFonts = raw.baseFonts ?? raw.base_fonts;
   return {
     fontId: raw.fontId ?? raw.font_id ?? '',
     originalName: raw.originalName ?? raw.original_name ?? '',
@@ -395,6 +444,7 @@ function normaliseMetadata(raw: FontMetadataWire): ExtractedFontMetadata {
     isSubset: raw.isSubset ?? raw.is_subset ?? false,
     format: raw.format ?? null,
     sizeBytes: raw.sizeBytes ?? raw.size_bytes ?? null,
+    ...(baseFonts ? { baseFonts } : {}),
   };
 }
 
@@ -581,6 +631,9 @@ export function useEmbeddedFonts(opts: UseEmbeddedFontsOptions): UseEmbeddedFont
         let fontBuffer: ArrayBuffer | null = null;
         let mimeType = formatToMime(metadata.format ?? 'ttf');
         let descriptors: FontFaceDescriptors | undefined;
+        // Byte provenance of the face being registered — drives
+        // `LoadedFont.source` (and thus `FontFaceMatch.embedded`).
+        let source: 'embedded' | 'google' = 'embedded';
         // Root cause kept so a Google miss after an extraction failure still
         // surfaces the original error in the font's failed state.
         let embeddedError: string | null = null;
@@ -592,11 +645,16 @@ export function useEmbeddedFonts(opts: UseEmbeddedFontsOptions): UseEmbeddedFont
         if (cached) {
           fontBuffer = cached.data;
           if (cached.meta?.source === 'google') {
+            source = 'google';
             mimeType = 'font/ttf';
             descriptors = {
               weight: String(cached.meta.weight ?? 400),
               style: cached.meta.style ?? 'normal',
             };
+          } else {
+            // Legacy entries persisted before `meta.source` existed carried
+            // embedded bytes (Google entries have always tagged their source).
+            source = 'embedded';
           }
         }
 
@@ -606,6 +664,7 @@ export function useEmbeddedFonts(opts: UseEmbeddedFontsOptions): UseEmbeddedFont
             const data = await fetchFontData(documentId, metadata.fontId);
             if (signal.aborted) return;
             fontBuffer = base64ToArrayBuffer(data.dataBase64);
+            source = 'embedded';
             // Cache asynchronously — do not block font registration
             cache
               .set(documentId, metadata.fontId, fontBuffer, undefined, { source: 'embedded' })
@@ -657,6 +716,7 @@ export function useEmbeddedFonts(opts: UseEmbeddedFontsOptions): UseEmbeddedFont
           }
 
           fontBuffer = base64ToArrayBuffer(google.dataBase64);
+          source = 'google';
           mimeType = google.mimeType;
           descriptors = { weight: String(google.weight), style: google.style };
           // Cache asynchronously — same entry shape as embedded fonts, tagged
@@ -710,7 +770,7 @@ export function useEmbeddedFonts(opts: UseEmbeddedFontsOptions): UseEmbeddedFont
         setFonts((prev) =>
           prev.map((f) =>
             f.metadata.fontId === metadata.fontId
-              ? { ...f, status: 'loaded', error: undefined }
+              ? { ...f, status: 'loaded', source, error: undefined }
               : f,
           ),
         );
@@ -781,6 +841,7 @@ export function useEmbeddedFonts(opts: UseEmbeddedFontsOptions): UseEmbeddedFont
           metadata: meta,
           fontFaceName: buildFontFaceName(documentId, meta.fontId),
           status: 'pending',
+          ...(meta.baseFonts ? { baseFonts: meta.baseFonts } : {}),
         }));
         setFonts(initialFonts);
 
@@ -887,28 +948,47 @@ export function useEmbeddedFonts(opts: UseEmbeddedFontsOptions): UseEmbeddedFont
       originalName: string,
       wantVariant?: { bold?: boolean; italic?: boolean },
       text?: string,
-    ): string | null => {
+      fontId?: string,
+    ): FontFaceMatch | null => {
+      const loaded = fonts.filter((f) => f.status === 'loaded');
+      if (loaded.length === 0) return null;
+
+      // Byte provenance → `embedded`. A face loaded before `source` existed
+      // carried embedded bytes (Google faces have always tagged themselves).
+      const matchOf = (f: LoadedFont, exact: boolean): FontFaceMatch => ({
+        name: f.fontFaceName,
+        embedded: f.source !== 'google',
+        exact,
+      });
+
+      // Every name a loaded font is known by: its weight-bearing names PLUS
+      // every `/BaseFont` alias of the physical program (a CERFA program is
+      // aliased by up to 35 wrapper names — a run can reference ANY of them).
+      const aliasNames = (f: LoadedFont): string[] =>
+        [
+          f.metadata.originalName,
+          f.metadata.postscriptName,
+          ...(f.metadata.baseFonts ?? f.baseFonts ?? []),
+        ].filter((s): s is string => Boolean(s));
+
+      // ── 1. IDENTITY (unconditional — the run's OWN embedded program). ──
+      // Product directive: ALWAYS serve the run's original embedded font, even
+      // when the subset is incomplete (missing glyphs render `.notdef`). ZERO
+      // coverage gating here. Matched by the physical program id first
+      // (name-ambiguity-proof), then by the exact `/BaseFont` (subset prefix
+      // kept) against every alias.
+      if (fontId) {
+        const byId = loaded.find((f) => f.metadata.fontId === fontId);
+        if (byId) return matchOf(byId, true);
+      }
       if (!originalName) return null;
+      const exactSubset = loaded.find((f) =>
+        aliasNames(f).some((n) => isExactSubsetName(n, originalName)),
+      );
+      if (exactSubset) return matchOf(exactSubset, true);
+
       const target = normaliseFontName(originalName);
       if (!target) return null;
-
-      const loaded = fonts.filter((f) => f.status === 'loaded');
-
-      // EXACT EMBEDDED SUBSET (font-fidelity fast path). `originalName` here is the
-      // run's real `/BaseFont` (subset prefix kept, e.g. "ABCDEF+TimesNewRomanPSMT",
-      // wired from the engine via TextStyle.originalFont). When a loaded FontFace
-      // advertises that exact name, it IS the subset that painted the run → exact
-      // metrics + full coverage. Resolve it BEFORE the family + cmap-coverage
-      // heuristic (which only refines among AMBIGUOUS same-family subsets). Applies
-      // to BOTH the variant-aware and the loose call, so resolveTextFont marks the
-      // result `usingEmbeddedFont` (no synthetic weight/style, no width fit).
-      const exactSubset = loaded.find((f) => {
-        const names = [f.metadata.originalName, f.metadata.postscriptName];
-        return names.some(
-          (n) => typeof n === 'string' && isExactSubsetName(n, originalName),
-        );
-      });
-      if (exactSubset) return exactSubset.fontFaceName;
 
       // Family name (loose) match against a candidate's normalised name.
       const familyHit = (candidate: string): boolean => {
@@ -917,75 +997,64 @@ export function useEmbeddedFonts(opts: UseEmbeddedFontsOptions): UseEmbeddedFont
         return norm === target || norm.includes(target) || target.includes(norm);
       };
 
-      // VARIANT-EXACT mode: when the caller passes the run's weight/style intent,
-      // resolve ONLY the subset whose OWN name advertises that same bold/italic.
-      // The renderer falls back to the loose 1-arg call for the closest subset
-      // AND re-applies a synthetic weight/style when this returns null, so a
-      // missing/incomplete variant is approximated instead of mis-rendered.
-      //
-      // Crucially the family is matched on the WEIGHT-BEARING names (originalName /
-      // postscriptName) only — NOT the backend-collapsed `fontFamily`
-      // ("Times New Roman"), which is identical for every subset and short-circuits
-      // to the first-loaded one. That collapse is exactly why a regular run used to
-      // resolve to the first BOLD subset (the "gras parasite" + wrong-metrics bug).
+      // ── 2. VARIANT — same-family subsets whose OWN name advertises the ──
+      // run's bold/italic intent (so a regular run never lands on the
+      // first-loaded BOLD subset — the "gras parasite" bug). Matched on the
+      // weight-bearing names + baseFonts aliases, NOT the collapsed
+      // `fontFamily` (identical for every subset). Glyph coverage of the run's
+      // text is a RANKING, never a rejection: full coverage first, then most
+      // covered codepoints, unknown coverage last — the best candidate is
+      // ALWAYS returned (an incomplete original subset beats losing the
+      // original typography; gaps render `.notdef` by design).
       if (wantVariant) {
         const wantBold = wantVariant.bold === true;
         const wantItalic = wantVariant.italic === true;
-        // ALL same-family subsets whose own name advertises this exact variant.
         const candidates = loaded.filter((f) => {
-          const weightNames = [f.metadata.originalName, f.metadata.postscriptName].filter(
-            (s): s is string => Boolean(s),
-          );
-          for (const name of weightNames) {
+          for (const name of aliasNames(f)) {
             if (!familyHit(name)) continue;
             const v = fontNameVariant(name);
             if (v.bold === wantBold && v.italic === wantItalic) return true;
           }
           return false;
         });
-        if (candidates.length === 0) return null;
-
-        // GLYPH-COVERAGE refinement. A PDF embeds many DISJOINT subsets of the
-        // same family+variant (a CERFA carries ~15 `TimesNewRoman,Bold` subsets,
-        // each mapping only the glyphs of the runs it painted). Returning the
-        // first-loaded one renders only ITS glyphs in the variant — the rest of a
-        // run falls to the non-bold browser fallback, so a title looks unevenly
-        // bold. When the caller passes the run's text:
-        //   • prefer a candidate that FULLY covers it (real bold, perfect);
-        //   • if NONE covers it fully, return null so the renderer uses the loose
-        //     subset + a SYNTHETIC, UNIFORM weight/style (uniformly bold like the
-        //     reference) instead of a patchy real-bold/fallback mix.
-        // Without text (or with no recorded coverage), keep the prior behaviour:
-        // first matching subset — so single-variant PDFs are unchanged.
-        const needed = text ? textCodepoints(text) : [];
-        if (needed.length === 0) {
-          return candidates[0]!.fontFaceName;
+        if (candidates.length > 0) {
+          const needed = text ? textCodepoints(text) : [];
+          if (needed.length === 0) return matchOf(candidates[0]!, true);
+          // Rank: covered-codepoint count (full coverage = max), unknown
+          // coverage scores -1 (last). Ties keep the first (list order —
+          // deterministic).
+          let best = candidates[0]!;
+          let bestScore = -Infinity;
+          for (const f of candidates) {
+            const cov = coverageRef.current.get(f.metadata.fontId);
+            const score =
+              !cov || cov.size === 0
+                ? -1
+                : needed.reduce((n, cp) => n + (cov.has(cp) ? 1 : 0), 0);
+            if (score > bestScore) {
+              bestScore = score;
+              best = f;
+            }
+          }
+          return matchOf(best, true);
         }
-        const fullyCovers = candidates.find((f) => {
-          const cov = coverageRef.current.get(f.metadata.fontId);
-          if (!cov || cov.size === 0) return false;
-          return needed.every((cp) => cov.has(cp));
-        });
-        // No single same-variant subset covers the whole run → defer to the
-        // loose + synthetic-uniform path (renderer's 1-arg fallback). This is the
-        // disjoint-subset case; returning a partial subset would leave glyphs
-        // un-bolded.
-        return fullyCovers ? fullyCovers.fontFaceName : null;
+        // No subset of the family advertises this variant → fall through to
+        // the LOOSE family match; `exact: false` tells the caller to keep its
+        // synthetic weight/style.
       }
 
-      // LOOSE family match (original behaviour) — used for the 1-arg call (no
-      // variant requested) and as the renderer's fallback when no variant-exact
-      // subset exists. Matches on every candidate name including the collapsed
-      // `fontFamily`, returning the first loaded subset of the family.
-      const found = loaded.find((f) => {
-        const candidates = [
-          f.metadata.originalName,
-          f.metadata.postscriptName,
-          f.metadata.fontFamily,
-        ].filter((s): s is string => Boolean(s));
-        return candidates.some((c) => familyHit(c));
-      });
-      return found?.fontFaceName ?? null;
+      // ── 3. LOOSE family match — first loaded subset of the family, matched ──
+      // on every known name including the collapsed `fontFamily`. `exact:
+      // false`: the face does not carry the run's variant, the caller applies
+      // it synthetically. `embedded` still reflects the byte provenance.
+      const found = loaded.find((f) =>
+        [...aliasNames(f), f.metadata.fontFamily]
+          .filter((s): s is string => Boolean(s))
+          .some((c) => familyHit(c)),
+      );
+      // 4. null ONLY when no FontFace of the family is loaded at all — the
+      // caller then falls back to a generic CSS family (last resort).
+      return found ? matchOf(found, false) : null;
     },
     [fonts],
   );

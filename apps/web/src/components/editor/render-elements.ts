@@ -117,23 +117,27 @@ export interface RenderElementsOptions {
   /** Callback déclenché à la sélection d'un élément (continu : panneaux page-scoped). */
   onElementSelected?: (elementId: string) => void;
   /**
-   * Résout le nom de FontFace enregistré pour une police embarquée du PDF.
-   * Injecté par l'appelant (hook `useEmbeddedFonts`).
+   * Résout la FontFace enregistrée pour une police embarquée du PDF. Injecté
+   * par l'appelant (hook `useEmbeddedFonts`). Retourne `{ name, embedded,
+   * exact }` — ou `null` quand AUCUNE face de la famille n'est chargée.
    *
-   * Le 2e argument optionnel porte l'INTENTION de graisse/style du run. Un PDF
-   * embarque couramment plusieurs sous-ensembles de la MÊME famille (Times New
-   * Roman regular/bold/italic/bold-italic), mais le scene-graph réduit la police
-   * d'un run à un nom nu ("Times New Roman"). Avec la variante, le résolveur
-   * choisit le sous-ensemble dont le NOM porte ce bold/italic (sinon `null`) :
-   * un run regular ne tombe plus sur le premier sous-ensemble GRAS chargé (bug du
-   * « gras parasite » + métriques fausses → chevauchement). Appelé sans variante,
-   * il retombe sur la correspondance floue (1er sous-ensemble de la famille).
+   * Cascade côté hook : (1) IDENTITÉ — le `fontId` du run (4e argument,
+   * identité PHYSIQUE du programme embarqué) ou son `/BaseFont` exact matche
+   * une face chargée → retour INCONDITIONNEL (`exact: true`), même si le
+   * subset est incomplet (glyphes manquants → `.notdef`, accepté) ; (2)
+   * VARIANTE — le sous-ensemble de la famille dont le NOM porte le
+   * bold/italic du run, la couverture cmap servant de CLASSEMENT (jamais de
+   * rejet) ; (3) FLOU — 1er sous-ensemble de la famille (`exact: false`, le
+   * renderer conserve alors ses poids/style synthétiques). `embedded` reflète
+   * la provenance des octets (programme du document vs substitut Google) —
+   * seul un vrai fallback subit le width-fit borné.
    */
   getFontFaceName?: (
     originalName: string,
     wantVariant?: { bold?: boolean; italic?: boolean },
     text?: string,
-  ) => string | null;
+    fontId?: string,
+  ) => { name: string; embedded: boolean; exact: boolean } | null;
   /** Résout une URL d'image relative en URL absolue (défaut : API base URL). */
   resolveImageUrl?: (url: string) => string;
   /**
@@ -220,9 +224,21 @@ function colorWithAlpha(color: string, alpha: number): string {
 interface ResolvedTextFont {
   /** FontFace name (embedded subset) or CSS fallback family. */
   fontFamily: string;
-  /** True when the resolved font already encodes the run's weight/style, so a
-   *  synthetic bold/italic must NOT be applied (double-bolding widens glyphs). */
+  /**
+   * True when the resolved face carries the document's ORIGINAL embedded bytes
+   * (even via a loose family match). Decoupled from {@link syntheticVariant}:
+   * the width-fit clamp keys on THIS flag (original metrics ⇒ no cosmetic
+   * squash), while the synthetic weight/style keys on `syntheticVariant`.
+   * False for a Google-substitute face and for the generic CSS fallback.
+   */
   usingEmbeddedFont: boolean;
+  /**
+   * True when the parsed weight/style had to be applied synthetically because
+   * the resolved face does NOT carry the run's variant (loose family match or
+   * CSS fallback). False when the face IS the run's identity/variant — a
+   * synthetic bold/italic on top would double-bold and widen the glyphs.
+   */
+  syntheticVariant: boolean;
   /** Effective fontWeight to set on the Fabric object ("normal" | "bold"). */
   fontWeight: "normal" | "bold";
   /** Effective fontStyle to set on the Fabric object ("normal" | "italic"). */
@@ -230,29 +246,32 @@ interface ResolvedTextFont {
 }
 
 /**
- * Resolve the font for a text run, weight/style-aware.
+ * Resolve the font for a text run, identity- and weight/style-aware.
  *
- * A PDF embeds many subsets of the same family (Times New Roman regular / bold /
- * italic / bold-italic); the scene graph only carries a bare `originalFont`
- * ("Times New Roman"). Resolving by the bare name alone returns the FIRST loaded
- * subset whatever its weight — so a regular run rendered with the BOLD subset
- * (the "gras parasite") and with the wrong glyph metrics (overlap/overflow).
+ * PRODUCT DIRECTIVE: a run whose ORIGINAL embedded program is loadable is
+ * ALWAYS rendered with it — even when the subset is incomplete (missing glyphs
+ * render `.notdef`, accepted). Google/CSS substitutes are the LAST resort,
+ * only when no embedded byte is servable for the family.
  *
- * Strategy (in order):
- *   1. VARIANT-EXACT — ask the resolver for the subset matching this run's
- *      bold/italic intent. Found ⇒ the FontFace already IS the right variant, so
- *      NO synthetic weight/style (applying it on top would double-bold/skew and
- *      widen the glyphs). This is the common, correct case.
- *   2. LOOSE — no variant-exact subset (font embeds only some variants): fall
- *      back to the closest loaded subset of the family AND apply the parsed
- *      weight/style synthetically to approximate the missing variant.
- *   3. CSS FALLBACK — no embedded match at all: use the mapped CSS family and
- *      apply the parsed weight/style (the generic family has no built-in variant).
+ * A single resolver call carries the whole cascade (see the hook's
+ * `getFontFaceName`): the run's PHYSICAL program id (`style.fontId`) pins its
+ * exact embedded program first; then the exact `/BaseFont`; then the
+ * variant-matching subset of the family (coverage RANKS candidates, never
+ * rejects); then the loose family match. The returned flags drive:
+ *   • `exact: true`  ⇒ the face already carries the run's identity/variant —
+ *     NO synthetic weight/style (double-bolding widens glyphs).
+ *   • `exact: false` ⇒ loose match — the parsed weight/style is applied
+ *     synthetically to approximate the variant this face does not carry.
+ *   • `embedded`     ⇒ byte provenance: original document bytes vs Google
+ *     substitute. Only a NON-embedded face is subject to the bounded
+ *     width-fit clamp (original metrics are never squashed).
+ * No resolver hit at all ⇒ generic CSS family + synthetic weight/style.
  */
 function resolveTextFont(
   style: {
     fontFamily?: string;
     originalFont?: string | null;
+    fontId?: string;
     fontWeight?: "normal" | "bold";
     fontStyle?: "normal" | "italic";
   },
@@ -260,7 +279,8 @@ function resolveTextFont(
     originalName: string,
     wantVariant?: { bold?: boolean; italic?: boolean },
     text?: string,
-  ) => string | null,
+    fontId?: string,
+  ) => { name: string; embedded: boolean; exact: boolean } | null,
   text?: string,
 ): ResolvedTextFont {
   const parsedWeight: "normal" | "bold" = style.fontWeight === "bold" ? "bold" : "normal";
@@ -270,37 +290,30 @@ function resolveTextFont(
   const orig = style.originalFont;
 
   if (orig && getFontFaceName) {
-    // 1. Variant-exact embedded subset that COVERS this run's glyphs → trust its
-    //    built-in weight/style. Passing the run text lets the resolver pick, among
-    //    several disjoint same-variant subsets (CERFA), the one that actually
-    //    covers the run — or return null when none fully does, so step 2 applies a
-    //    synthetic UNIFORM weight (uniformly bold) instead of a patchy mix.
-    const exact = getFontFaceName(orig, { bold: wantBold, italic: wantItalic }, text);
-    if (exact) {
+    const info = getFontFaceName(
+      orig,
+      { bold: wantBold, italic: wantItalic },
+      text,
+      style.fontId,
+    );
+    if (info) {
       return {
-        fontFamily: exact,
-        usingEmbeddedFont: true,
-        fontWeight: "normal",
-        fontStyle: "normal",
-      };
-    }
-    // 2. Loose embedded subset (closest of the family) + synthetic weight/style
-    //    to approximate the variant this PDF did not embed.
-    const loose = getFontFaceName(orig);
-    if (loose) {
-      return {
-        fontFamily: loose,
-        usingEmbeddedFont: false,
-        fontWeight: parsedWeight,
-        fontStyle: parsedStyle,
+        fontFamily: info.name,
+        usingEmbeddedFont: info.embedded,
+        syntheticVariant: !info.exact,
+        // Identity/variant carried by the face ⇒ neutral weight/style (the
+        // glyphs ARE the variant); loose ⇒ keep the parsed weight/style.
+        fontWeight: info.exact ? "normal" : parsedWeight,
+        fontStyle: info.exact ? "normal" : parsedStyle,
       };
     }
   }
 
-  // 3. Generic CSS family → honour the parsed weight/style.
+  // Generic CSS family → honour the parsed weight/style (last resort).
   return {
     fontFamily: style.fontFamily ?? "Helvetica",
     usingEmbeddedFont: false,
+    syntheticVariant: true,
     fontWeight: parsedWeight,
     fontStyle: parsedStyle,
   };
@@ -308,14 +321,15 @@ function resolveTextFont(
 
 /**
  * BOUNDED horizontal fit for FALLBACK-font text ONLY. The lib gives the real
- * target advance width (`bounds.width`). When the resolved font is the EXACT
- * embedded subset (`usingEmbeddedFont === true`) the glyph metrics already match
- * the original, so NO scaleX is applied (squashing exact text is the bug the
- * product directive forbids). When the resolved font is a loose/CSS FALLBACK its
- * substitute metrics can render WIDER than the original and overlap the next run;
- * shrink the object with a scaleX clamped to [0.92, 1] — enough to absorb the
- * metric drift WITHOUT a visible squash, and NEVER expanding (ratio ≥ 1 ⇒
- * untouched).
+ * target advance width (`bounds.width`). When the resolved face carries the
+ * document's ORIGINAL embedded bytes (`usingEmbeddedFont === true` — identity,
+ * variant OR loose family match on an embedded program) the glyph metrics
+ * already match the original, so NO scaleX is applied (squashing exact text is
+ * the bug the product directive forbids). Only a TRUE substitute (Google face
+ * or generic CSS family, `usingEmbeddedFont === false`) can render WIDER than
+ * the original and overlap the next run; shrink the object with a scaleX
+ * clamped to [0.92, 1] — enough to absorb the metric drift WITHOUT a visible
+ * squash, and NEVER expanding (ratio ≥ 1 ⇒ untouched).
  *
  * A Fabric `Textbox` reports its FIXED box width here (it wraps rather than
  * overflowing), so `measured === target` ⇒ this is naturally inert for grouped
@@ -520,6 +534,39 @@ export interface ParagraphRun {
 export interface ParagraphGroup {
   /** The source runs, ordered top→bottom. */
   runs: TextRun[];
+  /**
+   * The runs grouped per VISUAL LINE (reading order). Produced from the lib's
+   * `{t:'br'}` line structure when the block groups carry `lines`; every other
+   * producer (positional heuristic, table cells, list items, flat
+   * `sourceIndices`) emits ONE run per line — the legacy model. `runs` is
+   * always the flattening of `lines`.
+   */
+  lines?: TextRun[][];
+  /** Paragraph alignment from the lib block (drives the edit-session Textbox). */
+  align?: "left" | "center" | "right" | "justify";
+  /** Line height MULTIPLE from the lib block (fallback when unmeasurable). */
+  lineHeightMultiple?: number;
+  /** The lib block's top-down placement frame (edit-session position/width). */
+  frame?: { x: number; y: number; width: number; height: number };
+}
+
+/**
+ * The descriptor stashed on EVERY member Fabric object of an accepted
+ * paragraph group (`data.paragraphGroup`, alongside `data.paragraphGroupId`).
+ * AT REST the members stay the per-run / per-segment objects (pixel-1:1 with
+ * the raster — nothing about the resting render changes); the descriptor only
+ * fuels the EDIT-INTENT path: a double-click on any member swaps the group for
+ * ONE multi-line Textbox session (see {@link beginParagraphEditSession}).
+ * Plain JSON (serialisable by the history snapshots).
+ */
+export interface RegisteredParagraphGroup {
+  /** Stable id (derived from the first run's elementId). */
+  groupId: string;
+  /** The source runs per visual line, reading order (plain elements). */
+  lines: TextRun[][];
+  align?: "left" | "center" | "right" | "justify";
+  lineHeightMultiple?: number;
+  frame?: { x: number; y: number; width: number; height: number };
 }
 
 /** Normalised colour key for "same style" comparison. */
@@ -750,6 +797,98 @@ export function isCoherentCoalescedBlock(runs: readonly TextRun[]): boolean {
   return true;
 }
 
+/** Horizontal span (left/right) of one visual line = union of its runs. */
+function lineSpanOf(line: readonly TextRun[]): { left: number; right: number } {
+  let left = Infinity;
+  let right = -Infinity;
+  for (const r of line) {
+    left = Math.min(left, r.bounds.x);
+    right = Math.max(right, r.bounds.x + r.bounds.width);
+  }
+  return { left, right };
+}
+
+/** A group's visual lines: the lib `{t:'br'}` structure, or one run per line. */
+function linesOfGroup(group: ParagraphGroup): TextRun[][] {
+  if (group.lines && group.lines.length > 0) return group.lines;
+  return group.runs.map((r) => [r]);
+}
+
+/**
+ * PER-LINE coherence gate for a coalesced paragraph candidate — the EDIT-INTENT
+ * successor of {@link isCoherentCoalescedBlock} (kept exported for reference /
+ * tests but no longer gating the render). Since lib 0.114 repaired the
+ * `source_index` seam and hardened `split_paragraphs` (no more footer↔header
+ * fusions), the gate can reason about LINES instead of RUNS, which unlocks
+ * multi-run lines and justified (segmented) paragraphs:
+ *
+ *   1. Lines sorted by top-Y must be STRICTLY descending on the page (two
+ *      "lines" sharing a Y means the line structure is wrong → reject);
+ *   2. Every inter-line gap sits within `[0.4, 2.5] ×` the MEASURED leading
+ *      (median gap). The median itself must stay ≤ `3 ×` the median font size
+ *      — the anchor that keeps a two-line group (whose lone gap IS the median)
+ *      from accepting a footer↔header jump;
+ *   3. CONSECUTIVE lines overlap horizontally by ≥ 20% of the narrower line
+ *      (same column — an indented first/last line still passes).
+ *
+ * DELIBERATELY GONE vs the old run-level gate: the "one run per line" rule
+ * (the lib now says which runs share a line), the run left-edge spread rule
+ * (multi-run lines legitimately start apart), and the blanket `segments` ban
+ * (a justified paragraph is exactly what paragraph editing is FOR — at rest it
+ * still renders per-segment, pixel-exact). Acceptance no longer changes the
+ * resting render at all: members are only TAGGED for the edit session, and a
+ * rejected group simply keeps per-run editing. Pure & deterministic.
+ */
+export function isCoherentLineGroup(
+  lines: readonly (readonly TextRun[])[],
+): boolean {
+  const nonEmpty = lines.filter((l) => l.length > 0);
+  if (nonEmpty.length === 0) return false;
+  const all = nonEmpty.flat();
+  if (all.length < 2) return true; // a lone run is never coalesced anyway
+  if (nonEmpty.length === 1) return true; // one multi-run line — trivially coherent
+
+  // Median font size = the reference the leading anchor is expressed in.
+  const sizes = all.map((r) => r.style.fontSize || 12).sort((a, b) => a - b);
+  const fs = sizes[Math.floor((sizes.length - 1) / 2)] || 12;
+
+  // (1) Strictly descending line tops (sorted defensively — reading order in,
+  //     but a shared Y between two "lines" must reject either way).
+  const tops = nonEmpty
+    .map((l) => Math.min(...l.map((r) => r.bounds.y)))
+    .sort((a, b) => a - b);
+  const gaps: number[] = [];
+  for (let i = 1; i < tops.length; i += 1) {
+    const gap = tops[i]! - tops[i - 1]!;
+    if (gap <= 0.5) return false;
+    gaps.push(gap);
+  }
+
+  // (2) Gap regularity around the measured leading + the font-size anchor.
+  const sortedGaps = [...gaps].sort((a, b) => a - b);
+  const leading = sortedGaps[Math.floor((sortedGaps.length - 1) / 2)]!;
+  if (leading > fs * 3) return false;
+  for (const gap of gaps) {
+    if (gap < leading * 0.4 || gap > leading * 2.5) return false;
+  }
+
+  // (3) Consecutive lines share a column (≥ 20% overlap of the narrower one).
+  const byTop = [...nonEmpty].sort(
+    (a, b) =>
+      Math.min(...a.map((r) => r.bounds.y)) -
+      Math.min(...b.map((r) => r.bounds.y)),
+  );
+  for (let i = 1; i < byTop.length; i += 1) {
+    const a = lineSpanOf(byTop[i - 1]!);
+    const b = lineSpanOf(byTop[i]!);
+    const overlap = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+    const minWidth = Math.max(1, Math.min(a.right - a.left, b.right - b.left));
+    if (overlap < minWidth * 0.2) return false;
+  }
+
+  return true;
+}
+
 /**
  * Group consecutive same-style, regularly-spaced, left-aligned text runs into
  * paragraphs. Returns BOTH the detected paragraph groups (2+ runs) AND the runs
@@ -805,7 +944,8 @@ export function groupTextRunsIntoParagraphs(elements: Element[]): {
       }
     }
     if (group.length >= 2) {
-      paragraphs.push({ runs: group });
+      // The heuristic detects one run per line → legacy one-run-per-line model.
+      paragraphs.push({ runs: group, lines: group.map((r) => [r]) });
     } else {
       standalone.push(start);
     }
@@ -859,22 +999,47 @@ export function pageBlockGroupsToParagraphs(
 
   for (const group of blockGroups) {
     if (group.kind !== "paragraph" && group.kind !== "heading") continue;
-    const runs: TextRun[] = [];
-    for (const sourceIndex of group.sourceIndices) {
-      const run = runByIndex.get(sourceIndex);
-      // Skip a missing index, an already-consumed run (defensive against a run
-      // claimed by two blocks), and ungroupable runs (links/RTL/multi-line) so
-      // they keep their dedicated standalone rendering.
-      if (!run || consumed.has(run) || isUngroupableRun(run)) continue;
-      runs.push(run);
-      consumed.add(run);
+    // The lib's `{t:'br'}` line structure (lib ≥ 0.114) — falls back to the
+    // legacy one-run-per-line model when `lines` is absent (older producer).
+    const indexLines: number[][] =
+      group.lines && group.lines.length > 0
+        ? group.lines
+        : group.sourceIndices.map((i) => [i]);
+
+    const lines: TextRun[][] = [];
+    const claimed: TextRun[] = [];
+    for (const lineIndices of indexLines) {
+      const lineRuns: TextRun[] = [];
+      for (const sourceIndex of lineIndices) {
+        const run = runByIndex.get(sourceIndex);
+        // Skip a missing index, an already-consumed run (defensive against a
+        // run claimed by two blocks), and ungroupable runs (links/RTL/
+        // multi-line) so they keep their dedicated standalone rendering.
+        if (!run || consumed.has(run) || isUngroupableRun(run)) continue;
+        lineRuns.push(run);
+        consumed.add(run);
+        claimed.push(run);
+      }
+      // A line whose runs all failed to resolve is skipped (the group keeps
+      // its remaining lines — same "skip the hole" policy as before).
+      if (lineRuns.length > 0) lines.push(lineRuns);
     }
+
+    const runs = lines.flat();
     if (runs.length >= 2) {
-      paragraphs.push({ runs });
+      paragraphs.push({
+        runs,
+        lines,
+        ...(group.align ? { align: group.align } : {}),
+        ...(group.lineHeightMultiple
+          ? { lineHeightMultiple: group.lineHeightMultiple }
+          : {}),
+        ...(group.frame ? { frame: group.frame } : {}),
+      });
     } else {
-      // A block that resolved to a single run is not worth a Textbox — release
-      // its run so it renders as a standalone IText below.
-      for (const r of runs) consumed.delete(r);
+      // A block that resolved to a single run is not worth a paragraph session
+      // — release its run so it renders as a standalone IText below.
+      for (const r of claimed) consumed.delete(r);
     }
   }
 
@@ -949,7 +1114,8 @@ export function pageBlockGroupsToTablesAndLists(
       consumed.add(run);
     }
     if (runs.length >= 2) {
-      paragraphs.push({ runs });
+      // Cells/items carry no `{t:'br'}` structure → legacy one-run-per-line.
+      paragraphs.push({ runs, lines: runs.map((r) => [r]) });
     } else {
       for (const r of runs) consumed.delete(r);
     }
@@ -1122,27 +1288,17 @@ export async function renderElementsOverlay(
       ? pageBlockGroupsToTablesAndLists(dedupedElements, blockGroups).paragraphs
       : [];
 
-  // Drop any coalesced block (paragraph, table cell OR list item) that a single
-  // left-aligned, uniformly-spaced Textbox cannot reproduce 1:1. TWO gates:
-  //  • hasUniformLineAdvance — rejects blocks mixing a body advance with wider
-  //    sub-paragraph/blank-line gaps (a CERFA intro alternates ~10.5pt and ~14pt),
-  //    which a single lineHeight cannot honour.
-  //  • isCoherentCoalescedBlock — rejects blocks the lib's `pageBlocks` heuristic
-  //    mis-fused across the page: a "paragraph"/"table cell" whose runs span the
-  //    footer AND the header, two runs on the same line, a stray space next to a
-  //    far-away rule, or any justified (segmented) run. On dense forms these are
-  //    the cause of the vanishing footer / mis-placed header text.
-  // Dropped blocks fall through to the per-run / per-segment IText path and render
-  // 1:1 at their exact bounds (proven pixel-clean). Genuinely coherent blocks still
-  // coalesce and stay paragraph-editable.
+  // Gate every coalesced candidate (paragraph, table cell OR list item) with
+  // the PER-LINE coherence check (see isCoherentLineGroup): lines strictly
+  // descending, inter-line gaps within [0.4, 2.5]× the measured leading, and
+  // ≥ 20% horizontal overlap between consecutive lines. Multi-run lines and
+  // justified (segmented) paragraphs are now ACCEPTED — the lib 0.114 line
+  // structure says which runs share a line, and acceptance no longer changes
+  // the resting render (EDIT-INTENT model below): a rejected group simply
+  // keeps per-run editing, so this can only ever widen paragraph editing.
   const allCoalescedGroups = [...paragraphGroups, ...tableListGroups].filter(
-    (group) =>
-      hasUniformLineAdvance(group.runs) && isCoherentCoalescedBlock(group.runs),
+    (group) => isCoherentLineGroup(linesOfGroup(group)),
   );
-  const runsInParagraph = new Set<string>();
-  for (const group of allCoalescedGroups) {
-    for (const run of group.runs) runsInParagraph.add(run.elementId);
-  }
 
   for (const element of dedupedElements) {
     // Guard: skip elements with missing or zero-size bounds
@@ -1154,12 +1310,11 @@ export async function renderElementsOverlay(
       continue;
     }
 
-    // A text run folded into a paragraph is rendered as part of its Textbox
-    // (below), never as a standalone IText — skip it here.
-    if (element.type === "text" && runsInParagraph.has(element.elementId)) {
-      continue;
-    }
-
+    // EDIT-INTENT model: a text run that belongs to an accepted paragraph
+    // group is STILL rendered per-run/per-segment right here (the resting
+    // render is the proven pixel-1:1 path). Its membership is tagged AFTER
+    // this loop (data.paragraphGroupId) so a double-click opens the group's
+    // multi-line edit session instead of the single-run inline edit.
     const baseOptions = {
       left: element.bounds.x,
       top: element.bounds.y,
@@ -1825,6 +1980,46 @@ export async function renderElementsOverlay(
           formElement.fieldType === "checkbox" ||
           formElement.fieldType === "radio";
 
+        // Full-rect FIELD BACKGROUND + HIT-TARGET (Adobe UX). An empty text
+        // field used to be an IText whose width Fabric recomputes from its
+        // CONTENT (initDimensions), so a blank field's clickable surface was
+        // ~0 px. This Rect always covers the whole widget rect: the field is
+        // VISIBLE (tint + border) and clickable anywhere inside. It sits
+        // BEHIND the value object (stable-sort tie on [layerRank, engine
+        // order] — added first) and DELEGATES its clicks to the content
+        // object (attachFormFieldToggle): caret for text entry, toggle for
+        // checkables. Its `elementId` is `hit:`-prefixed so every element
+        // lookup (`data.elementId === id`) resolves the REAL field object,
+        // never this chrome; `hitForElementId` carries the target.
+        const wantsHitRect =
+          isTextEntry || isCheckable || formElement.fieldType === "listbox";
+        if (wantsHitRect) {
+          const hitRect = new Rect({
+            left: formElement.bounds.x,
+            top: formElement.bounds.y,
+            originX: "left" as const,
+            originY: "top" as const,
+            width: formElement.bounds.width,
+            height: formElement.bounds.height,
+            fill: fieldFill,
+            stroke: fieldStroke,
+            strokeWidth: 1,
+            selectable: false,
+            evented: !element.locked && !readonly,
+            visible: formElement.visible,
+            hoverCursor: isTextEntry ? "text" : "pointer",
+          });
+          (hitRect as FabricObjectWithData).data = {
+            elementId: `hit:${formElement.elementId}`,
+            type: "form_field",
+            isFieldHitTarget: true,
+            hitForElementId: formElement.elementId,
+            fieldName: formElement.fieldName,
+            fieldType: formElement.fieldType,
+          };
+          canvas.add(hitRect as unknown as FabricObject);
+        }
+
         if (isTextEntry) {
           // A COMB (PEIGNE) field lays its value out one char per equally-spaced
           // cell across `maxLength` cells (CERFA SSN/date boxes). Reproduce the
@@ -1852,49 +2047,108 @@ export async function renderElementsOverlay(
                 formElement.style?.daSize ?? formElement.style?.fontSize ?? 0,
               )
             : null;
-          // Field font size: honour the AcroForm style, fall back to a size that
-          // fits the field height (auto-size fields use 0 in PDF). Comb fields
-          // size to the cell so a glyph never bleeds into the next box.
+          // Field font size: honour the AcroForm `/DA` size verbatim; `0` is
+          // AUTO-SIZE — with a value, target a size that fits BOTH the box
+          // height (70%) and the box width (Helvetica-like ≈ 0.5 em per char),
+          // matching the engine's `0 Tf` shrink-to-fit appearances; an empty
+          // field keeps the height-only heuristic for the caret/placeholder.
+          // Comb fields size to the cell so a glyph never bleeds into the next.
           const styleFontSize = formElement.style?.fontSize ?? 0;
+          const autoFitFontSize = (() => {
+            const heightFit = Math.max(
+              8,
+              Math.min(formElement.bounds.height * 0.7, 16),
+            );
+            if (currentValue.length === 0) return heightFit;
+            const widthFit =
+              (formElement.bounds.width - 4) / (0.5 * currentValue.length);
+            return Math.max(
+              4,
+              Math.min(formElement.bounds.height * 0.7, widthFit),
+            );
+          })();
           const fieldFontSize = combLayout
             ? combLayout.fontSize
             : styleFontSize > 0
               ? styleFontSize
-              : Math.max(8, Math.min(formElement.bounds.height * 0.7, 16));
+              : autoFitFontSize;
           const textColour = formElement.style?.textColor || "#0a3a8a";
-          const fieldText = new IText(
-            showPlaceholder ? placeholder : currentValue,
-            {
-              ...baseOptions,
+          // `/Q` quadding: a single-line IText is CONTENT-sized, so honouring
+          // centre/right needs the ANCHOR (Fabric originX) at the box's
+          // centre/right edge — a left-anchored IText can never render centred
+          // in the widget. Comb fields stay left-anchored (per-cell layout).
+          const fieldAlign = combLayout
+            ? "left"
+            : formElement.style?.textAlign || "left";
+          const anchorOriginX: "left" | "center" | "right" =
+            combLayout || fieldAlign === "left"
+              ? "left"
+              : fieldAlign === "center"
+                ? "center"
+                : "right";
+          const anchorLeft =
+            anchorOriginX === "left"
+              ? formElement.bounds.x + (combLayout ? combLayout.leftInset : 2)
+              : anchorOriginX === "center"
+                ? formElement.bounds.x + formElement.bounds.width / 2
+                : formElement.bounds.x + formElement.bounds.width - 2;
+          const anchorTop =
+            formElement.bounds.y +
+            Math.max(0, (formElement.bounds.height - fieldFontSize) / 2);
+          const isMultiline =
+            !combLayout && (formElement.properties?.multiline ?? false);
+
+          const fieldTextOptions = {
+            ...baseOptions,
+            // The full-rect hit Rect behind carries the tint; a second
+            // background here would double it under the glyphs.
+            left: anchorLeft,
+            top: anchorTop,
+            originX: anchorOriginX,
+            fontSize: fieldFontSize,
+            fontFamily: combLayout
+              ? combLayout.fontFamily
+              : formElement.style?.fontFamily || "Helvetica",
+            fill: showPlaceholder ? "rgba(0,0,0,0.4)" : textColour,
+            textAlign: fieldAlign,
+            // Per-cell spacing for comb fields (1/1000 em); 0 otherwise.
+            charSpacing: combLayout ? combLayout.charSpacing : 0,
+            hasControls: false,
+            hasBorders: true,
+            borderColor: fieldStroke,
+            borderScaleFactor: 1,
+            editable: true,
+          };
+
+          let fieldText: FabricObject;
+          if (isMultiline) {
+            // MULTILINE (`/Ff` bit 13): a Textbox WRAPS at the widget width
+            // (an IText would run past the right edge on one line) and a clip
+            // to the widget rect keeps overflowing lines from painting outside
+            // the field (Adobe behaviour — the extra text stays in the model).
+            fieldText = new Textbox(showPlaceholder ? placeholder : currentValue, {
+              ...fieldTextOptions,
+              left: formElement.bounds.x + 2,
+              top: formElement.bounds.y + 1,
+              originX: "left" as const,
+              width: Math.max(8, formElement.bounds.width - 4),
+              splitByGrapheme: false,
+              clipPath: new Rect({
+                left: formElement.bounds.x,
+                top: formElement.bounds.y,
+                originX: "left" as const,
+                originY: "top" as const,
+                width: formElement.bounds.width,
+                height: formElement.bounds.height,
+                absolutePositioned: true,
+              }) as unknown as FabricObject,
+            }) as unknown as FabricObject;
+          } else {
+            fieldText = new IText(showPlaceholder ? placeholder : currentValue, {
+              ...fieldTextOptions,
               width: formElement.bounds.width,
-              // Slight inset + vertical centring inside the field box. Comb cells
-              // centre the first glyph in cell 0 instead of a flat 2px inset.
-              left:
-                formElement.bounds.x +
-                (combLayout ? combLayout.leftInset : 2),
-              top:
-                formElement.bounds.y +
-                Math.max(0, (formElement.bounds.height - fieldFontSize) / 2),
-              fontSize: fieldFontSize,
-              fontFamily: combLayout
-                ? combLayout.fontFamily
-                : formElement.style?.fontFamily || "Helvetica",
-              fill: showPlaceholder ? "rgba(0,0,0,0.4)" : textColour,
-              backgroundColor: fieldFill,
-              // Comb fields are left-anchored (each char sits in its own cell);
-              // other fields honour the AcroForm /Q quadding (left/center/right).
-              textAlign: combLayout
-                ? "left"
-                : formElement.style?.textAlign || "left",
-              // Per-cell spacing for comb fields (1/1000 em); 0 otherwise.
-              charSpacing: combLayout ? combLayout.charSpacing : 0,
-              hasControls: false,
-              hasBorders: true,
-              borderColor: fieldStroke,
-              borderScaleFactor: 1,
-              editable: true,
-            },
-          );
+            }) as unknown as FabricObject;
+          }
           (fieldText as FabricObjectWithData).data = {
             elementId: formElement.elementId,
             type: "form_field",
@@ -1902,11 +2156,24 @@ export async function renderElementsOverlay(
             fieldType: formElement.fieldType,
             fieldPlaceholder: placeholder,
             fieldShowingPlaceholder: showPlaceholder,
+            // WIDGET-RECT stash: the IText's live bbox is content-sized, NOT
+            // the widget rect. The save path re-derives the persisted bounds
+            // from THIS rect + the drag delta vs `fieldAnchor0`, so an
+            // untouched field round-trips its rect exactly (→ the bake sees
+            // "geometry unchanged" and routes the value to the real fill).
+            fieldWidgetBounds: { ...formElement.bounds },
+            fieldAnchor0: {
+              left: isMultiline ? formElement.bounds.x + 2 : anchorLeft,
+              top: isMultiline ? formElement.bounds.y + 1 : anchorTop,
+            },
+            // Base size for the live auto-shrink on overflow (editor-canvas
+            // grows back toward this size as characters are deleted).
+            fieldBaseFontSize: fieldFontSize,
             // Canonical full element → fabricObjectToElement re-merges live
             // bounds + the typed value without losing any business prop.
             formFieldElement: formElement,
           };
-          fabricObj = fieldText as unknown as FabricObject;
+          fabricObj = fieldText;
         } else if (isCheckable) {
           const checked = formFieldChecked(formElement);
           const mark =
@@ -1928,26 +2195,42 @@ export async function renderElementsOverlay(
             fontSize: markSize,
             fontFamily: "Helvetica",
             fill: checked ? "#0a7a0a" : "#444444",
-            backgroundColor: fieldFill,
+            // The full-rect hit Rect behind carries the field tint.
             // The mark is toggled by click, never edited as text.
             editable: false,
             hasControls: false,
             hasBorders: true,
             borderColor: fieldStroke,
           });
-          const exportValue =
-            formElement.fieldType === "radio"
-              ? formFieldTextValue(
-                  formElement.value || formElement.options?.[0] || "",
-                )
-              : "";
+          // This widget's on-state: `onValue` when the extractor stamped one
+          // (radio buttons AND multi-widget named checkboxes — Oui/non CERFA
+          // pairs); legacy radio fallback = the field value / first option.
+          const widgetOnValue =
+            typeof formElement.onValue === "string" &&
+            formElement.onValue.length > 0
+              ? formElement.onValue
+              : formElement.fieldType === "radio"
+                ? formFieldTextValue(
+                    formElement.value || formElement.options?.[0] || "",
+                  )
+                : "";
           (markText as FabricObjectWithData).data = {
             elementId: formElement.elementId,
             type: "form_field",
             fieldName: formElement.fieldName,
             fieldType: formElement.fieldType,
             fieldChecked: checked,
-            fieldExportValue: exportValue,
+            fieldExportValue:
+              formElement.fieldType === "radio" ? widgetOnValue : "",
+            // Named on-state of THIS widget (group exclusivity + serialisation
+            // of named checkbox states via readFormFieldValue). Null when the
+            // checkbox is a plain boolean one.
+            fieldOnValue: widgetOnValue.length > 0 ? widgetOnValue : null,
+            fieldWidgetBounds: { ...formElement.bounds },
+            fieldAnchor0: {
+              left: formElement.bounds.x,
+              top: formElement.bounds.y,
+            },
             formFieldElement: formElement,
           };
           fabricObj = markText as unknown as FabricObject;
@@ -1983,7 +2266,7 @@ export async function renderElementsOverlay(
             fontSize: lbFontSize,
             fontFamily: formElement.style?.fontFamily || "Helvetica",
             fill: formElement.style?.textColor || "#0a3a8a",
-            backgroundColor: fieldFill,
+            // The full-rect hit Rect behind carries the field tint.
             textAlign: "left",
             // The selection is changed via the field UI, not by typing on canvas.
             editable: false,
@@ -1996,6 +2279,11 @@ export async function renderElementsOverlay(
             type: "form_field",
             fieldName: formElement.fieldName,
             fieldType: formElement.fieldType,
+            fieldWidgetBounds: { ...formElement.bounds },
+            fieldAnchor0: {
+              left: formElement.bounds.x + 2,
+              top: formElement.bounds.y + 1,
+            },
             formFieldElement: formElement,
           };
           fabricObj = lbText as unknown as FabricObject;
@@ -2030,6 +2318,11 @@ export async function renderElementsOverlay(
             type: "form_field",
             fieldName: formElement.fieldName,
             fieldType: formElement.fieldType,
+            fieldWidgetBounds: { ...formElement.bounds },
+            fieldAnchor0: {
+              left: formElement.bounds.x + formElement.bounds.width / 2,
+              top: formElement.bounds.y + formElement.bounds.height / 2,
+            },
             formFieldElement: formElement,
           };
           fabricObj = btnText as unknown as FabricObject;
@@ -2090,118 +2383,39 @@ export async function renderElementsOverlay(
     }
   }
 
-  // 4. RENDER PARAGRAPHS as multi-line, editable Textboxes (Word-like). Each
-  //    group's runs were excluded from the IText loop above; here they become a
-  //    SINGLE Textbox positioned at the block's top-left, sized to the block
-  //    width, with the lines joined by "\n". The source runs are stashed on
-  //    `data.paragraphRuns` so `fabricObjectToElements` can decompose the block
-  //    back into the original runs on save (preserving each run's engine index/
-  //    elementId/bounds → lossless `replaceText`). Same typography rules as the
-  //    IText branch (embedded font + neutralised synthetic bold/italic). This
-  //    covers BOTH paragraph/heading groups AND reconstructed table-cell /
-  //    list-item groups — a cell/item is just a positioned multi-line paragraph,
-  //    so it shares the same render + lossless decompose-save path.
-  for (const group of allCoalescedGroups) {
-    const runs = group.runs;
-    const first = runs[0]!;
-    // Block geometry from the union of the runs' bounds.
-    const blockLeft = Math.min(...runs.map((r) => r.bounds.x));
-    const blockTop = Math.min(...runs.map((r) => r.bounds.y));
-    const blockRight = Math.max(...runs.map((r) => r.bounds.x + r.bounds.width));
-    const blockWidth = Math.max(1, blockRight - blockLeft);
-
-    const fontSize = first.style.fontSize ?? 12;
-    const textColour = first.style.color || "#000000";
-    const content = runs.map((r) => r.content).join("\n");
-    // Same weight/style-aware resolution as the per-run IText branch: pick the
-    // subset matching the paragraph's bold/italic (no "gras parasite"), and only
-    // synthesise weight/style when the exact variant is not embedded OR no single
-    // same-variant subset covers the block's glyphs (→ synthetic uniform weight).
-    const paraFont = resolveTextFont(first.style, getFontFaceName, content);
-    const usingEmbeddedFont = paraFont.usingEmbeddedFont;
-    const resolvedFontFamily = paraFont.fontFamily;
-
-    const tb = new Textbox(content, {
-      left: blockLeft,
-      top: blockTop,
-      originX: "left" as const,
-      originY: "top" as const,
-      width: blockWidth,
-      angle: first.transform?.rotation || 0,
-      selectable: !readonly,
-      evented: !readonly,
-      visible: first.visible,
-      fontSize,
-      fontFamily: resolvedFontFamily,
-      fontWeight: paraFont.fontWeight,
-      fontStyle: paraFont.fontStyle,
-      fill: textColour,
-      opacity: first.style.opacity ?? 1,
-      textAlign: first.style.textAlign || "left",
-      // Real per-line advance = median of the runs' own bounds.y gaps, NOT the
-      // per-run style.lineHeight (the extractor hardcodes 1.2 on every run, which
-      // is meaningless for a block's line spacing and over-spaces tight PDF text
-      // — a 10pt CERFA body advances ~10.5pt ⇒ ~1.05, not 1.2). The measured
-      // value reflects the runs' ACTUAL positions, so the box stays 1:1 with the
-      // source; it falls back to 1.2 only when unmeasurable (<2 lines). Uniform
-      // groups reach here (non-uniform ones were dropped to per-run above), so a
-      // single lineHeight faithfully reproduces the block. See
-      // measuredLineHeightMultiple.
-      lineHeight: measuredLineHeightMultiple(runs, fontSize),
-      charSpacing: (first.style.letterSpacing || 0) * 10,
-      underline: first.style.underline || false,
-      linethrough: first.style.strikethrough || false,
-      textBackgroundColor: "",
-      cursorColor: textColour,
-      cursorWidth: 1,
-      selectionColor: "rgba(0, 100, 200, 0.18)",
-      hasControls: true,
-      hasBorders: true,
-      borderColor: "rgba(0, 100, 200, 0.75)",
-      borderScaleFactor: 1,
-      cornerColor: "rgb(0, 100, 200)",
-      cornerStrokeColor: "#ffffff",
-      cornerSize: 8,
-      transparentCorners: false,
-    });
-
-    // Same BOUNDED fallback-only fit as the per-run IText branch. A Textbox keeps
-    // its FIXED box width (it wraps, never overflows horizontally), so this is
-    // inert for paragraphs that resolve a font — it exists for parity and to guard
-    // the rare single-line coalesced block rendered with a fallback font.
-    applyFallbackWidthFit(tb, blockWidth, usingEmbeddedFont);
-
-    const paragraphRuns: ParagraphRun[] = runs.map((r) => ({
-      elementId: r.elementId,
-      ...(r.index !== undefined ? { index: r.index } : {}),
-      bounds: {
-        x: r.bounds.x,
-        y: r.bounds.y,
-        width: r.bounds.width,
-        height: r.bounds.height,
-      },
-      content: r.content,
-    }));
-
-    (tb as FabricObjectWithData).data = {
-      // The paragraph adopts the FIRST run's identity for selection/tracking.
-      elementId: first.elementId,
-      type: "text",
-      // Engine index of the first line — only meaningful when the paragraph is
-      // NOT decomposed; the decompose path keeps each run's own index.
-      index: first.index,
-      rotation0: first.transform?.rotation ?? 0,
-      originalFont: first.style.originalFont,
-      usingEmbeddedFont,
-      originalFill: textColour,
-      originalBgColor: first.style.backgroundColor || "",
-      // Marks this Textbox as a coalesced paragraph + carries its source runs so
-      // the save path decomposes it losslessly (see fabricObjectToElements).
-      isParagraph: true,
-      paragraphRuns,
-      locked: first.locked === true,
-    };
-    canvas.add(tb as unknown as FabricObject);
+  // 4. TAG PARAGRAPH GROUPS (EDIT-INTENT model). At rest every run was rendered
+  //    per-run/per-segment above — the proven pixel-1:1 path, UNCHANGED. Each
+  //    accepted group's member objects (including the per-segment fragments of
+  //    a justified run) are tagged with the group id + the shared descriptor;
+  //    a double-click on any member then swaps the group for ONE multi-line
+  //    Textbox edit session (beginParagraphEditSession) with wrap/reflow, and
+  //    an unmodified exit restores the per-run objects untouched (zero write).
+  //    Skipped in read-only surfaces (no edit intent there).
+  if (!readonly && allCoalescedGroups.length > 0) {
+    const objects = canvas.getObjects();
+    for (const group of allCoalescedGroups) {
+      const lines = linesOfGroup(group);
+      const first = group.runs[0]!;
+      const descriptor: RegisteredParagraphGroup = {
+        groupId: `pg:${first.elementId}`,
+        lines,
+        ...(group.align ? { align: group.align } : {}),
+        ...(group.lineHeightMultiple
+          ? { lineHeightMultiple: group.lineHeightMultiple }
+          : {}),
+        ...(group.frame ? { frame: group.frame } : {}),
+      };
+      const memberIds = new Set(group.runs.map((r) => r.elementId));
+      for (const obj of objects) {
+        const data = (obj as FabricObjectWithData).data;
+        if (!data?.elementId || data.type !== "text") continue;
+        if (!memberIds.has(data.elementId)) continue;
+        data.paragraphGroupId = descriptor.groupId;
+        data.paragraphGroup = descriptor;
+        // Light affordance: an editable-paragraph member invites a text cursor.
+        (obj as FabricObject & { hoverCursor?: string }).hoverCursor = "text";
+      }
+    }
   }
 
   // Wait for all async image loads before final render
@@ -2241,7 +2455,10 @@ export async function renderElementsOverlay(
     const orderKey = (o: FabricObject): [number, number] => {
       const data = (o as FabricObjectWithData).data;
       const rank = layerRank[(data?.type as string) ?? ""] ?? 99;
-      const id = data?.elementId;
+      // A form-field HIT-TARGET orders by its TARGET element (its own id is
+      // `hit:`-prefixed and unknown to the engine order); the sort is stable,
+      // so the tie keeps the hit Rect BEHIND its value object (added first).
+      const id = (data?.hitForElementId as string | undefined) ?? data?.elementId;
       const engineOrder =
         typeof id === "string"
           ? (engineOrderByElementId.get(id) ?? Number.MAX_SAFE_INTEGER)
@@ -2321,6 +2538,320 @@ export function clearElementsOverlay(canvas: FabricCanvas): number {
 
   canvas.requestRenderAll();
   return toRemove.length;
+}
+
+// ---------------------------------------------------------------------------
+// Paragraph EDIT SESSION (edit-intent, Adobe-like)
+//
+// At rest a paragraph group's runs are ordinary per-run/per-segment objects
+// tagged with `data.paragraphGroupId` (+ the shared `data.paragraphGroup`
+// descriptor). Double-clicking a member calls beginParagraphEditSession: the
+// member objects are lifted OFF the canvas (kept intact, with their z indices)
+// and replaced by ONE multi-line Textbox — frame-positioned, line texts joined
+// by "\n", per-character styles carried PER RUN (family/size/colour/weight),
+// the lib's alignment (justify supported) and the measured line advance — that
+// enters editing immediately. Exiting without a modification restores the
+// EXACT same objects (zero write); a modification flows through the standard
+// commit path (see fabric-element-io.ts commitParagraphSession).
+// ---------------------------------------------------------------------------
+
+/**
+ * Join the contents of one visual line's runs. Runs on a line are separate
+ * content-stream runs usually split at word boundaries; a single space is
+ * injected between two pieces only when NEITHER side already carries the
+ * whitespace, so "Nom :" + "DUPONT" reads "Nom : DUPONT" while "foo " + "bar"
+ * stays "foo bar". Pure & deterministic (the commit path compares the edited
+ * lines against these exact strings, stashed as `data.sessionLineTexts`).
+ */
+export function joinLineRunContents(line: readonly TextRun[]): string {
+  let out = "";
+  for (const run of line) {
+    const piece = run.content || "";
+    if (piece.length === 0) continue;
+    if (out.length > 0 && !/\s$/.test(out) && !/^\s/.test(piece)) out += " ";
+    out += piece;
+  }
+  return out;
+}
+
+/**
+ * One stashed source run of a paragraph edit session (`data.lineRuns[i][j]`).
+ * Plain JSON. `style` snapshots the run's FULL parsed style so the commit can
+ * emit erase/move elements that keep the run's own typography — the apply
+ * pipeline routes them through the lossless `replaceText`/`moveElement` (a
+ * style mismatch would silently downgrade to the destructive redact+add).
+ */
+export interface SessionLineRun {
+  elementId: string;
+  index?: number;
+  bounds: { x: number; y: number; width: number; height: number };
+  content: string;
+  style: TextRun["style"];
+}
+
+/** Non-serialisable restore info (Fabric object refs), keyed by session box. */
+interface ParagraphSessionRestoreInfo {
+  members: Array<{ obj: FabricObject; index: number }>;
+}
+const paragraphSessionRestore = new WeakMap<
+  FabricObject,
+  ParagraphSessionRestoreInfo
+>();
+
+/**
+ * Swap a paragraph group's per-run objects for ONE multi-line edit-session
+ * Textbox and enter editing. `memberObj` is the double-clicked member (any of
+ * the group's objects). Returns the session Textbox, or `null` when the object
+ * carries no group descriptor / no member is on the canvas. The caller is
+ * responsible for suppressing its own object:added/removed forwarding around
+ * this call (the swap is presentation-only — no scene-graph change).
+ */
+export function beginParagraphEditSession(
+  canvas: FabricCanvas,
+  fabricModule: FabricModule,
+  memberObj: FabricObjectWithData,
+  options: {
+    getFontFaceName?: RenderElementsOptions["getFontFaceName"];
+  } = {},
+): FabricObject | null {
+  const descriptor = memberObj.data?.paragraphGroup as
+    | RegisteredParagraphGroup
+    | undefined;
+  const groupId = memberObj.data?.paragraphGroupId as string | undefined;
+  if (!descriptor || !groupId || descriptor.groupId !== groupId) return null;
+  const lines = descriptor.lines.filter((l) => l.length > 0);
+  if (lines.length === 0) return null;
+  const { Textbox } = fabricModule;
+  const { getFontFaceName } = options;
+
+  // Collect the group's live member objects (per-run ITexts AND the per-segment
+  // fragments of a justified run) with their z indices, then lift them off.
+  const members: Array<{ obj: FabricObject; index: number }> = [];
+  canvas.getObjects().forEach((obj, index) => {
+    const data = (obj as FabricObjectWithData).data;
+    if (data?.paragraphGroupId === groupId && data?.isParagraphSession !== true) {
+      members.push({ obj, index });
+    }
+  });
+  if (members.length === 0) return null;
+
+  const allRuns = lines.flat();
+  const first = lines[0]![0]!;
+  const baseFontSize = first.style.fontSize ?? 12;
+  const textColour = first.style.color || "#000000";
+
+  // Line texts + full content (the session baseline the commit compares against).
+  const lineTexts = lines.map(joinLineRunContents);
+  const content = lineTexts.join("\n");
+
+  // Base typography = first run (same resolution as the per-run branch).
+  const baseFont = resolveTextFont(first.style, getFontFaceName, content);
+
+  // Geometry: the lib block frame positions/sizes the session box (its width is
+  // the paragraph's LAYOUT width → wrap/reflow happens at the right measure);
+  // fallback = union of the runs' bounds when the producer had no frame.
+  const unionLeft = Math.min(...allRuns.map((r) => r.bounds.x));
+  const unionTop = Math.min(...allRuns.map((r) => r.bounds.y));
+  const unionRight = Math.max(
+    ...allRuns.map((r) => r.bounds.x + r.bounds.width),
+  );
+  const frame = descriptor.frame;
+  const left = frame ? frame.x : unionLeft;
+  const top = frame ? frame.y : unionTop;
+  const width = Math.max(1, frame ? frame.width : unionRight - unionLeft);
+
+  // Line advance: measured from the LINE tops (median gap / base font size),
+  // falling back to the lib's line-height multiple, then Word's 1.2.
+  const lineTops = lines
+    .map((l) => Math.min(...l.map((r) => r.bounds.y)))
+    .sort((a, b) => a - b);
+  const gaps: number[] = [];
+  for (let i = 1; i < lineTops.length; i += 1) {
+    const gap = lineTops[i]! - lineTops[i - 1]!;
+    if (gap > 0.5) gaps.push(gap);
+  }
+  let lineHeight = descriptor.lineHeightMultiple ?? 1.2;
+  if (gaps.length > 0 && baseFontSize > 0) {
+    gaps.sort((a, b) => a - b);
+    const median = gaps[Math.floor((gaps.length - 1) / 2)]!;
+    lineHeight = Math.min(3, Math.max(0.8, median / baseFontSize));
+  }
+
+  // Per-character styles PER RUN (family/size/colour/weight/style resolved for
+  // EACH run via the same identity-aware cascade as the resting render — never
+  // the first run's style for everything). The injected join spaces inherit the
+  // Textbox base style (no entry).
+  const styles: Record<number, Record<number, Record<string, unknown>>> = {};
+  lines.forEach((line, li) => {
+    let ci = 0;
+    let lineOut = "";
+    for (const run of line) {
+      const piece = run.content || "";
+      if (piece.length === 0) continue;
+      if (lineOut.length > 0 && !/\s$/.test(lineOut) && !/^\s/.test(piece)) {
+        lineOut += " ";
+        ci += 1;
+      }
+      const resolved = resolveTextFont(run.style, getFontFaceName, piece);
+      const charStyle: Record<string, unknown> = {
+        fontFamily: resolved.fontFamily,
+        fontWeight: resolved.fontWeight,
+        fontStyle: resolved.fontStyle,
+        fontSize: run.style.fontSize ?? baseFontSize,
+        fill: run.style.color || textColour,
+        underline: run.style.underline || false,
+        linethrough: run.style.strikethrough || false,
+      };
+      for (let k = 0; k < piece.length; k += 1) {
+        (styles[li] ??= {})[ci + k] = { ...charStyle };
+      }
+      ci += piece.length;
+      lineOut += piece;
+    }
+  });
+
+  // Lift the members off the canvas (kept intact for the zero-write restore).
+  for (const m of members) canvas.remove(m.obj);
+
+  const tb = new Textbox(content, {
+    left,
+    top,
+    originX: "left" as const,
+    originY: "top" as const,
+    width,
+    angle: first.transform?.rotation || 0,
+    selectable: true,
+    evented: true,
+    visible: true,
+    fontSize: baseFontSize,
+    fontFamily: baseFont.fontFamily,
+    fontWeight: baseFont.fontWeight,
+    fontStyle: baseFont.fontStyle,
+    fill: textColour,
+    opacity: first.style.opacity ?? 1,
+    // The lib's paragraph alignment — Fabric's Textbox supports "justify".
+    textAlign: descriptor.align ?? first.style.textAlign ?? "left",
+    lineHeight,
+    charSpacing: (first.style.letterSpacing || 0) * 10,
+    underline: first.style.underline || false,
+    linethrough: first.style.strikethrough || false,
+    textBackgroundColor: "",
+    cursorColor: textColour,
+    cursorWidth: 1,
+    selectionColor: "rgba(0, 100, 200, 0.18)",
+    hasControls: true,
+    hasBorders: true,
+    borderColor: "rgba(0, 100, 200, 0.75)",
+    borderScaleFactor: 1,
+    cornerColor: "rgb(0, 100, 200)",
+    cornerStrokeColor: "#ffffff",
+    cornerSize: 8,
+    transparentCorners: false,
+  });
+  if (Object.keys(styles).length > 0) {
+    (tb as unknown as { set: (k: string, v: unknown) => void }).set(
+      "styles",
+      styles,
+    );
+  }
+
+  // Session snapshot: per-line source runs (with their engine index + full
+  // style) so the commit maps edited lines back onto the sources losslessly;
+  // `paragraphRuns` keeps the legacy flat shape so the existing block-delete
+  // and duplicate flows keep working on a session box unchanged.
+  const lineRuns: SessionLineRun[][] = lines.map((line) =>
+    line.map((r) => ({
+      elementId: r.elementId,
+      ...(r.index !== undefined ? { index: r.index } : {}),
+      bounds: {
+        x: r.bounds.x,
+        y: r.bounds.y,
+        width: r.bounds.width,
+        height: r.bounds.height,
+      },
+      content: r.content,
+      style: { ...r.style },
+    })),
+  );
+  const paragraphRuns: ParagraphRun[] = lineRuns.flat().map((r) => ({
+    elementId: r.elementId,
+    ...(r.index !== undefined ? { index: r.index } : {}),
+    bounds: { ...r.bounds },
+    content: r.content,
+  }));
+
+  (tb as FabricObjectWithData).data = {
+    // The session adopts the FIRST run's identity for selection/tracking.
+    elementId: first.elementId,
+    type: "text",
+    index: first.index,
+    rotation0: first.transform?.rotation ?? 0,
+    originalFont: first.style.originalFont,
+    usingEmbeddedFont: baseFont.usingEmbeddedFont,
+    originalFill: textColour,
+    originalBgColor: first.style.backgroundColor || "",
+    isParagraph: true,
+    isParagraphSession: true,
+    paragraphGroupId: groupId,
+    paragraphRuns,
+    lineRuns,
+    sessionLineTexts: lineTexts,
+    sessionOriginalText: content,
+    sessionOrigin: { left, top },
+    locked: false,
+  };
+
+  paragraphSessionRestore.set(tb as unknown as FabricObject, { members });
+  canvas.add(tb as unknown as FabricObject);
+  canvas.setActiveObject(tb as unknown as FabricObject);
+  (tb as unknown as { enterEditing?: () => void }).enterEditing?.();
+  canvas.requestRenderAll();
+  return tb as unknown as FabricObject;
+}
+
+/**
+ * ZERO-WRITE exit of a paragraph edit session: remove the session Textbox and
+ * put the ORIGINAL per-run objects back at their recorded z indices — the
+ * resting render is byte-identical to before the double-click. Returns false
+ * when the object carries no session restore info (already restored, or a
+ * reloaded canvas — nothing to do). The caller suppresses its object:added/
+ * removed forwarding around this call, like for beginParagraphEditSession.
+ */
+export function restoreParagraphEditSession(
+  canvas: FabricCanvas,
+  sessionObj: FabricObject,
+): boolean {
+  const info = paragraphSessionRestore.get(sessionObj);
+  if (!info) return false;
+  paragraphSessionRestore.delete(sessionObj);
+  canvas.remove(sessionObj);
+  const insertAt = (
+    canvas as unknown as {
+      insertAt?: (index: number, ...objects: FabricObject[]) => void;
+    }
+  ).insertAt;
+  for (const { obj, index } of [...info.members].sort(
+    (a, b) => a.index - b.index,
+  )) {
+    if (typeof insertAt === "function") {
+      insertAt.call(canvas, Math.min(index, canvas.getObjects().length), obj);
+    } else {
+      canvas.add(obj);
+    }
+  }
+  (canvas as unknown as { discardActiveObject?: () => void })
+    .discardActiveObject?.();
+  canvas.requestRenderAll();
+  return true;
+}
+
+/**
+ * Drop the session restore info of a COMMITTED session box (its members are
+ * superseded by the commit — restoring them would resurrect stale runs). The
+ * box itself stays on canvas as the edited paragraph until the re-render.
+ */
+export function sealParagraphEditSession(sessionObj: FabricObject): void {
+  paragraphSessionRestore.delete(sessionObj);
 }
 
 // ---------------------------------------------------------------------------
@@ -2491,45 +3022,152 @@ function attachFormFieldToggle(
     );
   };
 
+  /** Live Fill & Sign flags stamped on the canvas by the editor surface. */
+  const fillSignMeta = canvas as unknown as {
+    _gigaFillSignMode?: boolean;
+    _gigaOnSignatureFieldClick?: (element: unknown) => void;
+  };
+
+  /** Resolve a hit Rect's CONTENT object (the real field value object). */
+  const resolveHitContent = (
+    hit: FabricObjectWithData,
+  ): FabricObjectWithData | undefined =>
+    canvas.getObjects().find((o) => {
+      const od = (o as FabricObjectWithData).data;
+      return (
+        od?.elementId === hit.data?.hitForElementId &&
+        od?.isFieldHitTarget !== true
+      );
+    }) as FabricObjectWithData | undefined;
+
+  /**
+   * Toggle a checkable widget + keep its GROUP coherent across the page's
+   * sibling widgets (same fieldName):
+   *   - a widget with the SAME on-state (duplicate-page twin) mirrors this one;
+   *   - a widget with a DIFFERENT on-state (multi-widget named checkbox pairs
+   *     like Oui/non on CERFA forms, or radio buttons) is UNCHECKED when this
+   *     one checks — one field holds ONE value, so "non" checking must uncheck
+   *     the "Oui" overlay.
+   * Siblings fire `object:modified` BEFORE the target so the target's value is
+   * the LAST queued for the field (last-wins accumulation at bake time).
+   */
+  const toggleCheckable = (target: FabricObjectWithData): void => {
+    const data = target.data;
+    if (!data) return;
+    const nextChecked = data.fieldChecked !== true;
+    const groupName = data.fieldName;
+    const onValue =
+      typeof data.fieldOnValue === "string" && data.fieldOnValue.length > 0
+        ? data.fieldOnValue
+        : null;
+
+    for (const other of canvas.getObjects() as FabricObjectWithData[]) {
+      if (other === target) continue;
+      const od = other.data;
+      if (od?.type !== "form_field" || od.isFieldHitTarget === true) continue;
+      if (od.fieldType !== "checkbox" && od.fieldType !== "radio") continue;
+      if (od.fieldName !== groupName) continue;
+      const otherOn =
+        typeof od.fieldOnValue === "string" && od.fieldOnValue.length > 0
+          ? od.fieldOnValue
+          : null;
+      const isTwin = onValue !== null && otherOn !== null && otherOn === onValue;
+      // Twins mirror the target's new state; distinct-state siblings are
+      // unchecked when the target checks and untouched when it unchecks.
+      const desired = isTwin
+        ? nextChecked
+        : nextChecked
+          ? false
+          : od.fieldChecked === true;
+      if ((od.fieldChecked === true) === desired) continue;
+      od.fieldChecked = desired;
+      setMark(other, desired);
+      fireModified(other);
+    }
+
+    data.fieldChecked = nextChecked;
+    setMark(target, nextChecked);
+    if (data.elementId && onElementSelected) onElementSelected(data.elementId);
+    fireModified(target);
+    canvas.requestRenderAll();
+  };
+
   canvas.on(
     "mouse:down",
     (e: { target?: FabricObject | null }) => {
       const target = e.target as FabricObjectWithData | null;
-      if (!target) return;
+      if (!target?.data) return;
       const data = target.data;
-      if (
-        !data ||
-        data.type !== "form_field" ||
-        (data.fieldType !== "checkbox" && data.fieldType !== "radio")
-      ) {
+      const fillSign = fillSignMeta._gigaFillSignMode === true;
+
+      // Delegated click on a full-rect field hit-target: route to the field's
+      // CONTENT object — toggle for checkables, selection for the others (the
+      // caret for text entry is placed on mouse:up below).
+      if (data.isFieldHitTarget === true) {
+        const content = resolveHitContent(target);
+        if (!content?.data) return;
+        if (
+          content.data.fieldType === "checkbox" ||
+          content.data.fieldType === "radio"
+        ) {
+          toggleCheckable(content);
+          return;
+        }
+        if (fillSign && content.data.fieldType === "signature") {
+          fillSignMeta._gigaOnSignatureFieldClick?.(
+            content.data.formFieldElement,
+          );
+          return;
+        }
+        canvas.setActiveObject(content as FabricObject);
+        if (content.data.elementId && onElementSelected) {
+          onElementSelected(content.data.elementId as string);
+        }
+        canvas.requestRenderAll();
         return;
       }
 
-      const nextChecked = data.fieldChecked !== true;
+      if (data.type !== "form_field") return;
 
-      if (data.fieldType === "radio" && nextChecked) {
-        // Uncheck the other radios of the same group before checking this one.
-        const groupName = data.fieldName;
-        for (const other of canvas.getObjects() as FabricObjectWithData[]) {
-          if (other === target) continue;
-          const od = other.data;
-          if (
-            od?.type === "form_field" &&
-            od.fieldType === "radio" &&
-            od.fieldName === groupName &&
-            od.fieldChecked === true
-          ) {
-            od.fieldChecked = false;
-            setMark(other, false);
-            fireModified(other);
-          }
-        }
+      // Fill & Sign: clicking a SIGNATURE widget opens the capture dialog so
+      // the drawn/typed/imported signature lands INSIDE the widget rect.
+      if (fillSign && data.fieldType === "signature") {
+        fillSignMeta._gigaOnSignatureFieldClick?.(data.formFieldElement);
+        return;
       }
 
-      data.fieldChecked = nextChecked;
-      setMark(target, nextChecked);
-      if (data.elementId && onElementSelected) onElementSelected(data.elementId);
-      fireModified(target);
+      if (data.fieldType !== "checkbox" && data.fieldType !== "radio") return;
+      toggleCheckable(target);
+    },
+  );
+
+  // Fill & Sign (Adobe UX): a SINGLE click on a text-entry widget — its IText/
+  // Textbox or its full-rect hit target — places the caret directly (no double
+  // click). Done on mouse:up so Fabric's own mousedown selection/drag handling
+  // has fully settled; outside Fill & Sign the design behaviour is untouched
+  // (single click selects, double click edits, drag moves the widget).
+  canvas.on(
+    "mouse:up",
+    (e: { target?: FabricObject | null; e?: Event }) => {
+      if (fillSignMeta._gigaFillSignMode !== true) return;
+      const target = e.target as FabricObjectWithData | null;
+      if (!target?.data) return;
+      let content: FabricObjectWithData | undefined = target;
+      if (target.data.isFieldHitTarget === true) {
+        content = resolveHitContent(target);
+      }
+      const data = content?.data;
+      if (!content || data?.type !== "form_field") return;
+      if (data.fieldType !== "text" && data.fieldType !== "dropdown") return;
+      const editable = content as FabricObjectWithData & {
+        isEditing?: boolean;
+        enterEditing?: () => void;
+        setCursorByClick?: (ev: Event) => void;
+      };
+      if (editable.isEditing) return;
+      canvas.setActiveObject(content as FabricObject);
+      editable.enterEditing?.();
+      if (e.e) editable.setCursorByClick?.(e.e);
       canvas.requestRenderAll();
     },
   );

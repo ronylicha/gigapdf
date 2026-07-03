@@ -84,6 +84,7 @@ import { addImage } from './image-renderer';
 import { addShape } from './shape-renderer';
 import { addAnnotation } from './annotation-renderer';
 import { addFormField } from './form-renderer';
+import { applyFieldValuesOnHandle } from '../forms/filler';
 import { applyRedactions } from './engine-redact';
 import type { RedactionTarget } from './engine-redact';
 import { rgbToHex, hexToRgb01 } from '../utils';
@@ -145,6 +146,13 @@ export interface ApplyOperationsResult {
   inPlaceReordered: number;
   /** Number of `removeElement` in-place deletes applied. */
   inPlaceRemoved: number;
+  /**
+   * Number of EXISTING form fields whose VALUE was filled in place via the real
+   * form setters (`applyFieldValuesOnHandle`) — a fill-mode `update` (geometry
+   * unchanged) never takes the redact + re-add path, which would duplicate the
+   * field and reset its `/DA`//`/Q`/comb identity.
+   */
+  formFieldsFilled: number;
 }
 
 type ImageDataExtractor = (element: Record<string, unknown>) => Uint8Array | undefined;
@@ -175,6 +183,36 @@ const MOVE_TOLERANCE = 0.5;
 
 /** A rotation delta below this (in degrees) is treated as "rotation unchanged". */
 const ROTATION_TOLERANCE = 0.5;
+
+/**
+ * A form-field widget whose old/new bounds differ by less than this (in web
+ * points, every axis) is treated as "geometry unchanged" — the `update` is a
+ * fill-mode VALUE change and is routed to the real form setters instead of the
+ * destructive redact + re-add fallback.
+ */
+const FORM_GEOMETRY_TOLERANCE = 0.5;
+
+/** Whether two web-space boxes are equal within {@link FORM_GEOMETRY_TOLERANCE}. */
+function formGeometryUnchanged(
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number },
+): boolean {
+  return (
+    Math.abs(a.x - b.x) <= FORM_GEOMETRY_TOLERANCE &&
+    Math.abs(a.y - b.y) <= FORM_GEOMETRY_TOLERANCE &&
+    Math.abs(a.width - b.width) <= FORM_GEOMETRY_TOLERANCE &&
+    Math.abs(a.height - b.height) <= FORM_GEOMETRY_TOLERANCE
+  );
+}
+
+/** One fill-mode form-field update routed to `applyFieldValuesOnHandle`. */
+interface FormFillOp {
+  pageNumber: number;
+  element: Record<string, unknown>;
+  fieldName: string;
+  value: string | boolean | string[];
+  originalIndex: number;
+}
 
 /**
  * Whether two rotation angles (degrees) are equal within `ROTATION_TOLERANCE`,
@@ -541,6 +579,7 @@ export async function applyOperations(
 
   const inPlaceOps: InPlaceOp[] = [];
   const fallbackOps: ElementOperation[] = [];
+  const formFillOps: FormFillOp[] = [];
 
   for (let opIndex = 0; opIndex < operations.length; opIndex++) {
     const op = operations[opIndex]!;
@@ -573,6 +612,42 @@ export async function applyOperations(
 
     // `add` always materialises brand-new content (no existing element to edit).
     if (action !== 'update' && action !== 'delete') {
+      fallbackOps.push(op);
+      continue;
+    }
+
+    // ── Form-field VALUE fill (update with unchanged widget geometry) ────────
+    // A fill-mode edit changes a field's VALUE without moving its widget.
+    // Routing it through the redact + add fallback would DUPLICATE the field:
+    // the redaction only clears the content stream while the original widget
+    // survives in /Annots, and the re-add creates a brand-new field with a
+    // reset `/DA` (Helv 12) and lost `/Q`/comb/flags. Instead the value is
+    // accumulated here and applied on the Phase-2 handle via the REAL form
+    // setters (`applyFieldValuesOnHandle`) just before the final save — the
+    // widget, its appearance rules and its identity are preserved (the engine
+    // regenerates Adobe-parity appearances from `/DA`//`/Q`//`/MaxLen`).
+    // A geometry change (design-mode move/resize) still takes the fallback, as
+    // does an element with no field name. A fill that fails (field not yet in
+    // the AcroForm — created in design mode) falls back to `addFormField` in
+    // Phase 3 below.
+    if (action === 'update' && elementType === 'form_field') {
+      const formElement = element as unknown as FormFieldElement;
+      const fieldName =
+        typeof formElement.fieldName === 'string' ? formElement.fieldName : '';
+      const geometryUnchanged =
+        !op.oldBounds ||
+        !formElement.bounds ||
+        formGeometryUnchanged(op.oldBounds, formElement.bounds);
+      if (fieldName !== '' && geometryUnchanged) {
+        formFillOps.push({
+          pageNumber,
+          element,
+          fieldName,
+          value: formElement.value,
+          originalIndex: opIndex,
+        });
+        continue;
+      }
       fallbackOps.push(op);
       continue;
     }
@@ -1021,6 +1096,47 @@ export async function applyOperations(
     }
   }
 
+  // ── Phase 3: fill EXISTING form fields (fill-mode updates) ──────────────────
+  // Applied on the SAME handle as the add pass, right before the save, so the
+  // engine regenerates the widget appearances once with the final values.
+  let formFieldsFilled = 0;
+  if (formFillOps.length > 0) {
+    // One value per field: several widgets of the same field each emit an
+    // update op (multi-widget checkboxes, duplicate-page twins); the LAST
+    // queued value wins — it reflects the user's final action.
+    const values: Record<string, string | boolean | string[]> = {};
+    for (const fill of formFillOps) {
+      values[fill.fieldName] = fill.value;
+    }
+    const fillResults = applyFieldValuesOnHandle(handle, values);
+    for (const result of fillResults) {
+      if (result.success) {
+        formFieldsFilled++;
+        continue;
+      }
+      // Field not in the AcroForm yet (created in design mode, first bake) →
+      // materialise it exactly like a plain `add` op. Never redacted: the
+      // geometry was unchanged, so there is nothing stale to clear.
+      const source = formFillOps.find((f) => f.fieldName === result.fieldName);
+      if (!source) continue;
+      try {
+        addFormField(
+          handle,
+          source.pageNumber,
+          source.element as unknown as FormFieldElement,
+        );
+        addsApplied++;
+      } catch (err) {
+        engineLogger.warn('applyOperations: form-fill fallback add failed', {
+          fieldName: result.fieldName,
+          page: source.pageNumber,
+          originalIndex: source.originalIndex,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  }
+
   const finalBytes = await saveDocument(handle);
   closeDocument(handle);
 
@@ -1037,5 +1153,6 @@ export async function applyOperations(
     inPlaceOpacitySet,
     inPlaceReordered,
     inPlaceRemoved,
+    formFieldsFilled,
   };
 }

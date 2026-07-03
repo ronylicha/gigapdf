@@ -1,7 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { loadFixture, WITH_FORMS_PDF } from '../helpers';
-import { fillForm } from '../../src/forms/filler';
+import { loadFixture, SIMPLE_PDF, WITH_FORMS_PDF } from '../helpers';
+import { fillForm, applyFieldValuesOnHandle } from '../../src/forms/filler';
 import { getFormFields } from '../../src/forms/reader';
+import { getEngine } from '../../src/wasm';
+import {
+  openDocument,
+  saveDocument,
+  closeDocument,
+} from '../../src/engine/document-handle';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -159,5 +165,98 @@ describe('fillForm — invalid buffer', () => {
   it('throws PDFParseError when given invalid bytes', async () => {
     const invalid = Buffer.from([0x00, 0x01, 0x02, 0x03]);
     await expect(fillForm(invalid, { name: 'test' })).rejects.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// applyFieldValuesOnHandle — in-pipeline fill on an open handle
+// ---------------------------------------------------------------------------
+
+/** SIMPLE_PDF + a text field and a NAMED-export checkbox (CERFA Oui/non style). */
+async function pdfWithNamedCheckbox(): Promise<Buffer> {
+  const giga = await getEngine();
+  const doc = giga.open(loadFixture(SIMPLE_PDF));
+  try {
+    expect(doc.addTextField(1, 'name', [72, 700, 272, 724], '')).toBe(true);
+    expect(
+      doc.addCheckbox(1, 'rat', [72, 660, 86, 674], false, { export: 'non' }),
+    ).toBe(true);
+    return Buffer.from(doc.save());
+  } finally {
+    doc.close();
+  }
+}
+
+describe('applyFieldValuesOnHandle', () => {
+  it('fills a text field on an open handle (persists through save)', async () => {
+    const handle = await openDocument(await pdfWithNamedCheckbox());
+    try {
+      const results = applyFieldValuesOnHandle(handle, { name: 'Alice' });
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ fieldName: 'name', success: true });
+
+      const bytes = await saveDocument(handle);
+      const fields = await getFormFields(Buffer.from(bytes));
+      expect(fields.find((f) => f.fieldName === 'name')?.value).toBe('Alice');
+    } finally {
+      closeDocument(handle);
+    }
+  });
+
+  it('checks a NAMED checkbox state via setCheckboxState (string value)', async () => {
+    const handle = await openDocument(await pdfWithNamedCheckbox());
+    try {
+      const results = applyFieldValuesOnHandle(handle, { rat: 'non' });
+      expect(results[0]).toMatchObject({ fieldName: 'rat', success: true });
+
+      // The raw engine value carries the EXPORT (per-widget /AS reached).
+      const raw = handle._doc.fields().find((f) => f.name === 'rat');
+      expect(raw?.value).toBe('non');
+    } finally {
+      closeDocument(handle);
+    }
+  });
+
+  it('unchecks on "" and on false', async () => {
+    const handle = await openDocument(await pdfWithNamedCheckbox());
+    try {
+      applyFieldValuesOnHandle(handle, { rat: 'non' });
+      expect(
+        applyFieldValuesOnHandle(handle, { rat: '' })[0]?.success,
+      ).toBe(true);
+      const bytes = await saveDocument(handle);
+      const fields = await getFormFields(Buffer.from(bytes));
+      expect(fields.find((f) => f.fieldName === 'rat')?.value).toBe(false);
+    } finally {
+      closeDocument(handle);
+    }
+
+    const handle2 = await openDocument(await pdfWithNamedCheckbox());
+    try {
+      applyFieldValuesOnHandle(handle2, { rat: 'non' });
+      expect(
+        applyFieldValuesOnHandle(handle2, { rat: false })[0]?.success,
+      ).toBe(true);
+      const raw = handle2._doc.fields().find((f) => f.name === 'rat');
+      expect(raw?.value === '' || raw?.value.toLowerCase() === 'off').toBe(
+        true,
+      );
+    } finally {
+      closeDocument(handle2);
+    }
+  });
+
+  it('reports failure (Field not found) for an unknown field', async () => {
+    const handle = await openDocument(await pdfWithNamedCheckbox());
+    try {
+      const results = applyFieldValuesOnHandle(handle, { ghost: 'x' });
+      expect(results[0]).toMatchObject({
+        fieldName: 'ghost',
+        success: false,
+        error: 'Field not found',
+      });
+    } finally {
+      closeDocument(handle);
+    }
   });
 });

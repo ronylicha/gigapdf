@@ -4,41 +4,47 @@
  * The editor renders editable text on top of a text-free page raster using the
  * document's OWN fonts (via the browser FontFace API). This module is the single
  * source of truth for serving those fonts — backed entirely by the gigapdf
- * engine (`embeddedFonts` + `extractWebFont`), with ZERO external font tooling
- * (no pikepdf, no fontTools).
+ * engine (`embeddedFontsV2` + `extractWebFontById`), with ZERO external font
+ * tooling (no pikepdf, no fontTools).
  *
- * Why `extractWebFont` and not a PDF-font reparser: a PDF selects a CFF/Type1
- * glyph by NAME (via the font's charset), never by code, and routinely ships a
- * bare CFF or a `cmap`-less TrueType subset that a browser's `FontFace`/OTS
- * rejects. The engine repairs those into a real, loadable sfnt with a correct
- * Unicode `cmap` built from the PDF's own `code → Unicode` decode mapping —
- * **keeping the original glyphs** (no substitute), so every run renders the right
- * letters (a naive "code == gid" cmap synthesis mapped `M → U` — the CERFA
- * garbling this replaces).
+ * Why `extractWebFontById` and not a name lookup: a form generator routinely
+ * embeds DOZENS of same-family font wrapper dicts whose descriptors all share a
+ * handful of physical `/FontFile*` programs, each wrapper carrying its own
+ * *partial* `/ToUnicode`. A `/BaseFont` NAME lookup can land on a homonym
+ * wrapper whose 2-entry map drops accents the program actually carries (the
+ * "à/é lost on CERFA" bug). Resolving by the program's PHYSICAL identity
+ * (`fontId` — 8-hex SHA-256 prefix of the decoded bytes, the same value
+ * `textElements()` reports per run) pins the exact program, and the engine
+ * serves it with a `cmap` rebuilt as the UNION of every wrapper's mapping —
+ * **keeping the original glyphs** (no substitute), never rejected for an
+ * incomplete map (missing glyphs render `.notdef`, accepted by design).
  *
- * One entry PER embedded subset (no de-duplication): a PDF embeds many disjoint
- * subsets of the SAME family (`XXXXXX+TimesNewRoman` ×30+), each carrying only
- * the glyphs of the runs it painted. The editor loads them all and picks, per
- * run, the subset that actually covers the run's code points — so each subset
- * must be served with its own glyphs under its own (full, prefix-included)
- * `/BaseFont` name.
+ * One entry PER embedded **program** (deduplicated by `/FontFile*` stream): the
+ * reference CERFA collapses from 74 wrapper names to 21 physical programs, one
+ * of which is aliased by up to 35 `/BaseFont` names — all carried in
+ * {@link ExtractedFontMeta.baseFonts} so the editor can match a run by any of
+ * its aliases.
  */
 
 import { openDocument, closeDocument } from '../engine';
 
-/** Metadata for one embedded font subset, consumed by the editor. */
+/** Metadata for one embedded font program, consumed by the editor. */
 export interface ExtractedFontMeta {
-  /** Stable id derived from the full `/BaseFont` (cache + fetch key). */
+  /**
+   * PHYSICAL program identity (engine `EmbeddedFontV2.fontId` — 8-hex SHA-256
+   * prefix of the decoded `/FontFile*` bytes). Matches the per-run
+   * `TextElementInfo.fontId` / `TextStyle.fontId`; cache + fetch key.
+   */
   fontId: string;
-  /** The `/BaseFont` name (subset prefix kept) — unique per embedded subset. */
+  /** First `/BaseFont` alias of the program (subset prefix kept). */
   originalName: string;
-  /** PostScript-ish name (subset prefix stripped). */
+  /** PostScript-ish name (subset prefix stripped from {@link originalName}). */
   postscriptName: string | null;
   /** Display family (variant suffixes stripped). */
   fontFamily: string | null;
   /** PDF font subtype label (TrueType / Type1 / …) from the embedded program. */
   subtype: string;
-  /** Always true here — `extractWebFont` yields a browser-loadable sfnt. */
+  /** Always true here — `extractWebFontById` yields a browser-loadable sfnt. */
   isEmbedded: boolean;
   /** True when the `/BaseFont` carries an `ABCDEF+` subset prefix. */
   isSubset: boolean;
@@ -46,6 +52,12 @@ export interface ExtractedFontMeta {
   format: 'ttf' | 'otf' | 'cff' | null;
   /** Unknown without extracting; the editor does not rely on it. */
   sizeBytes: number | null;
+  /**
+   * EVERY `/BaseFont` alias wrapped around this physical program (deduplicated,
+   * sorted — includes {@link originalName}). A run resolved by NAME matches the
+   * program when its `/BaseFont` equals ANY of these aliases.
+   */
+  baseFonts: string[];
 }
 
 /** Binary payload for one font, base64-encoded for JSON transport. */
@@ -79,52 +91,34 @@ function describeFormat(format: 'truetype' | 'cff' | 'type1'): {
   browser: 'ttf' | 'otf';
 } {
   if (format === 'truetype') return { subtype: 'TrueType', browser: 'ttf' };
-  // CFF (Type1C) and Type1 are wrapped to OpenType (`OTTO`) by extractWebFont.
+  // CFF (Type1C) and Type1 are wrapped to OpenType (`OTTO`) by extractWebFontById.
   return { subtype: 'Type1', browser: 'otf' };
 }
 
 /**
- * Deterministic 16-hex-char id (FNV-1a 64-bit). Dependency-free — the id only
- * needs to be stable and collision-resistant across the font names of a single
- * document, not cryptographic. Keyed on the FULL `/BaseFont` (prefix included),
- * so it is unique per embedded subset.
- */
-function hashFontId(name: string): string {
-  let h = 0xcbf29ce484222325n;
-  const prime = 0x100000001b3n;
-  const mask = 0xffffffffffffffffn;
-  for (let i = 0; i < name.length; i++) {
-    h = (h ^ BigInt(name.charCodeAt(i))) & mask;
-    h = (h * prime) & mask;
-  }
-  return h.toString(16).padStart(16, '0');
-}
-
-/**
- * List the document's embedded font subsets (one entry each, by full
- * `/BaseFont`) with the metadata the editor needs. Cheap — reads
- * `embeddedFonts()` only, no per-font extraction.
+ * List the document's embedded font PROGRAMS (one entry per physical
+ * `/FontFile*` stream, via `embeddedFontsV2`) with the metadata the editor
+ * needs. Cheap — no per-font extraction. Deterministic: the engine sorts by
+ * `fontId`.
  */
 export async function listDocumentFonts(bytes: Buffer): Promise<ExtractedFontMeta[]> {
   const handle = await openDocument(bytes);
   try {
-    const embedded = handle._doc.embeddedFonts();
     const out: ExtractedFontMeta[] = [];
-    const seen = new Set<string>();
-    for (const ef of embedded) {
-      if (seen.has(ef.baseFont)) continue; // identical /BaseFont ⇒ same subset
-      seen.add(ef.baseFont);
-      const { subtype, browser } = describeFormat(ef.format);
+    for (const program of handle._doc.embeddedFontsV2()) {
+      const originalName = program.baseFonts[0] ?? '';
+      const { subtype, browser } = describeFormat(program.format);
       out.push({
-        fontId: hashFontId(ef.baseFont),
-        originalName: ef.baseFont,
-        postscriptName: ef.baseFont.replace(SUBSET_PREFIX, ''),
-        fontFamily: fontFamilyOf(ef.baseFont),
+        fontId: program.fontId,
+        originalName,
+        postscriptName: originalName ? originalName.replace(SUBSET_PREFIX, '') : null,
+        fontFamily: originalName ? fontFamilyOf(originalName) : null,
         subtype,
         isEmbedded: true,
-        isSubset: isSubsetName(ef.baseFont),
+        isSubset: isSubsetName(originalName),
         format: browser,
         sizeBytes: null,
+        baseFonts: program.baseFonts,
       });
     }
     return out;
@@ -134,8 +128,13 @@ export async function listDocumentFonts(bytes: Buffer): Promise<ExtractedFontMet
 }
 
 /**
- * Return the browser-loadable binary for one font id, or null when the id is
- * unknown or the face cannot be made FontFace-loadable.
+ * Return the browser-loadable binary for one PHYSICAL font id (the engine's
+ * `EmbeddedFontV2.fontId` / per-run `TextElementInfo.fontId`), or null when no
+ * embedded program carries that id or the face cannot be made
+ * FontFace-loadable (bare cff/type1 — rare). The served `cmap` is the UNION of
+ * every wrapper's `code → Unicode` mapping, so accents present in ANY wrapper
+ * survive; an incomplete subset is served as-is (missing glyphs → `.notdef`),
+ * never rejected.
  */
 export async function getDocumentFont(
   bytes: Buffer,
@@ -143,29 +142,25 @@ export async function getDocumentFont(
 ): Promise<ExtractedFontBinary | null> {
   const handle = await openDocument(bytes);
   try {
-    const embedded = handle._doc.embeddedFonts();
-    const seen = new Set<string>();
-    for (const ef of embedded) {
-      if (seen.has(ef.baseFont)) continue;
-      seen.add(ef.baseFont);
-      if (hashFontId(ef.baseFont) !== fontId) continue;
+    const program = handle._doc
+      .embeddedFontsV2()
+      .find((p) => p.fontId === fontId);
+    if (!program) return null;
 
-      const web = handle._doc.extractWebFont(ef.baseFont);
-      if (!web) return null;
-      // truetype → ttf, otf (wrapped CFF / OpenType) → otf; bare cff/type1 are
-      // not FontFace-loadable.
-      const format: 'ttf' | 'otf' | null =
-        web.format === 'truetype' ? 'ttf' : web.format === 'otf' ? 'otf' : null;
-      if (!format) return null;
-      return {
-        fontId,
-        dataBase64: Buffer.from(web.bytes).toString('base64'),
-        format,
-        mimeType: format === 'ttf' ? 'font/ttf' : 'font/otf',
-        originalName: ef.baseFont,
-      };
-    }
-    return null;
+    const web = handle._doc.extractWebFontById(fontId);
+    if (!web) return null;
+    // truetype → ttf, otf (wrapped CFF / OpenType) → otf; bare cff/type1 are
+    // not FontFace-loadable.
+    const format: 'ttf' | 'otf' | null =
+      web.format === 'truetype' ? 'ttf' : web.format === 'otf' ? 'otf' : null;
+    if (!format) return null;
+    return {
+      fontId,
+      dataBase64: Buffer.from(web.bytes).toString('base64'),
+      format,
+      mimeType: format === 'ttf' ? 'font/ttf' : 'font/otf',
+      originalName: program.baseFonts[0] ?? '',
+    };
   } finally {
     closeDocument(handle);
   }

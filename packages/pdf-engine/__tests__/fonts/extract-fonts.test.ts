@@ -41,15 +41,22 @@ describe('listDocumentFonts', () => {
     expect(fonts.length).toBeGreaterThanOrEqual(1);
 
     const f = fonts[0]!;
-    expect(f.fontId).toMatch(/^[0-9a-f]{16}$/); // stable FNV-1a id
+    // PHYSICAL program identity (engine EmbeddedFontV2.fontId — 8-hex SHA-256
+    // prefix of the decoded /FontFile* bytes), matching TextElementInfo.fontId.
+    expect(f.fontId).toMatch(/^[0-9a-f]{8}$/);
     expect(f.subtype).toBe('TrueType');
     expect(f.isEmbedded).toBe(true); // truetype → browser-loadable
     expect(f.format).toBe('ttf');
-    // The list is built cheaply from embeddedFonts() (no per-font extraction), so
-    // size is not computed here — it stays null until the binary is fetched.
+    // The list is built cheaply from embeddedFontsV2() (no per-font extraction),
+    // so size is not computed here — it stays null until the binary is fetched.
     expect(f.sizeBytes).toBeNull();
     expect(typeof f.originalName).toBe('string');
     expect(f.originalName.length).toBeGreaterThan(0);
+    // One entry per PROGRAM: every /BaseFont alias wrapped around it is listed,
+    // and originalName is the first alias.
+    expect(Array.isArray(f.baseFonts)).toBe(true);
+    expect(f.baseFonts.length).toBeGreaterThanOrEqual(1);
+    expect(f.baseFonts[0]).toBe(f.originalName);
   });
 
   it('is deterministic — same document yields the same fontIds', async () => {

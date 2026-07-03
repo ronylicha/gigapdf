@@ -50,7 +50,12 @@ export interface TextBlock {
     alignment?: 'left' | 'center' | 'right' | 'justify';
     /** Original font family (engine-resolved) */
     originalFont?: string;
-    /** Normalised font id for matching against extracted font resources */
+    /**
+     * PHYSICAL identity of the run's embedded font program (the engine's
+     * `TextElementInfo.fontId` — 8-hex SHA-256 prefix of the `/FontFile*`
+     * bytes, matching `EmbeddedFontV2.fontId` / `extractWebFontById`).
+     * Absent when the font embeds no program (base-14, Type3).
+     */
     fontId?: string;
   };
   direction?: 'ltr' | 'rtl';
@@ -61,11 +66,6 @@ export interface TextBlock {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/** Normalise a family name to a stable id (lowercase, spaces → dashes). */
-function normaliseFontId(family: string): string {
-  return family.toLowerCase().replace(/\s+/g, '-');
-}
 
 /** `#rrggbb` from an engine RGB triple (`0..1` per channel). */
 function colorHex(color: [number, number, number]): string {
@@ -117,6 +117,8 @@ interface TextRun {
   fontFamily: string;
   /** Exact `/BaseFont` (subset prefix kept) — the precise embedded-font key. */
   baseFont: string;
+  /** Physical embedded-program id (`TextElementInfo.fontId`), '' when none. */
+  fontId: string;
   bold: boolean;
   italic: boolean;
   fontSize: number;
@@ -275,6 +277,14 @@ export function runToTextElement(run: TextElementInfo, pageHeight: number, pageN
       // the run (exact metrics, no overlap). Empty `baseFont` (Type3 fonts) falls
       // back to the family so resolution still has a key.
       originalFont: run.baseFont || run.fontFamily || null,
+      // PHYSICAL program identity (8-hex SHA-256 prefix of the `/FontFile*`
+      // bytes) — name-ambiguity-proof: dozens of same-`/BaseFont` wrappers can
+      // share one program, and a NAME lookup can land on a homonym wrapper
+      // whose partial /ToUnicode drops accents. The editor feeds this to the
+      // per-program font endpoint (`extractWebFontById`) so the run ALWAYS
+      // renders with its own glyphs. Absent for runs whose font embeds no
+      // program (base-14, Type3) — resolution then falls back to the name.
+      fontId: run.fontId || undefined,
     },
     ocrConfidence: null,
     linkUrl: null,
@@ -383,6 +393,7 @@ export async function extractTextBlocks(
           fontKey: `${run.fontFamily}|${run.bold ? 1 : 0}|${run.italic ? 1 : 0}`,
           fontFamily: run.fontFamily,
           baseFont: run.baseFont,
+          fontId: run.fontId ?? '',
           bold: run.bold,
           italic: run.italic,
           fontSize: run.fontSize,
@@ -441,7 +452,9 @@ export async function extractTextBlocks(
               // Exact `/BaseFont` (subset) for embedded-font matching; falls back
               // to the collapsed family for Type3 runs with no `/BaseFont`.
               originalFont: firstRun.baseFont || firstRun.fontFamily || undefined,
-              fontId: normaliseFontId(firstRun.fontFamily) || undefined,
+              // Physical program identity (engine `fontId`) — NOT a family slug.
+              // Absent when the block's font embeds no program.
+              fontId: firstRun.fontId || undefined,
             },
             direction,
             rotation: firstRun.rotation !== 0 ? firstRun.rotation : undefined,

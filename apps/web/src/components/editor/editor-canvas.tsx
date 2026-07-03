@@ -24,7 +24,15 @@ import { addPdfBackground, backgroundRenderScale } from "./lib/pdf-background";
 // editable Fabric overlay is built identically there — never duplicated. The
 // single-page editor injects its embedded-font resolver + edit-time hide-mask
 // below.
-import { renderElementsOverlay as renderElementsOverlayShared } from "./render-elements";
+import {
+  renderElementsOverlay as renderElementsOverlayShared,
+  // Paragraph EDIT-INTENT session (Adobe-like): a double-click on a member of
+  // a coalesced paragraph group swaps the group's per-run objects for ONE
+  // multi-line Textbox session; an unmodified exit restores them untouched.
+  beginParagraphEditSession,
+  restoreParagraphEditSession,
+  sealParagraphEditSession,
+} from "./render-elements";
 // Pure Fabric<->Element helpers in lib/fabric-element-io.ts, so any surface that
 // serialises Fabric objects back to Elements does so identically.
 import {
@@ -33,6 +41,8 @@ import {
   fabricObjectToElement as fabricObjectToElementImpl,
   fabricObjectToElements as fabricObjectToElementsImpl,
   sampleBackgroundUnder as sampleBackgroundUnderImpl,
+  commitParagraphSession,
+  refreshParagraphSessionAfterCommit,
 } from "./lib/fabric-element-io";
 // Word-like partial formatting: shared char-style mappers (model <-> Fabric)
 // reused so setSelectionStyles / selection-style aggregation map fields the
@@ -130,8 +140,18 @@ export type TextFormatAction =
   | "alignRight";
 
 export interface EditorCanvasHandle {
-  /** Ajouter une image au canvas */
-  addImage: (dataUrl: string, width: number, height: number) => void;
+  /**
+   * Ajouter une image au canvas. `target` (optionnel — Remplir & Signer) :
+   * l'image est AJUSTÉE dans ce rect (ratio préservé, centrée) au lieu du
+   * placement libre par défaut — utilisé pour poser une signature dans un
+   * widget de champ signature.
+   */
+  addImage: (
+    dataUrl: string,
+    width: number,
+    height: number,
+    target?: { x: number; y: number; width: number; height: number },
+  ) => void;
   /** Annuler la dernière action */
   undo: () => void;
   /** Refaire la dernière action annulée */
@@ -303,7 +323,8 @@ export interface EditorCanvasProps {
     originalName: string,
     wantVariant?: { bold?: boolean; italic?: boolean },
     text?: string,
-  ) => string | null;
+    fontId?: string,
+  ) => { name: string; embedded: boolean; exact: boolean } | null;
   /**
    * True while embedded PDF fonts are still loading (the `isLoading` of
    * `useEmbeddedFonts`). The overlay first renders with FALLBACK metrics; when
@@ -429,6 +450,19 @@ export interface EditorCanvasProps {
    * elements (see the Redaction tool).
    */
   onRedactionMarksChanged?: (count: number) => void;
+  /**
+   * Mode « Remplir & Signer » actif (Adobe UX). Quand vrai : un simple clic
+   * dans un champ texte place le CURSEUR (enterEditing + setCursorByClick), et
+   * un clic sur un widget signature ouvre le dialog de capture via
+   * `onSignatureFieldClick`. Hors de ce mode le comportement design est
+   * inchangé (simple clic = sélection, double clic = édition, drag = move).
+   */
+  fillSignActive?: boolean;
+  /**
+   * Remplir & Signer : clic sur un widget SIGNATURE → l'appelant ouvre le
+   * SignatureCaptureDialog et insérera l'image ajustée aux bounds du widget.
+   */
+  onSignatureFieldClick?: (element: FormFieldElement) => void;
 }
 
 /** Tailles par défaut des widgets de formulaire, par variante de création. */
@@ -576,6 +610,21 @@ function sceneToPdfUserPoint(
 }
 
 /**
+ * Retire le hit-target plein rect apparié à un élément form_field (Rect de
+ * fond ajouté par render-elements, `data.hitForElementId`). À appeler partout
+ * où l'objet CONTENU d'un champ est retiré/re-créé, sinon le rect orphelin
+ * reste cliquable (et se ré-empile au re-render).
+ */
+function removeFieldHitTwin(canvas: FabricCanvas, elementId: string): void {
+  const twin = canvas
+    .getObjects()
+    .find(
+      (o) => (o as FabricObjectWithData).data?.hitForElementId === elementId,
+    );
+  if (twin) canvas.remove(twin);
+}
+
+/**
  * Canvas de l'éditeur PDF avec support Fabric.js.
  * Chaque élément est indépendant et éditable.
  */
@@ -615,11 +664,34 @@ export function EditorCanvas({
   onCanvasReady,
   onHyperlinkClick,
   onRedactionMarksChanged,
+  fillSignActive = false,
+  onSignatureFieldClick,
 }: EditorCanvasProps) {
   // En mode intégré, le parent (défileur continu) possède le zoom : on neutralise
   // tout mode "fit" local (qui réécrirait le zoom depuis le viewport interne
   // absent). En mode standalone, comportement inchangé.
   const fitMode = embedded ? null : fitModeProp;
+
+  // Remplir & Signer : flags LIVE lus par les handlers souris de
+  // render-elements (attachés UNE fois par canvas). Stampés sur l'instance
+  // Fabric pour que le mode s'applique/se retire sans ré-attacher les
+  // listeners ni re-render l'overlay.
+  const fillSignActiveRef = useRef(fillSignActive);
+  fillSignActiveRef.current = fillSignActive;
+  const onSignatureFieldClickRef = useRef(onSignatureFieldClick);
+  onSignatureFieldClickRef.current = onSignatureFieldClick;
+  useEffect(() => {
+    const canvas = fabricRef.current as
+      | (FabricCanvas & {
+          _gigaFillSignMode?: boolean;
+          _gigaOnSignatureFieldClick?: (element: unknown) => void;
+        })
+      | null;
+    if (!canvas) return;
+    canvas._gigaFillSignMode = fillSignActive;
+    canvas._gigaOnSignatureFieldClick = (element: unknown) =>
+      onSignatureFieldClickRef.current?.(element as FormFieldElement);
+  });
   const t = useTranslations("editor.canvas");
   const containerRef = useRef<HTMLDivElement>(null);
   // Assigné IMPÉRATIVEMENT (plus via ref JSX) : le <canvas> est créé et attaché
@@ -648,6 +720,14 @@ export function EditorCanvas({
   const onHyperlinkClickRef = useRef(onHyperlinkClick);
   const onRedactionMarksChangedRef = useRef(onRedactionMarksChanged);
   const onInkDrawnRef = useRef(onInkDrawn);
+
+  // Paragraph edit-intent session plumbing: the loaded Fabric module (the
+  // session Textbox is constructed outside loadPage) + the LIVE embedded-font
+  // resolver (per-run character styles), both read through refs because the
+  // text-editing handlers are memoised once.
+  const fabricModuleRef = useRef<typeof import("fabric") | null>(null);
+  const getFontFaceNameRef = useRef(getFontFaceName);
+  getFontFaceNameRef.current = getFontFaceName;
 
   // Freehand pencil ("draw" tool) live-capture state. While drawing, the stroke
   // is a transient Fabric preview; on pointer-up it is lowered to PDF user space
@@ -1205,6 +1285,52 @@ export function EditorCanvas({
     if (typeName !== "i-text" && typeName !== "textbox" && typeName !== "text") {
       return;
     }
+    // PARAGRAPH EDIT-INTENT: a double-click on a MEMBER of a coalesced
+    // paragraph group opens the GROUP session instead of the single-run inline
+    // edit (Adobe-like: one editable multi-line box with wrap/reflow). Fabric
+    // has already entered editing on the member — baseline its content so the
+    // imminent exitEditing() forwards nothing, then (microtask, out of Fabric's
+    // enterEditing call stack) swap the group for the session Textbox. Only in
+    // the plain select tool; form fields never carry a group id.
+    if (
+      obj.data?.paragraphGroupId &&
+      obj.data?.isParagraphSession !== true &&
+      toolRef.current === "select"
+    ) {
+      const canvas = fabricRef.current;
+      const fabricModule = fabricModuleRef.current;
+      if (canvas && fabricModule) {
+        const memberId = obj.data?.elementId;
+        if (memberId) {
+          originalContentRef.current.set(
+            memberId,
+            (obj as FabricObjectWithData & { text?: string }).text || "",
+          );
+        }
+        queueMicrotask(() => {
+          if (fabricRef.current !== canvas) return; // canvas re-init meanwhile
+          (
+            obj as FabricObjectWithData & { exitEditing?: () => void }
+          ).exitEditing?.();
+          // The swap is presentation-only (no scene-graph change): suppress the
+          // object:added/removed forwarding it would otherwise trigger.
+          beginProgrammaticApply();
+          try {
+            beginParagraphEditSession(
+              canvas,
+              fabricModule,
+              obj,
+              getFontFaceNameRef.current
+                ? { getFontFaceName: getFontFaceNameRef.current }
+                : {},
+            );
+          } finally {
+            endProgrammaticApply();
+          }
+        });
+      }
+      return;
+    }
     // DIRECT-TEXT model: the page is rasterised WITHOUT text, so this overlay is
     // already the visible text in its real colour — there is no glyph beneath to
     // mask. Just remember the original content (to detect a real change on exit)
@@ -1251,7 +1377,7 @@ export function EditorCanvas({
       obj as FabricObject & { canvas?: { requestRenderAll?: () => void } }
     ).canvas;
     canvas?.requestRenderAll?.();
-  }, []);
+  }, [beginProgrammaticApply, endProgrammaticApply]);
 
   // Handler appele quand le texte change en temps reel
   const handleTextChanged = useCallback((e: { target?: FabricObject }) => {
@@ -1261,6 +1387,78 @@ export function EditorCanvas({
     const currentText = (obj as FabricObjectWithData & { text?: string }).text || "";
 
     clientLogger.debug("[EditorCanvas] Text changed in real-time:", elementId, `"${currentText}"`);
+
+    // Contraintes LIVE des champs de formulaire (UX Adobe) :
+    //   - /MaxLen non-comb : la saisie est TRONQUÉE à la volée (les champs
+    //     comb sont déjà clampés par leur layout par-cellule au round-trip) ;
+    //   - single-line : si le texte déborde la largeur du widget, la taille de
+    //     police RÉTRÉCIT en direct (auto-size Adobe) et regrandit vers la
+    //     taille de base quand des caractères sont effacés.
+    const data = obj.data;
+    if (data?.type !== "form_field") return;
+    const field = data.formFieldElement as FormFieldElement | undefined;
+    if (!field) return;
+    const isComb = field.properties?.comb === true;
+    const isMultiline = field.properties?.multiline === true;
+    const set = (obj as FabricObject & { set: (...args: unknown[]) => void }).set;
+    const editable = obj as FabricObjectWithData & {
+      text?: string;
+      width?: number;
+      fontSize?: number;
+      selectionStart?: number;
+      selectionEnd?: number;
+      canvas?: { requestRenderAll?: () => void };
+    };
+    let dirty = false;
+
+    const maxLength = field.properties?.maxLength ?? null;
+    if (
+      !isComb &&
+      typeof maxLength === "number" &&
+      maxLength > 0 &&
+      currentText.length > maxLength
+    ) {
+      set.call(obj, { text: currentText.slice(0, maxLength) });
+      editable.selectionStart = Math.min(
+        editable.selectionStart ?? maxLength,
+        maxLength,
+      );
+      editable.selectionEnd = Math.min(
+        editable.selectionEnd ?? maxLength,
+        maxLength,
+      );
+      dirty = true;
+    }
+
+    if (!isComb && !isMultiline) {
+      const widgetBounds =
+        (data.fieldWidgetBounds as { width: number } | undefined) ??
+        field.bounds;
+      const avail = Math.max(4, (widgetBounds?.width ?? 0) - 4);
+      const base =
+        typeof data.fieldBaseFontSize === "number"
+          ? data.fieldBaseFontSize
+          : (editable.fontSize ?? 12);
+      const measured = editable.width ?? 0;
+      const current = editable.fontSize ?? base;
+      if (measured > avail && current > 4) {
+        // Déborde : rétrécir proportionnellement (plancher 4pt lisible).
+        const next = Math.max(4, current * (avail / measured));
+        if (next < current - 0.1) {
+          set.call(obj, { fontSize: next });
+          dirty = true;
+        }
+      } else if (current < base && measured > 0 && measured < avail) {
+        // Regrandir vers la taille de base quand la place le permet.
+        const grown = Math.min(base, current * (avail / measured));
+        if (grown > current + 0.1) {
+          set.call(obj, { fontSize: grown });
+          dirty = true;
+        }
+      }
+    }
+
+    if (dirty) editable.canvas?.requestRenderAll?.();
   }, []);
 
   // Word-like partial formatting: the IText caret/selection moved while editing
@@ -1296,6 +1494,75 @@ export function EditorCanvas({
     // so it reverts to the whole-element state.
     if (editingTextRef.current === obj) editingTextRef.current = null;
     onTextSelectionStyleChangedRef.current?.(null);
+
+    // PARAGRAPH EDIT SESSION exit (edit-intent model):
+    //   - UNMODIFIED → put the original per-run objects back exactly as they
+    //     were (zero write, zero re-render of the group);
+    //   - MODIFIED   → commit through the standard queue: same line count ⇒
+    //     per-line in-place updates (replaceText on the line's first run +
+    //     erase of its siblings / pure moves); line count changed ⇒ reflow
+    //     (removeElement of EVERY source run + one added run per re-wrapped
+    //     line). The box then stays on canvas as the edited paragraph until
+    //     the post-apply re-render re-forms the group from the fresh parse.
+    if (obj.data?.isParagraphSession === true) {
+      const sessionCanvas = fabricRef.current;
+      const commit = commitParagraphSession(obj);
+      if (commit.kind === "unchanged") {
+        if (sessionCanvas) {
+          beginProgrammaticApply();
+          try {
+            restoreParagraphEditSession(
+              sessionCanvas,
+              obj as unknown as FabricObject,
+            );
+          } finally {
+            endProgrammaticApply();
+          }
+        }
+        return;
+      }
+      const sessionElementId = obj.data?.elementId as string | undefined;
+      if (commit.kind === "update") {
+        for (const element of commit.elements) {
+          const oldBounds = lastKnownBoundsRef.current.get(element.elementId);
+          lastKnownBoundsRef.current.set(element.elementId, element.bounds);
+          onElementModifiedRef.current?.(element, oldBounds);
+        }
+      } else {
+        // Reflow: removals first (apply-operations orders the removeElement
+        // calls in descending index itself), then the re-wrapped lines as
+        // brand-new runs (no engine index → add path).
+        for (const removedId of commit.removedElementIds) {
+          onElementRemovedRef.current?.(removedId);
+        }
+        for (const element of commit.addedElements) {
+          lastKnownBoundsRef.current.set(element.elementId, element.bounds);
+          onElementAddedRef.current?.(element);
+        }
+      }
+      // The commit supersedes the lifted per-run objects — never restore them.
+      sealParagraphEditSession(obj as unknown as FabricObject);
+      // Re-anchor the session snapshot so a follow-up edit (before the
+      // re-render) maps against the freshly-committed baseline.
+      refreshParagraphSessionAfterCommit(obj, commit);
+      if (sessionElementId) {
+        originalContentRef.current.set(
+          sessionElementId,
+          (obj as FabricObjectWithData & { text?: string }).text || "",
+        );
+        // The object:modified Fabric fires right after exitEditing() must not
+        // re-queue the same commit.
+        recentlyForwardedTextEditRef.current.set(sessionElementId, Date.now());
+      }
+      const setSession = (
+        obj as FabricObject & { set: (...args: unknown[]) => void }
+      ).set;
+      setSession.call(obj, { borderColor: "rgba(0, 100, 200, 0.75)" });
+      sessionCanvas?.requestRenderAll();
+      if (sessionCanvas) saveHistory(sessionCanvas);
+      return;
+    }
+
     const elementId = obj.data?.elementId;
     const currentText = (obj as FabricObjectWithData & { text?: string }).text || "";
     const originalText = elementId ? originalContentRef.current.get(elementId) : undefined;
@@ -1351,7 +1618,7 @@ export function EditorCanvas({
         recentlyForwardedTextEditRef.current.set(elementId, Date.now());
       }
     }
-  }, [forwardElementModified]);
+  }, [forwardElementModified, beginProgrammaticApply, endProgrammaticApply, saveHistory]);
 
   const handleObjectModified = useCallback(
     (e: { target?: FabricObject }) => {
@@ -1532,6 +1799,8 @@ export function EditorCanvas({
 
     // Import dynamique de Fabric.js pour éviter les erreurs SSR
     import("fabric").then((fabricModule) => {
+      // Conservé pour la construction hors-loadPage (session de paragraphe).
+      fabricModuleRef.current = fabricModule;
       const { Canvas, Rect, Circle, Ellipse, Triangle, Line, IText, Group, FabricText, Polyline } = fabricModule;
 
       const host = containerRef.current;
@@ -1574,6 +1843,16 @@ export function EditorCanvas({
       ]);
 
       fabricRef.current = canvas;
+
+      // Remplir & Signer : stamp initial des flags live (le canvas naît APRÈS
+      // le render courant ; l'effet de sync ne tournera qu'au prochain render).
+      const gigaCanvas = canvas as typeof canvas & {
+        _gigaFillSignMode?: boolean;
+        _gigaOnSignatureFieldClick?: (element: unknown) => void;
+      };
+      gigaCanvas._gigaFillSignMode = fillSignActiveRef.current;
+      gigaCanvas._gigaOnSignatureFieldClick = (element: unknown) =>
+        onSignatureFieldClickRef.current?.(element as FormFieldElement);
 
       // Event handlers
       canvas.on("selection:created", handleSelectionChange);
@@ -2667,19 +2946,44 @@ export function EditorCanvas({
     if (!onCanvasReady) return;
 
     const handle: EditorCanvasHandle = {
-      addImage: (dataUrl: string) => {
+      addImage: (
+        dataUrl: string,
+        _width?: number,
+        _height?: number,
+        target?: { x: number; y: number; width: number; height: number },
+      ) => {
         if (!fabricRef.current) return;
         import("fabric").then(({ FabricImage }) => {
           FabricImage.fromURL(dataUrl).then((img) => {
+            const naturalW =
+              (img as unknown as { width: number }).width || 400;
+            const naturalH =
+              (img as unknown as { height: number }).height || 400;
+            let left = 50;
+            let top = 50;
+            let scaleX = Math.min(1, 400 / naturalW);
+            let scaleY = Math.min(1, 400 / naturalH);
+            if (target && target.width > 0 && target.height > 0) {
+              // Remplir & Signer : ajuster l'image DANS le rect du widget
+              // signature — ratio préservé, centrée dans le rect.
+              const fit = Math.min(
+                target.width / naturalW,
+                target.height / naturalH,
+              );
+              scaleX = fit;
+              scaleY = fit;
+              left = target.x + (target.width - naturalW * fit) / 2;
+              top = target.y + (target.height - naturalH * fit) / 2;
+            }
             img.set({
-              left: 50,
-              top: 50,
+              left,
+              top,
               // Fabric v6 defaults originX/Y to 'center'; force 'left'/'top'
               // so left/top reference the corner, not the centre.
               originX: "left",
               originY: "top",
-              scaleX: Math.min(1, 400 / ((img as unknown as { width: number }).width || 400)),
-              scaleY: Math.min(1, 400 / ((img as unknown as { height: number }).height || 400)),
+              scaleX,
+              scaleY,
             });
             (img as FabricObjectWithData).data = { elementId: generateId() };
             fabricRef.current?.add(img);
@@ -2731,6 +3035,11 @@ export function EditorCanvas({
         activeObjects.forEach((obj) => {
           fabricRef.current?.remove(obj);
         });
+        // Retirer aussi les hit-targets plein rect appariés aux champs de
+        // formulaire supprimés (sinon un Rect orphelin reste cliquable).
+        for (const id of removedIds) {
+          if (fabricRef.current) removeFieldHitTwin(fabricRef.current, id);
+        }
         fabricRef.current.discardActiveObject();
         fabricRef.current.renderAll();
         saveHistory(fabricRef.current);
@@ -2770,7 +3079,17 @@ export function EditorCanvas({
             // and re-id the stashed runs: the duplicate is brand-new content,
             // so its lines must take the `add` path and must NEVER `replaceText`
             // the ORIGINAL runs they were copied from.
-            const keepRuns = keep as { isParagraph?: boolean; paragraphRuns?: unknown };
+            const keepRuns = keep as {
+              isParagraph?: boolean;
+              paragraphRuns?: unknown;
+              isParagraphSession?: unknown;
+              lineRuns?: unknown;
+              paragraphGroupId?: unknown;
+              paragraphGroup?: unknown;
+              sessionLineTexts?: unknown;
+              sessionOriginalText?: unknown;
+              sessionOrigin?: unknown;
+            };
             if (keepRuns.isParagraph && Array.isArray(keepRuns.paragraphRuns)) {
               keepRuns.paragraphRuns = (
                 keepRuns.paragraphRuns as Array<{
@@ -2784,6 +3103,16 @@ export function EditorCanvas({
                 content: r.content,
               }));
             }
+            // EDIT-INTENT markers must NEVER survive duplication: a clone is
+            // brand-new content, not a member of the source paragraph group
+            // nor a live edit session (its lines must take the `add` path).
+            delete keepRuns.isParagraphSession;
+            delete keepRuns.lineRuns;
+            delete keepRuns.paragraphGroupId;
+            delete keepRuns.paragraphGroup;
+            delete keepRuns.sessionLineTexts;
+            delete keepRuns.sessionOriginalText;
+            delete keepRuns.sessionOrigin;
             (cloned as FabricObjectWithData).data = {
               ...keep,
               elementId: generateId(),
@@ -2988,6 +3317,9 @@ export function EditorCanvas({
                   element.elementId,
               );
             if (existing) canvas.remove(existing);
+            // Le hit-target plein rect d'un champ est re-créé par le render —
+            // retirer l'ancien pour ne pas empiler des Rects orphelins.
+            removeFieldHitTwin(canvas, element.elementId);
             // Même tracking qu'au load : bounds initiales pour que la
             // première modification locale efface la bonne zone au bake.
             lastKnownBoundsRef.current.set(element.elementId, element.bounds);
@@ -3049,6 +3381,8 @@ export function EditorCanvas({
             // embarquées et mode "1:1 fidelity" recalculés comme au load).
             // La sélection locale d'AUTRES objets n'est pas affectée.
             if (existing) canvas.remove(existing);
+            // Retirer aussi le hit-target apparié (re-créé par le render).
+            removeFieldHitTwin(canvas, element.elementId);
             lastKnownBoundsRef.current.set(element.elementId, element.bounds);
             if (element.type === "text") {
               originalContentRef.current.set(
@@ -3116,6 +3450,8 @@ export function EditorCanvas({
               if (wasSelected) canvas.discardActiveObject();
               canvas.remove(existing);
             }
+            // Retirer aussi le hit-target apparié (re-créé par le render).
+            removeFieldHitTwin(canvas, element.elementId);
 
             lastKnownBoundsRef.current.set(element.elementId, element.bounds);
             if (element.type === "text") {
@@ -3194,6 +3530,8 @@ export function EditorCanvas({
             );
           if (isSelected) canvas.discardActiveObject();
           canvas.remove(target);
+          // Retirer aussi le hit-target plein rect apparié (champ form).
+          removeFieldHitTwin(canvas, elementId);
           // Nettoyage des refs de tracking pour cet élément.
           lastKnownBoundsRef.current.delete(elementId);
           originalContentRef.current.delete(elementId);
@@ -3274,6 +3612,18 @@ export function EditorCanvas({
                 evented: !lockedState,
                 selectable: !lockedState,
               });
+            }
+            // Le hit-target plein rect d'un champ de formulaire suit la
+            // visibilité de son contenu (sinon un champ caché reste cliquable).
+            const hitTwin = canvas
+              .getObjects()
+              .find(
+                (o) =>
+                  (o as FabricObjectWithData).data?.hitForElementId ===
+                  elementId,
+              );
+            if (hitTwin) {
+              hitTwin.set({ visible, evented: visible && !lockedState });
             }
             canvas.requestRenderAll();
           } finally {

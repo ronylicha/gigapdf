@@ -32,6 +32,12 @@ export interface ExtractedFontMetadata {
   format: 'ttf' | 'otf' | 'cff' | null;
   /** Approximate byte size of the embedded font program */
   sizeBytes: number | null;
+  /**
+   * Every `/BaseFont` alias wrapped around this physical program (the list is
+   * one entry per program since the `embeddedFontsV2` backend). Optional —
+   * absent on older payloads.
+   */
+  baseFonts?: string[];
 }
 
 /**

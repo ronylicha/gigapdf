@@ -35,26 +35,160 @@ export type { PageBlockGroup } from '@giga-pdf/types';
 // `source_index`es of its runs (which map 1:1 onto the parsed `TextElement.index`
 // of the same page, so the in-place edit pipeline keeps working unchanged).
 
+/**
+ * Read the `{ runs, style }` paragraph body of a paragraph OR heading block.
+ * A heading nests its paragraph under `{ level, para: { runs, style } }` at
+ * runtime, while the (older) flat shape carries `{ runs }` directly — read
+ * both defensively so synthetic test blocks and every engine version work.
+ */
+function paragraphBody(
+  block: GigaBlock,
+): { runs?: unknown; style?: unknown } | undefined {
+  const v = block.kind.v as
+    | { runs?: unknown; style?: unknown; para?: { runs?: unknown; style?: unknown } }
+    | undefined;
+  if (!v || typeof v !== 'object') return undefined;
+  if (block.kind.t === 'heading' && v.para && typeof v.para === 'object') {
+    return v.para;
+  }
+  return v;
+}
+
 /** Read the `{ runs }` body of a paragraph/heading block defensively. */
 function blockRuns(block: GigaBlock): GigaInline[] {
-  const body = block.kind.v as { runs?: unknown } | undefined;
-  const runs = body?.runs;
+  const runs = paragraphBody(block)?.runs;
   return Array.isArray(runs) ? (runs as GigaInline[]) : [];
 }
 
-/** Ordered, non-null `source_index` values of a paragraph/heading block. */
-function paragraphSourceIndices(block: GigaBlock): number[] {
-  const out: number[] = [];
+/**
+ * ALL engine run indices carried by ONE inline run, reading BOTH the flat
+ * typed shape (`{ t:'run', source_index, source_indices? }`) and the
+ * runtime-wrapped shape (`{ t:'run', v:{ source_index, source_indices? } }`).
+ * `source_indices` (present since lib 0.114) lists EVERY content-stream run
+ * the span was coalesced from; the scalar `source_index` (its first entry) is
+ * the backward-compatible fallback. Returns `[]` for a non-editable run.
+ */
+function inlineRunIndices(inline: unknown): number[] {
+  if (!inline || typeof inline !== 'object') return [];
+  if ((inline as { t?: unknown }).t !== 'run') return [];
+  const wrapped = (inline as { v?: unknown }).v;
+  const body =
+    wrapped && typeof wrapped === 'object'
+      ? (wrapped as { source_index?: number | null; source_indices?: unknown })
+      : (inline as { source_index?: number | null; source_indices?: unknown });
+  const multi = body.source_indices;
+  if (Array.isArray(multi)) {
+    const out = multi.filter(
+      (n): n is number => typeof n === 'number' && n >= 0,
+    );
+    if (out.length > 0) return out;
+  }
+  const idx = body.source_index;
+  return typeof idx === 'number' && idx >= 0 ? [idx] : [];
+}
+
+/**
+ * The line structure + flat run indices of a paragraph/heading block.
+ *
+ * Walks the block's top-level inlines in order: every `run` contributes ALL of
+ * its {@link inlineRunIndices} to the CURRENT line; a `{t:'br'}` hard break
+ * closes the line; a `link` contributes its children's runs (they stay on the
+ * current line — a link never spans a hard break). Empty lines (leading /
+ * consecutive `br`s, or lines whose runs carry no editable index) are dropped,
+ * so `lines.flat()` always equals `flat`.
+ */
+function paragraphLines(block: GigaBlock): {
+  lines: number[][];
+  flat: number[];
+} {
+  const lines: number[][] = [];
+  const flat: number[] = [];
+  let current: number[] = [];
+  const closeLine = () => {
+    if (current.length > 0) lines.push(current);
+    current = [];
+  };
+  const pushRun = (inline: unknown) => {
+    for (const idx of inlineRunIndices(inline)) {
+      current.push(idx);
+      flat.push(idx);
+    }
+  };
   for (const inline of blockRuns(block)) {
-    if (
-      inline &&
-      typeof inline === 'object' &&
-      (inline as { t?: unknown }).t === 'run'
-    ) {
-      const idx = (inline as { source_index?: number | null }).source_index;
-      if (typeof idx === 'number' && idx >= 0) out.push(idx);
+    if (!inline || typeof inline !== 'object') continue;
+    const t = (inline as { t?: unknown }).t;
+    if (t === 'br') {
+      closeLine();
+    } else if (t === 'run') {
+      pushRun(inline);
+    } else if (t === 'link') {
+      const children = (inline as { children?: unknown }).children;
+      if (Array.isArray(children)) for (const child of children) pushRun(child);
     }
   }
+  closeLine();
+  return { lines, flat };
+}
+
+/**
+ * The PARAGRAPH-LEVEL formatting of a paragraph/heading block, reduced to the
+ * additive {@link PageBlockGroup} fields: alignment, a line-height MULTIPLE
+ * (only the `{t:'multiple'}` policy is portable without knowing the font
+ * size), the block's top-down placement `frame`, and the first-line indent.
+ * Every field is optional — a malformed/absent style simply contributes none.
+ */
+function paragraphGroupStyle(
+  block: GigaBlock,
+): Pick<
+  PageBlockGroup,
+  'align' | 'lineHeightMultiple' | 'frame' | 'firstLineIndentPt'
+> {
+  const out: Pick<
+    PageBlockGroup,
+    'align' | 'lineHeightMultiple' | 'frame' | 'firstLineIndentPt'
+  > = {};
+
+  const style = paragraphBody(block)?.style as
+    | {
+        align?: unknown;
+        line_height?: { t?: unknown; v?: unknown };
+        first_line_pt?: unknown;
+      }
+    | undefined;
+  if (style && typeof style === 'object') {
+    const align = style.align;
+    if (
+      align === 'left' ||
+      align === 'center' ||
+      align === 'right' ||
+      align === 'justify'
+    ) {
+      out.align = align;
+    }
+    const lh = style.line_height;
+    if (lh && lh.t === 'multiple' && typeof lh.v === 'number' && lh.v > 0) {
+      out.lineHeightMultiple = lh.v;
+    }
+    if (typeof style.first_line_pt === 'number' && style.first_line_pt !== 0) {
+      out.firstLineIndentPt = style.first_line_pt;
+    }
+  }
+
+  const frame = block.frame;
+  if (
+    frame &&
+    typeof frame.x === 'number' &&
+    typeof frame.y === 'number' &&
+    typeof frame.w === 'number' &&
+    typeof frame.h === 'number' &&
+    frame.w > 0 &&
+    frame.h > 0
+  ) {
+    // The engine's `pageBlocks` frames are TOP-DOWN (origin top-left) — the
+    // same space as the editor's element bounds; carried verbatim.
+    out.frame = { x: frame.x, y: frame.y, width: frame.w, height: frame.h };
+  }
+
   return out;
 }
 
@@ -102,16 +236,10 @@ function nestedSourceIndices(blocks: unknown): number[] {
   if (!Array.isArray(blocks)) return out;
   for (const block of blocks) {
     for (const inline of nestedBlockRuns(block as GigaBlock)) {
-      if (!inline || typeof inline !== 'object') continue;
-      if ((inline as { t?: unknown }).t !== 'run') continue;
-      // Runtime wraps the run body under `.v`; the typed shape is flat.
-      const wrapped = inline as { v?: { source_index?: number | null } };
-      const body =
-        wrapped.v && typeof wrapped.v === 'object'
-          ? wrapped.v
-          : (inline as { source_index?: number | null });
-      const idx = (body as { source_index?: number | null }).source_index;
-      if (typeof idx === 'number' && idx >= 0) out.push(idx);
+      // A coalesced lib run carries EVERY content-stream index it merged
+      // (`source_indices`, lib ≥ 0.114); the scalar `source_index` is the
+      // backward-compatible fallback. Both runtime shapes are handled.
+      out.push(...inlineRunIndices(inline));
     }
   }
   return out;
@@ -239,12 +367,20 @@ export function gigaBlocksToPageBlockGroups(blocks: GigaBlock[]): PageBlockGroup
     const kind = block.kind?.t;
 
     if (kind === 'paragraph' || kind === 'heading') {
-      const sourceIndices = paragraphSourceIndices(block);
+      const { lines, flat: sourceIndices } = paragraphLines(block);
       // A lone run is not a multi-line block — the editor already renders single
       // runs as standalone IText, so grouping it would be a no-op (and the
       // decompose-save path expects ≥ 2 runs to be worth a Textbox).
       if (sourceIndices.length < 2) continue;
-      groups.push({ kind, sourceIndices });
+      // `lines` (the `{t:'br'}` structure) + the paragraph style/frame are
+      // ADDITIVE: the editor's edit-intent session consumes them; every
+      // pre-existing consumer keeps reading the flat `sourceIndices`.
+      groups.push({
+        kind,
+        sourceIndices,
+        lines,
+        ...paragraphGroupStyle(block),
+      });
       continue;
     }
 

@@ -88,7 +88,16 @@ export function readFormFieldValue(
   const fieldType = field.fieldType;
 
   if (fieldType === "checkbox") {
-    return obj.data?.fieldChecked === true;
+    const checked = obj.data?.fieldChecked === true;
+    // A checkbox widget with a NAMED on-state (multi-widget Oui/non pairs on
+    // CERFA forms) serialises its export STRING — a boolean would collapse the
+    // pair to "checked/unchecked" and lose WHICH state was picked. The bake
+    // side routes such strings through `setCheckboxState` (per-widget /AS).
+    const onValue = field.onValue;
+    if (typeof onValue === "string" && onValue.length > 0) {
+      return checked ? onValue : "";
+    }
+    return checked;
   }
 
   if (fieldType === "radio") {
@@ -138,6 +147,11 @@ export function fabricObjectToElement(
   // index/binary, never per fragment. Serialising fragments would duplicate the
   // run and scramble its text — skip them here (the single serialisation seam).
   if (obj.data?.isRunSegment === true) return null;
+  // A form-field full-rect HIT-TARGET (background Rect behind the value object)
+  // is pure chrome: the field is serialised ONCE via its content object. Its
+  // `elementId` is `hit:`-prefixed so element lookups never resolve it, and it
+  // must never round-trip as an element of its own.
+  if (obj.data?.isFieldHitTarget === true) return null;
   const elementId = obj.data?.elementId || generateId();
   const scaleY = obj.scaleY ?? 1;
   // A user resize bakes obj.scaleX into bounds.width here. There is no longer a
@@ -191,9 +205,33 @@ export function fabricObjectToElement(
     | undefined;
   if (storedFormFieldEarly && storedFormFieldEarly.type === "form_field") {
     const liveValue = readFormFieldValue(obj, storedFormFieldEarly);
+    // WIDGET-RECT preservation: the value object's live bbox is NOT the widget
+    // rect (a text-field IText is inset and CONTENT-sized — Fabric recomputes
+    // its width from the text; a checkbox mark is glyph-sized). Persisting that
+    // bbox would shrink the field's bounds on every save AND make the bake see
+    // a "geometry change" (→ destructive redact + re-add instead of a fill).
+    // The renderer stashes the widget rect + the object's initial anchor; the
+    // persisted bounds are the STORED widget rect translated by the live drag
+    // delta — an untouched field round-trips its rect exactly.
+    const anchor0 = obj.data?.fieldAnchor0 as
+      | { left: number; top: number }
+      | undefined;
+    const widgetBounds = obj.data?.fieldWidgetBounds as
+      | { x: number; y: number; width: number; height: number }
+      | undefined;
+    const preservedBounds =
+      anchor0 && widgetBounds
+        ? {
+            x: widgetBounds.x + ((obj.left ?? anchor0.left) - anchor0.left),
+            y: widgetBounds.y + ((obj.top ?? anchor0.top) - anchor0.top),
+            width: widgetBounds.width,
+            height: widgetBounds.height,
+          }
+        : baseElement.bounds;
     return {
       ...storedFormFieldEarly,
       ...baseElement,
+      bounds: preservedBounds,
       type: "form_field" as const,
       fieldType: storedFormFieldEarly.fieldType,
       value: liveValue,
@@ -695,8 +733,34 @@ export function fabricObjectToElements(obj: FabricObjectWithData): Element[] {
     typeName === "i-text" || typeName === "text" || typeName === "textbox";
   const runs = data?.paragraphRuns as StashedParagraphRun[] | undefined;
 
+  // A form field can NEVER take a paragraph path (its widget identity would be
+  // destroyed): route it straight to the canonical single-element serialiser
+  // (which claims it via the `formFieldElement` early guard).
+  const isFormField =
+    data?.formFieldElement !== undefined || data?.formFieldType !== undefined;
+
+  // A PARAGRAPH EDIT SESSION box (edit-intent model) maps its edited lines back
+  // onto the per-line SOURCE runs via commitParagraphSession — line i ↔ source
+  // line i, first run carries the full line text, siblings are erased. This
+  // generic path only ever sees session moves / no-reflow edits (the editor's
+  // session-exit handler owns the reflow seam — removes + adds); a reflow
+  // arriving here falls through to the legacy flat decomposition below (never
+  // duplicates, at worst line↔run instead of line↔line).
+  if (
+    !isFormField &&
+    data?.isParagraphSession === true &&
+    isTextual &&
+    Array.isArray(data?.lineRuns)
+  ) {
+    const commit = commitParagraphSession(obj);
+    if (commit.kind === "unchanged") return [];
+    if (commit.kind === "update") return commit.elements;
+    // kind === "reflow" → legacy fallthrough below.
+  }
+
   // Not a coalesced paragraph → keep the canonical 1:1 behaviour.
   if (
+    isFormField ||
     data?.isParagraph !== true ||
     !isTextual ||
     !Array.isArray(runs) ||
@@ -751,6 +815,372 @@ export function fabricObjectToElements(obj: FabricObjectWithData): Element[] {
   }
 
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Paragraph EDIT-SESSION commit (edit-intent model)
+// ---------------------------------------------------------------------------
+
+/**
+ * One stashed source run of a paragraph edit session (`data.lineRuns[i][j]`,
+ * written by render-elements' beginParagraphEditSession). `style` snapshots the
+ * run's FULL parsed style so erase/move emissions keep the run's own typography
+ * — a style mismatch would silently downgrade the apply pipeline's lossless
+ * `replaceText`/`moveElement` to the destructive redact+add.
+ */
+export interface SessionLineRunSnapshot {
+  elementId: string;
+  index?: number;
+  bounds: { x: number; y: number; width: number; height: number };
+  content: string;
+  style?: TextStyle;
+}
+
+/** The outcome of exiting a paragraph edit session. */
+export type ParagraphSessionCommit =
+  | { kind: "unchanged" }
+  | {
+      /** Same line count: per-line in-place updates (replace / erase / move). */
+      kind: "update";
+      elements: Element[];
+    }
+  | {
+      /**
+       * Line count changed (Enter / line join / wrap): every source run of the
+       * group is REMOVED (`removeElement`, ordered by apply-operations) and one
+       * NEW run is ADDED per re-wrapped line, stacked from the session box top
+       * at `fontSize × lineHeight`, sized to the session frame width.
+       */
+      kind: "reflow";
+      removedElementIds: string[];
+      addedElements: Element[];
+    };
+
+/** Positional/typographic session-box fields read by the commit. */
+interface SessionTextbox extends FabricTextLike {
+  textLines?: string[];
+  styles?: Record<number, Record<number, Record<string, unknown>>>;
+  _styleMap?: Record<number, { line: number; offset: number }>;
+}
+
+/**
+ * Build ONE element for a session source run: the run keeps its OWN elementId,
+ * engine `index`, bounds (translated by the block move delta) and full stashed
+ * style — only `content` changes. This is what routes the apply pipeline to the
+ * lossless in-place ops for every untouched typographic property.
+ */
+function sessionRunToElement(
+  tb: SessionTextbox,
+  run: SessionLineRunSnapshot,
+  content: string,
+  dx: number,
+  dy: number,
+): TextElement {
+  const fontSize = run.style?.fontSize ?? tb.fontSize ?? 12;
+  const style: TextStyle = run.style
+    ? { ...run.style }
+    : {
+        fontFamily:
+          ((tb.data?.originalFont as string | null) ?? tb.fontFamily) ||
+          "Arial",
+        fontSize,
+        fontWeight: isBoldFontWeight(tb.fontWeight) ? "bold" : "normal",
+        fontStyle: tb.fontStyle === "italic" ? "italic" : "normal",
+        color: (tb.fill as string) || "#000000",
+        opacity: tb.opacity ?? 1,
+        textAlign:
+          (tb.textAlign as "left" | "center" | "right" | "justify") || "left",
+        lineHeight: tb.lineHeight || 1.2,
+        letterSpacing: tb.charSpacing || 0,
+        writingMode: "horizontal-tb",
+        underline: tb.underline || false,
+        strikethrough: tb.linethrough || false,
+        backgroundColor: null,
+        verticalAlign: "baseline",
+        originalFont: (tb.data?.originalFont as string | null) ?? null,
+      };
+  return {
+    elementId: run.elementId,
+    type: "text",
+    bounds: {
+      x: run.bounds.x + dx,
+      y: run.bounds.y + dy,
+      width: run.bounds.width,
+      height: run.bounds.height,
+    },
+    transform: {
+      rotation: tb.angle || 0,
+      scaleX: 1,
+      scaleY: 1,
+      skewX: tb.skewX || 0,
+      skewY: tb.skewY || 0,
+    },
+    layerId: null,
+    locked: false,
+    visible: tb.visible ?? true,
+    content,
+    style,
+    ocrConfidence: null,
+    linkUrl: null,
+    linkPage: null,
+    ...(run.index !== undefined ? { index: run.index } : {}),
+  };
+}
+
+/**
+ * The dominant style of ONE re-wrapped visual line, for a reflow's added runs.
+ * Reads Fabric's per-character `styles` map through the Textbox `_styleMap`
+ * (visual line → logical line + char offset) and takes the MAJORITY of
+ * fontSize / colour / weight / slant over the line's characters; every lookup
+ * is defensive and falls back to the live box's base style. The font FAMILY
+ * always stays the box's round-trip family (a per-char browser FontFace name
+ * cannot be inverted to a PDF font name).
+ */
+function dominantSessionLineStyle(
+  tb: SessionTextbox,
+  visualLineIndex: number,
+  lineLength: number,
+): TextStyle {
+  const originalFont = (tb.data?.originalFont as string | null) ?? null;
+  const base: TextStyle = {
+    fontFamily: (originalFont ?? tb.fontFamily) || "Arial",
+    fontSize: tb.fontSize || 12,
+    fontWeight: isBoldFontWeight(tb.fontWeight) ? "bold" : "normal",
+    fontStyle: tb.fontStyle === "italic" ? "italic" : "normal",
+    color: (tb.fill as string) || "#000000",
+    opacity: tb.opacity ?? 1,
+    textAlign:
+      (tb.textAlign as "left" | "center" | "right" | "justify") || "left",
+    lineHeight: tb.lineHeight || 1.2,
+    letterSpacing: tb.charSpacing || 0,
+    writingMode: "horizontal-tb",
+    underline: tb.underline || false,
+    strikethrough: tb.linethrough || false,
+    backgroundColor: null,
+    verticalAlign: "baseline",
+    originalFont,
+  };
+  const styles = tb.styles;
+  if (!styles || lineLength <= 0) return base;
+  const mapEntry = tb._styleMap?.[visualLineIndex];
+  const logicalLine = mapEntry?.line ?? visualLineIndex;
+  const offset = mapEntry?.offset ?? 0;
+  const lineStyles = styles[logicalLine];
+  if (!lineStyles) return base;
+
+  const votes = new Map<string, { count: number; style: Record<string, unknown> }>();
+  for (let c = offset; c < offset + lineLength; c += 1) {
+    const s = lineStyles[c];
+    if (!s || typeof s !== "object") continue;
+    const key = JSON.stringify([
+      s.fontSize ?? null,
+      s.fill ?? null,
+      s.fontWeight ?? null,
+      s.fontStyle ?? null,
+    ]);
+    const entry = votes.get(key);
+    if (entry) entry.count += 1;
+    else votes.set(key, { count: 1, style: s });
+  }
+  if (votes.size === 0) return base;
+  const winner = [...votes.values()].sort((a, b) => b.count - a.count)[0]!;
+  // Majority only when it covers > half the line — otherwise keep the base.
+  if (winner.count <= lineLength / 2) return base;
+  const s = winner.style;
+  return {
+    ...base,
+    ...(typeof s.fontSize === "number" ? { fontSize: s.fontSize } : {}),
+    ...(typeof s.fill === "string" ? { color: s.fill } : {}),
+    ...(s.fontWeight !== undefined
+      ? { fontWeight: isBoldFontWeight(s.fontWeight as string | number) ? "bold" : "normal" }
+      : {}),
+    ...(s.fontStyle !== undefined
+      ? { fontStyle: s.fontStyle === "italic" ? "italic" : "normal" }
+      : {}),
+  } as TextStyle;
+}
+
+/**
+ * Map a paragraph edit session's live Textbox back onto its SOURCE runs — the
+ * pure decision + construction of the edit-intent commit:
+ *
+ *   - UNCHANGED (text identical to the session baseline, box not moved) →
+ *     `{kind:"unchanged"}` — the caller restores the per-run objects, ZERO
+ *     writes;
+ *   - SAME LINE COUNT → `{kind:"update"}`: line i ↔ source line i. A CHANGED
+ *     line puts its full new text on the line's FIRST run (`replaceText`) and
+ *     erases the siblings (`content:""`); an UNCHANGED line is skipped
+ *     entirely (zero write) unless the block moved, in which case its runs are
+ *     emitted verbatim with translated bounds (pure `moveElement`);
+ *   - LINE COUNT CHANGED (Enter / join / wrap at the frame width) →
+ *     `{kind:"reflow"}`: every source run is removed and one new run is added
+ *     per re-wrapped VISUAL line (Fabric's `textLines`), stacked from the box
+ *     top at `fontSize × lineHeight`, each with the line's dominant style.
+ *
+ * Pure & deterministic — reads only the live object + the session snapshot.
+ */
+export function commitParagraphSession(
+  obj: FabricObjectWithData,
+): ParagraphSessionCommit {
+  const data = obj.data;
+  const tb = obj as SessionTextbox;
+  const lineRuns = data?.lineRuns as SessionLineRunSnapshot[][] | undefined;
+  if (!Array.isArray(lineRuns) || lineRuns.length === 0) {
+    return { kind: "unchanged" };
+  }
+  const origin = (data?.sessionOrigin as
+    | { left: number; top: number }
+    | undefined) ?? { left: obj.left ?? 0, top: obj.top ?? 0 };
+  const baseline: string[] = Array.isArray(data?.sessionLineTexts)
+    ? (data!.sessionLineTexts as string[])
+    : typeof data?.sessionOriginalText === "string"
+      ? (data.sessionOriginalText as string).split("\n")
+      : lineRuns.map((line) => line.map((r) => r.content).join(" "));
+
+  const dx = (obj.left ?? origin.left) - origin.left;
+  const dy = (obj.top ?? origin.top) - origin.top;
+  const moved = Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01;
+
+  const logicalLines = (tb.text ?? "").split("\n");
+  const textChanged =
+    logicalLines.length !== baseline.length ||
+    logicalLines.some((l, i) => l !== baseline[i]);
+
+  if (!textChanged && !moved) return { kind: "unchanged" };
+
+  // Visual (wrapped) lines — only trusted when Fabric exposes them.
+  const visualLines =
+    Array.isArray(tb.textLines) && tb.textLines.length > 0
+      ? tb.textLines
+      : logicalLines;
+
+  // NO REFLOW: the logical line count still matches the source lines AND no
+  // line wrapped past the frame width (visual === logical).
+  const noReflow =
+    logicalLines.length === lineRuns.length &&
+    visualLines.length === logicalLines.length;
+
+  if (noReflow) {
+    const elements: Element[] = [];
+    for (let i = 0; i < lineRuns.length; i += 1) {
+      const line = lineRuns[i]!;
+      if (line.length === 0) continue;
+      const lineChanged = logicalLines[i] !== baseline[i];
+      if (!lineChanged && !moved) continue; // untouched line — zero write
+      if (lineChanged) {
+        // Full new line text on the FIRST run; siblings erased.
+        elements.push(
+          sessionRunToElement(tb, line[0]!, logicalLines[i] ?? "", dx, dy),
+        );
+        for (let j = 1; j < line.length; j += 1) {
+          elements.push(sessionRunToElement(tb, line[j]!, "", dx, dy));
+        }
+      } else {
+        // Pure move: every run keeps its own content (→ moveElement).
+        for (const run of line) {
+          elements.push(sessionRunToElement(tb, run, run.content, dx, dy));
+        }
+      }
+    }
+    return { kind: "update", elements };
+  }
+
+  // REFLOW: remove every source run, add one run per re-wrapped visual line.
+  const removedElementIds = lineRuns.flat().map((r) => r.elementId);
+  const fontSize = tb.fontSize || 12;
+  const lineHeight = tb.lineHeight && tb.lineHeight > 0 ? tb.lineHeight : 1.2;
+  const lineStep = fontSize * lineHeight;
+  const blockWidth =
+    (tb.width || lineRuns[0]![0]?.bounds.width || 100) * (tb.scaleX ?? 1);
+  const leftX = obj.left ?? origin.left;
+  const topY = obj.top ?? origin.top;
+
+  const addedElements: Element[] = visualLines.map((text, i) => ({
+    elementId: generateId(),
+    type: "text" as const,
+    bounds: {
+      x: leftX,
+      y: topY + i * lineStep,
+      width: blockWidth,
+      height: fontSize,
+    },
+    transform: {
+      rotation: tb.angle || 0,
+      scaleX: 1,
+      scaleY: 1,
+      skewX: tb.skewX || 0,
+      skewY: tb.skewY || 0,
+    },
+    layerId: null,
+    locked: false,
+    visible: tb.visible ?? true,
+    content: text,
+    style: dominantSessionLineStyle(tb, i, text.length),
+    ocrConfidence: null,
+    linkUrl: null,
+    linkPage: null,
+  }));
+
+  return { kind: "reflow", removedElementIds, addedElements };
+}
+
+/**
+ * Refresh the session snapshot on the box AFTER a commit was forwarded, so a
+ * FOLLOW-UP edit (before the post-apply re-render replaces the canvas) maps
+ * against the NEW baseline instead of re-committing the old delta:
+ *
+ *   - update → the changed lines' first runs now carry the full line text,
+ *     their siblings "" (matching what was just baked); the baseline texts and
+ *     the box origin are re-anchored;
+ *   - reflow → the snapshot becomes ONE line per added run (no engine index —
+ *     a further edit updates the freshly-added elements by elementId).
+ */
+export function refreshParagraphSessionAfterCommit(
+  obj: FabricObjectWithData,
+  commit: ParagraphSessionCommit,
+): void {
+  const data = obj.data;
+  if (!data) return;
+  const tb = obj as SessionTextbox;
+  const logicalLines = (tb.text ?? "").split("\n");
+
+  if (commit.kind === "update") {
+    const lineRuns = data.lineRuns as SessionLineRunSnapshot[][] | undefined;
+    if (Array.isArray(lineRuns)) {
+      const baseline = Array.isArray(data.sessionLineTexts)
+        ? (data.sessionLineTexts as string[])
+        : [];
+      lineRuns.forEach((line, i) => {
+        const newText = logicalLines[i];
+        if (newText === undefined || newText === baseline[i]) return;
+        if (line[0]) line[0] = { ...line[0], content: newText };
+        for (let j = 1; j < line.length; j += 1) {
+          line[j] = { ...line[j]!, content: "" };
+        }
+      });
+    }
+  } else if (commit.kind === "reflow") {
+    const added = commit.addedElements.filter(
+      (el): el is Extract<Element, { type: "text" }> => el.type === "text",
+    );
+    data.lineRuns = added.map((el) => [
+      {
+        elementId: el.elementId,
+        bounds: { ...el.bounds },
+        content: el.content,
+        style: { ...el.style },
+      },
+    ]);
+    data.paragraphRuns = added.map((el) => ({
+      elementId: el.elementId,
+      bounds: { ...el.bounds },
+      content: el.content,
+    }));
+  }
+
+  data.sessionLineTexts = logicalLines;
+  data.sessionOriginalText = tb.text ?? "";
+  data.sessionOrigin = { left: obj.left ?? 0, top: obj.top ?? 0 };
 }
 
 /**

@@ -109,6 +109,17 @@ export interface TextStyle {
   verticalAlign: "baseline" | "superscript" | "subscript";
   // Original font info for 1:1 rendering
   originalFont: string | null;
+  /**
+   * PHYSICAL identity of the run's embedded font program — the engine's
+   * `TextElementInfo.fontId` (first 8 hex chars of the SHA-256 of the decoded
+   * `/FontFile*` bytes, matching `EmbeddedFontV2.fontId`). Unlike
+   * {@link originalFont} (a `/BaseFont` NAME, ambiguous when many wrapper dicts
+   * share one program), this pins the exact program that painted the run, so
+   * the editor always serves the run's OWN glyphs. Absent when the run's font
+   * embeds no program (base-14 / non-embedded faces, Type3). Additive /
+   * backward-compatible.
+   */
+  fontId?: string;
 }
 
 /**

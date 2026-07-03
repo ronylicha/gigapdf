@@ -15,6 +15,18 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.21.0",
+    date: "2026-07-03",
+    type: "minor",
+    changes: [
+      { type: "feature", description: "Paragraph editing (Adobe-style): double-click a paragraph and edit it as ONE multi-line block — real wrapping, the document's own alignment (justified included) and inline bold/italic preserved as per-word styles. Leaving without a change restores the pixel-exact original rendering; edits rewrite only the touched lines in place, or reflow the paragraph within its frame. Powered by an engine fix aligning structural blocks with the editable runs (the actual root cause of the v1.19.2 'vanishing footer')." },
+      { type: "feature", description: "Form filling reaches Adobe parity: an empty field occupies its whole box (visible border, clickable anywhere — in Fill & Sign one click puts the caret in the field); typed text respects alignment, multi-line wrapping, comb cells (one character per cell), auto-size and max-length, so values never overflow or overlap; Oui/Non checkbox pairs are mutually exclusive and 'Non' can actually be selected; clicking a signature widget fits your signature to its box." },
+      { type: "fix", description: "Filling a field no longer duplicates it on save: the value is written into the existing AcroForm field and the engine regenerates a faithful appearance (comb, wrap, auto-size, alignment measured with the field's real font) — no more overlapping widgets or conflicting values in Adobe." },
+      { type: "fix", description: "The document's original embedded fonts are ALWAYS used, even incomplete subsets: fonts are matched by the identity of the physical font program instead of by name (a dense CERFA shares 20 programs across 69 name variants), so accents no longer disappear or swap to a substitute face. Google/Helvetica only apply when a font truly isn't embedded (engine 0.114.0)." },
+      { type: "fix", description: "Editing can no longer silently corrupt text: replacing a run's text now re-encodes through the exact inverse of the document's own decoding. On the reference CERFA, 527/527 identical-text replacements survive (was 140 — the rest came back empty or garbled) (engine 0.114.1)." },
+    ],
+  },
+  {
     version: "1.20.0",
     date: "2026-07-02",
     type: "minor",

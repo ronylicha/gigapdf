@@ -5,9 +5,15 @@
  * GET /api/pdf/fonts/{documentId}/{fontId}
  *   → { success, data: { fontId, dataBase64, format, mimeType, originalName } }
  *
- * Returns 404 when the id is unknown or the face is not a directly
- * FontFace-loadable sfnt (bare cff/type1) — the editor then falls back to its
- * Google-Fonts substitute (correct Unicode), never a garbled embedded font.
+ * `fontId` is the PHYSICAL program identity (engine `EmbeddedFontV2.fontId`,
+ * the same value `textElements()` reports per run) — served via
+ * `extractWebFontById`, which always yields a loadable sfnt with a union
+ * `cmap` for an embedded program (incomplete subsets are served as-is, missing
+ * glyphs render `.notdef`). A 404 is therefore RARE: only an id that matches
+ * no embedded program (stale client cache, foreign document) or a bare
+ * cff/type1 face no browser can load. The editor then falls back to its
+ * Google-Fonts substitute — the LAST resort, never preferred over embedded
+ * bytes.
  */
 
 import 'server-only';

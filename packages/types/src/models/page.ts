@@ -114,6 +114,31 @@ export interface PageBlockGroup {
   table?: PageBlockTable;
   /** Structural payload when `kind === "list"`. */
   list?: PageBlockList;
+  /**
+   * LINE STRUCTURE of a `paragraph`/`heading` block (additive, present since
+   * lib 0.114): the engine run indices grouped per VISUAL LINE, split on the
+   * block's `{t:'br'}` inlines. Each inline run contributes ALL of its
+   * `source_indices` (a lib inline run may coalesce several content-stream
+   * runs); the flattening of `lines` equals `sourceIndices`. Absent when the
+   * producing engine predates the line model — consumers fall back to
+   * `sourceIndices` (one run per line).
+   */
+  lines?: number[][];
+  /** Paragraph alignment from the lib's `ParagraphStyle.align` (additive). */
+  align?: "left" | "center" | "right" | "justify";
+  /**
+   * Line height as a MULTIPLE of the font size, from the lib's
+   * `ParagraphStyle.line_height` when it is `{t:'multiple'}` (additive).
+   */
+  lineHeightMultiple?: number;
+  /**
+   * The block's placement frame in TOP-DOWN page coordinates (PDF points,
+   * origin top-left — same space as the editor's element bounds). Additive;
+   * absent when the engine emitted no frame.
+   */
+  frame?: { x: number; y: number; width: number; height: number };
+  /** First-line indent (positive) or hanging indent (negative), in points. */
+  firstLineIndentPt?: number;
 }
 
 export interface PageObject {

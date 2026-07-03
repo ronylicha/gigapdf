@@ -21,8 +21,12 @@ import {
   measuredLineHeightMultiple,
   hasUniformLineAdvance,
   isCoherentCoalescedBlock,
+  isCoherentLineGroup,
+  joinLineRunContents,
   pageBlockGroupsToParagraphs,
   pageBlockGroupsToTablesAndLists,
+  beginParagraphEditSession,
+  restoreParagraphEditSession,
 } from "../render-elements";
 import type { TextRun } from "../render-elements";
 
@@ -33,7 +37,12 @@ class FakeObj {
   constructor(opts: Record<string, unknown> = {}) {
     this.opts = opts;
   }
-  set(patch: Record<string, unknown>) {
+  // Mirror Fabric's dual signature: set(key, value) AND set({ ...patch }).
+  set(patch: Record<string, unknown> | string, value?: unknown) {
+    if (typeof patch === "string") {
+      this.opts[patch] = value;
+      return;
+    }
     Object.assign(this.opts, patch);
   }
 }
@@ -45,20 +54,25 @@ class IText extends FakeObj {
   }
   // Fabric's IText.set({ text }) updates the live `.text` property; mirror that
   // so click-toggle assertions (which read obj.text) behave like real Fabric.
-  set(patch: Record<string, unknown>) {
-    if (typeof patch.text === "string") this.text = patch.text;
-    super.set(patch);
+  set(patch: Record<string, unknown> | string, value?: unknown) {
+    if (typeof patch === "object" && typeof patch.text === "string") {
+      this.text = patch.text;
+    }
+    super.set(patch, value);
   }
 }
 class Textbox extends FakeObj {
   text: string;
+  enterEditing = vi.fn();
   constructor(text: string, opts: Record<string, unknown>) {
     super(opts);
     this.text = text;
   }
-  set(patch: Record<string, unknown>) {
-    if (typeof patch.text === "string") this.text = patch.text;
-    super.set(patch);
+  set(patch: Record<string, unknown> | string, value?: unknown) {
+    if (typeof patch === "object" && typeof patch.text === "string") {
+      this.text = patch.text;
+    }
+    super.set(patch, value);
   }
 }
 class Rect extends FakeObj {}
@@ -102,7 +116,17 @@ function makeCanvas() {
   const handlers: Record<string, Array<(e: unknown) => void>> = {};
   return {
     add: (o: FakeObj) => objects.push(o),
-    remove: vi.fn(),
+    // A REAL removal (splice) — the paragraph edit session lifts the member
+    // objects off the canvas and puts them back on an unmodified exit.
+    remove: vi.fn((o: FakeObj) => {
+      const i = objects.indexOf(o);
+      if (i >= 0) objects.splice(i, 1);
+    }),
+    insertAt: vi.fn((index: number, ...objs: FakeObj[]) => {
+      objects.splice(index, 0, ...objs);
+    }),
+    discardActiveObject: vi.fn(),
+    setActiveObject: vi.fn(),
     getObjects: () => objects,
     // Mirror Fabric v6's canvas.moveObjectTo: pull the object out and re-insert
     // it at the target index (used by the post-image-load z-order re-assert).
@@ -163,7 +187,11 @@ describe("renderElementsOverlay — 1:1 fidelity (anti-doubling)", () => {
 
   it("resolves the embedded FontFace via getFontFaceName when provided", async () => {
     const canvas = makeCanvas();
-    const getFontFaceName = vi.fn(() => "gigapdf-doc-font-abc");
+    const getFontFaceName = vi.fn(() => ({
+      name: "gigapdf-doc-font-abc",
+      embedded: true,
+      exact: true,
+    }));
     await renderElementsOverlay(canvas, [textElement()], fabricMock, {
       getFontFaceName,
     });
@@ -173,14 +201,48 @@ describe("renderElementsOverlay — 1:1 fidelity (anti-doubling)", () => {
     ) as IText;
     // Now resolved WEIGHT/STYLE-AWARE: the run carries no explicit weight/style,
     // so the variant intent is regular (bold:false, italic:false). The run text
-    // is forwarded so the resolver can pick the COVERING subset (CERFA disjoint
-    // subsets) — here "Bonjour" from the textElement() factory.
+    // is forwarded so the resolver can rank same-variant subsets by coverage —
+    // here "Bonjour" from the textElement() factory. The 4th arg is the run's
+    // PHYSICAL program id (`style.fontId`) — absent on this element.
     expect(getFontFaceName).toHaveBeenCalledWith(
       "KWVFOU+TimesNewRoman,Bold",
       { bold: false, italic: false },
       "Bonjour",
+      undefined,
     );
     expect(it_.opts.fontFamily).toBe("gigapdf-doc-font-abc");
+  });
+
+  it("forwards the run's physical fontId (style.fontId) to the resolver", async () => {
+    const canvas = makeCanvas();
+    const getFontFaceName = vi.fn(() => ({
+      name: "gigapdf-doc-ab12cd34",
+      embedded: true,
+      exact: true,
+    }));
+    const run = textElement({
+      style: {
+        fontSize: 12,
+        color: "#112233",
+        fontFamily: "Helvetica",
+        originalFont: "KWVFOU+TimesNewRoman,Bold",
+        // Physical program identity from the engine (TextElementInfo.fontId).
+        fontId: "ab12cd34",
+      },
+    });
+    await renderElementsOverlay(canvas, [run], fabricMock, { getFontFaceName });
+
+    expect(getFontFaceName).toHaveBeenCalledWith(
+      "KWVFOU+TimesNewRoman,Bold",
+      { bold: false, italic: false },
+      "Bonjour",
+      "ab12cd34",
+    );
+    const it_ = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) => o instanceof IText,
+    ) as IText;
+    expect(it_.opts.fontFamily).toBe("gigapdf-doc-ab12cd34");
+    expect((it_.data as Record<string, unknown>).usingEmbeddedFont).toBe(true);
   });
 
   it("resolves the embedded subset matching the run's weight/style variant", async () => {
@@ -191,7 +253,9 @@ describe("renderElementsOverlay — 1:1 fidelity (anti-doubling)", () => {
     // and its result is used as-is (no synthetic bold/italic on top).
     const canvas = makeCanvas();
     const getFontFaceName = vi.fn((_name: string, variant?: { bold?: boolean; italic?: boolean }) =>
-      variant?.bold && variant?.italic ? "gigapdf-doc-bolditalic" : null,
+      variant?.bold && variant?.italic
+        ? { name: "gigapdf-doc-bolditalic", embedded: true, exact: true }
+        : null,
     );
     const run = textElement({
       style: {
@@ -213,6 +277,7 @@ describe("renderElementsOverlay — 1:1 fidelity (anti-doubling)", () => {
       "Times New Roman",
       { bold: true, italic: true },
       "Bonjour",
+      undefined,
     );
     expect(it_.opts.fontFamily).toBe("gigapdf-doc-bolditalic");
     // Variant-exact subset already encodes the weight/style → no synthetic.
@@ -221,17 +286,19 @@ describe("renderElementsOverlay — 1:1 fidelity (anti-doubling)", () => {
     expect((it_.data as Record<string, unknown>).usingEmbeddedFont).toBe(true);
   });
 
-  it("falls back to the loose subset + synthetic weight when the exact variant is not embedded", async () => {
-    // The PDF embeds the family but NOT this run's variant: the variant-exact
-    // query (Pass 1) returns null, so the renderer uses the loose 1-arg match for
-    // the closest subset AND re-applies the parsed weight/style synthetically to
-    // approximate the missing variant (instead of silently rendering it regular).
+  it("keeps the ORIGINAL embedded bytes + synthetic weight on a LOOSE match (exact: false)", async () => {
+    // The PDF embeds the family but NOT this run's variant: the resolver's
+    // cascade lands on the LOOSE family subset (`exact: false`) in a SINGLE
+    // call. The renderer keeps the parsed weight/style synthetically to
+    // approximate the missing variant — but the face still carries the
+    // document's ORIGINAL bytes, so it IS flagged usingEmbeddedFont (no
+    // cosmetic width-fit clamp on original metrics).
     const canvas = makeCanvas();
-    const getFontFaceName = vi.fn(
-      (_name: string, variant?: { bold?: boolean; italic?: boolean }) =>
-        // Variant-exact miss (null); loose 1-arg call (no variant) → closest subset.
-        variant === undefined ? "gigapdf-doc-regular" : null,
-    );
+    const getFontFaceName = vi.fn(() => ({
+      name: "gigapdf-doc-regular",
+      embedded: true,
+      exact: false,
+    }));
     const run = textElement({
       style: {
         fontSize: 12,
@@ -247,19 +314,52 @@ describe("renderElementsOverlay — 1:1 fidelity (anti-doubling)", () => {
     const it_ = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
       (o) => o instanceof IText,
     ) as IText;
-    // Both calls happened: variant-exact (missed, carries the run text) then
-    // loose 1-arg (hit). The loose path is exactly what FIX #1b relies on when no
-    // same-variant subset covers the run → loose subset + synthetic uniform weight.
+    // ONE call carries the whole cascade (variant intent + run text + fontId).
+    expect(getFontFaceName).toHaveBeenCalledTimes(1);
     expect(getFontFaceName).toHaveBeenCalledWith(
       "Times New Roman",
       { bold: true, italic: false },
       "Bonjour",
+      undefined,
     );
-    expect(getFontFaceName).toHaveBeenCalledWith("Times New Roman");
     expect(it_.opts.fontFamily).toBe("gigapdf-doc-regular");
-    // Closest subset is not the bold variant → synthesise bold so it still reads bold.
+    // Loose subset is not the bold variant → synthesise bold so it still reads bold.
     expect(it_.opts.fontWeight).toBe("bold");
     expect(it_.opts.fontStyle).toBe("normal");
+    // Original embedded bytes ⇒ usingEmbeddedFont stays true (synthetic variant
+    // is decoupled from byte provenance).
+    expect((it_.data as Record<string, unknown>).usingEmbeddedFont).toBe(true);
+  });
+
+  it("flags a GOOGLE-substitute face as NOT embedded (mislabel fix)", async () => {
+    // The resolver can return a face whose bytes came from the Google-Fonts
+    // proxy (registered under the font's conventional name). It must NOT be
+    // treated as original bytes: usingEmbeddedFont=false (width-fit clamp
+    // allowed), while `exact: true` still neutralises the synthetic variant
+    // (the Google face was requested at the right weight/style).
+    const canvas = makeCanvas();
+    const getFontFaceName = vi.fn(() => ({
+      name: "gigapdf-doc-google-sub",
+      embedded: false,
+      exact: true,
+    }));
+    const run = textElement({
+      style: {
+        fontSize: 12,
+        color: "#000000",
+        fontFamily: "Times New Roman",
+        fontWeight: "bold",
+        fontStyle: "normal",
+        originalFont: "Times New Roman",
+      },
+    });
+    await renderElementsOverlay(canvas, [run], fabricMock, { getFontFaceName });
+
+    const it_ = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) => o instanceof IText,
+    ) as IText;
+    expect(it_.opts.fontFamily).toBe("gigapdf-doc-google-sub");
+    expect(it_.opts.fontWeight).toBe("normal");
     expect((it_.data as Record<string, unknown>).usingEmbeddedFont).toBe(false);
   });
 
@@ -269,7 +369,11 @@ describe("renderElementsOverlay — 1:1 fidelity (anti-doubling)", () => {
     // font resolved, fontWeight/fontStyle must be 'normal' and the object is
     // flagged usingEmbeddedFont (no cosmetic width fit).
     const canvas = makeCanvas();
-    const getFontFaceName = vi.fn(() => "gigapdf-doc-font-bold");
+    const getFontFaceName = vi.fn(() => ({
+      name: "gigapdf-doc-font-bold",
+      embedded: true,
+      exact: true,
+    }));
     const bold = textElement({
       style: {
         fontSize: 12,
@@ -357,7 +461,7 @@ describe("renderElementsOverlay — 1:1 fidelity (anti-doubling)", () => {
     } as unknown as typeof import("fabric");
     await renderElementsOverlay(canvas, [textElement()], wideFabric, {
       // Exact subset resolves → resolveTextFont marks usingEmbeddedFont.
-      getFontFaceName: () => "gigapdf-doc-KWVFOU",
+      getFontFaceName: () => ({ name: "gigapdf-doc-KWVFOU", embedded: true, exact: true }),
     });
 
     const it_ = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
@@ -826,6 +930,292 @@ describe("renderElementsOverlay — editable form fields", () => {
     expect(it_.opts.editable).toBe(false);
     expect(it_.opts.originX).toBe("center");
     expect((it_.data as Record<string, unknown>).fieldType).toBe("button");
+  });
+});
+
+// --- Form fields: full-rect hit-target + AcroForm format fidelity ------------
+
+describe("renderElementsOverlay — form-field hit-target & format", () => {
+  it("adds a full-rect background/hit Rect BEHIND an empty TEXT field (widget bounds)", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(canvas, [formFieldElement()], fabricMock);
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const hit = objects.find(
+      (o) => (o.data as Record<string, unknown>)?.isFieldHitTarget === true,
+    ) as Rect;
+    const it_ = objects.find((o) => o instanceof IText) as IText;
+    expect(hit).toBeDefined();
+    // The hit Rect covers the WHOLE widget rect — an empty field is clickable
+    // anywhere inside (the IText alone has ~0 width when blank).
+    expect(hit.opts.left).toBe(10);
+    expect(hit.opts.top).toBe(20);
+    expect(hit.opts.width).toBe(120);
+    expect(hit.opts.height).toBe(16);
+    expect(hit.opts.evented).toBe(true);
+    expect(hit.opts.selectable).toBe(false);
+    // Prefixed id → element lookups never resolve the chrome instead of the field.
+    const data = hit.data as Record<string, unknown>;
+    expect(data.elementId).toBe("hit:f1");
+    expect(data.hitForElementId).toBe("f1");
+    // Behind the value object (added first, stable-sorted tie).
+    expect(objects.indexOf(hit)).toBeLessThan(objects.indexOf(it_));
+  });
+
+  it("anchors a /Q=center field at the box centre (originX center)", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        formFieldElement({
+          value: "Centré",
+          style: {
+            fontFamily: "Helvetica",
+            fontSize: 11,
+            textColor: "#0a3a8a",
+            backgroundColor: null,
+            borderColor: null,
+            borderWidth: 0,
+            textAlign: "center",
+          },
+        }),
+      ],
+      fabricMock,
+    );
+    const it_ = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) => o instanceof IText,
+    ) as IText;
+    expect(it_.opts.originX).toBe("center");
+    expect(it_.opts.left).toBe(10 + 120 / 2);
+    expect(it_.opts.textAlign).toBe("center");
+  });
+
+  it("anchors a /Q=right field at the box right edge (originX right)", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        formFieldElement({
+          value: "Droite",
+          style: {
+            fontFamily: "Helvetica",
+            fontSize: 11,
+            textColor: "#0a3a8a",
+            backgroundColor: null,
+            borderColor: null,
+            borderWidth: 0,
+            textAlign: "right",
+          },
+        }),
+      ],
+      fabricMock,
+    );
+    const it_ = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) => o instanceof IText,
+    ) as IText;
+    expect(it_.opts.originX).toBe("right");
+    expect(it_.opts.left).toBe(10 + 120 - 2);
+  });
+
+  it("renders a MULTILINE field as a wrapping Textbox clipped to the widget rect", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        formFieldElement({
+          value: "ligne 1\nligne 2",
+          properties: {
+            required: false,
+            readOnly: false,
+            maxLength: null,
+            multiline: true,
+            password: false,
+            comb: false,
+          },
+        }),
+      ],
+      fabricMock,
+    );
+    const tb = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) => o instanceof Textbox,
+    ) as Textbox;
+    expect(tb).toBeDefined();
+    expect(tb.text).toBe("ligne 1\nligne 2");
+    // Fixed wrap width = widget width minus the inset.
+    expect(tb.opts.width).toBe(120 - 4);
+    // Clip to the widget rect (top-aligned) so overflow never paints outside.
+    const clip = tb.opts.clipPath as Rect;
+    expect(clip).toBeDefined();
+    expect(clip.opts.left).toBe(10);
+    expect(clip.opts.top).toBe(20);
+    expect(clip.opts.width).toBe(120);
+    expect(clip.opts.height).toBe(16);
+    expect(clip.opts.absolutePositioned).toBe(true);
+  });
+
+  it("auto-sizes (/DA 0 Tf) a VALUED field to fit the widget width", async () => {
+    const canvas = makeCanvas();
+    const longValue = "1234567890123"; // 13 chars in a 120pt-wide box
+    await renderElementsOverlay(
+      canvas,
+      [
+        formFieldElement({
+          value: longValue,
+          style: {
+            fontFamily: "Helvetica",
+            fontSize: 0, // auto-size, propagated verbatim by the extractor
+            textColor: "#0a3a8a",
+            backgroundColor: null,
+            borderColor: null,
+            borderWidth: 0,
+          },
+        }),
+      ],
+      fabricMock,
+    );
+    const it_ = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) => o instanceof IText,
+    ) as IText;
+    // min(height*0.7, widthFit) = min(11.2, (120-4)/(0.5*13) ≈ 17.8) → 11.2
+    expect(it_.opts.fontSize).toBeCloseTo(11.2, 5);
+  });
+
+  it("unchecks the OTHER named state of a multi-widget checkbox pair (Oui/non)", async () => {
+    const canvas = makeCanvas();
+    const pair = ["Oui", "non"].map((state) =>
+      formFieldElement({
+        elementId: `rat-${state}`,
+        fieldType: "checkbox",
+        fieldName: "RAT",
+        onValue: state,
+        // Field value = "Oui" → the Oui widget starts checked.
+        value: "Oui",
+        bounds: { x: 10, y: state === "Oui" ? 20 : 50, width: 14, height: 14 },
+      }),
+    );
+    await renderElementsOverlay(canvas, pair, fabricMock, {
+      onElementSelected: vi.fn(),
+    });
+    const fire = (canvas as unknown as { fire: (e: string, p: unknown) => void })
+      .fire;
+    const marks = (
+      canvas as unknown as { _objects: FakeObj[] }
+    )._objects.filter((o) => o instanceof IText) as IText[];
+    const oui = marks.find(
+      (m) => (m.data as Record<string, unknown>).elementId === "rat-Oui",
+    )!;
+    const non = marks.find(
+      (m) => (m.data as Record<string, unknown>).elementId === "rat-non",
+    )!;
+    expect((oui.data as Record<string, unknown>).fieldChecked).toBe(true);
+    expect((non.data as Record<string, unknown>).fieldChecked).toBe(false);
+
+    const modified: unknown[] = [];
+    canvas.on("object:modified", (e) => {
+      modified.push((e as { target?: unknown }).target);
+    });
+
+    // Check "non" → "Oui" must uncheck (one field, one value), sibling first.
+    fire("mouse:down", { target: non });
+    expect((non.data as Record<string, unknown>).fieldChecked).toBe(true);
+    expect((oui.data as Record<string, unknown>).fieldChecked).toBe(false);
+    expect(modified[0]).toBe(oui); // sibling fires BEFORE the target
+    expect(modified[1]).toBe(non); // target last → last-wins at bake time
+  });
+
+  it("delegates a click on the hit Rect to the checkbox toggle", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        formFieldElement({
+          elementId: "cb",
+          fieldType: "checkbox",
+          fieldName: "agree",
+          value: false,
+        }),
+      ],
+      fabricMock,
+      { onElementSelected: vi.fn() },
+    );
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const hit = objects.find(
+      (o) => (o.data as Record<string, unknown>)?.isFieldHitTarget === true,
+    )!;
+    const mark = objects.find((o) => o instanceof IText) as IText;
+    const fire = (canvas as unknown as { fire: (e: string, p: unknown) => void })
+      .fire;
+    fire("mouse:down", { target: hit });
+    expect((mark.data as Record<string, unknown>).fieldChecked).toBe(true);
+    expect(mark.text).toBe("☑");
+  });
+
+  it("places the caret on a single click in Fill & Sign mode (mouse:up on the hit Rect)", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(canvas, [formFieldElement()], fabricMock, {
+      onElementSelected: vi.fn(),
+    });
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const hit = objects.find(
+      (o) => (o.data as Record<string, unknown>)?.isFieldHitTarget === true,
+    )!;
+    const it_ = objects.find((o) => o instanceof IText) as IText & {
+      enterEditing?: () => void;
+      setCursorByClick?: (e: unknown) => void;
+    };
+    const enterEditing = vi.fn();
+    const setCursorByClick = vi.fn();
+    it_.enterEditing = enterEditing;
+    it_.setCursorByClick = setCursorByClick;
+    const fire = (canvas as unknown as { fire: (e: string, p: unknown) => void })
+      .fire;
+
+    // Outside Fill & Sign: no caret on single click (design behaviour intact).
+    fire("mouse:up", { target: hit, e: {} });
+    expect(enterEditing).not.toHaveBeenCalled();
+
+    // In Fill & Sign (flag stamped live on the canvas by the editor surface).
+    (canvas as unknown as { _gigaFillSignMode?: boolean })._gigaFillSignMode =
+      true;
+    fire("mouse:up", { target: hit, e: {} });
+    expect(enterEditing).toHaveBeenCalledTimes(1);
+    expect(setCursorByClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the signature capture on a signature-widget click in Fill & Sign", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        formFieldElement({
+          elementId: "sig",
+          fieldType: "signature",
+          fieldName: "sign",
+          value: "",
+        }),
+      ],
+      fabricMock,
+      { onElementSelected: vi.fn() },
+    );
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const rect = objects.find((o) => o instanceof Rect)!;
+    const onSignature = vi.fn();
+    const meta = canvas as unknown as {
+      _gigaFillSignMode?: boolean;
+      _gigaOnSignatureFieldClick?: (el: unknown) => void;
+    };
+    const fire = (canvas as unknown as { fire: (e: string, p: unknown) => void })
+      .fire;
+
+    // Outside Fill & Sign: nothing happens (design selection untouched).
+    meta._gigaOnSignatureFieldClick = onSignature;
+    fire("mouse:down", { target: rect });
+    expect(onSignature).not.toHaveBeenCalled();
+
+    meta._gigaFillSignMode = true;
+    fire("mouse:down", { target: rect });
+    expect(onSignature).toHaveBeenCalledTimes(1);
+    const arg = onSignature.mock.calls[0]![0] as { fieldName?: string };
+    expect(arg.fieldName).toBe("sign");
   });
 });
 
@@ -1554,8 +1944,8 @@ describe("applySegmentWidthFit (pure)", () => {
   });
 });
 
-describe("renderElementsOverlay — paragraph rendering", () => {
-  it("renders a paragraph as ONE editable Textbox with lines joined by \\n", async () => {
+describe("renderElementsOverlay — paragraph rendering (edit-intent)", () => {
+  it("keeps per-run ITexts AT REST and tags them as one paragraph group", async () => {
     const canvas = makeCanvas();
     await renderElementsOverlay(
       canvas,
@@ -1567,20 +1957,74 @@ describe("renderElementsOverlay — paragraph rendering", () => {
       fabricMock,
     );
     const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
-    const tb = objects.find((o) => o instanceof Textbox) as Textbox | undefined;
+    // AT REST: the proven pixel-1:1 per-run render, no Textbox anywhere.
+    expect(objects.filter((o) => o instanceof Textbox)).toHaveLength(0);
     const itexts = objects.filter((o) => o instanceof IText);
-    expect(tb).toBeDefined();
-    // No standalone IText for the folded runs.
-    expect(itexts).toHaveLength(0);
-    expect(tb!.text).toBe("First line\nSecond line\nThird line");
-    const data = tb!.data as Record<string, unknown>;
+    expect(itexts).toHaveLength(3);
+    // Every member carries the SAME group id + the shared descriptor.
+    const groupIds = itexts.map(
+      (o) => (o.data as Record<string, unknown>).paragraphGroupId,
+    );
+    expect(groupIds[0]).toBe("pg:a");
+    expect(new Set(groupIds).size).toBe(1);
+    const descriptor = (itexts[0]!.data as Record<string, unknown>)
+      .paragraphGroup as { lines: Array<Array<{ elementId: string }>> };
+    expect(descriptor.lines.map((l) => l.map((r) => r.elementId))).toEqual([
+      ["a"],
+      ["b"],
+      ["c"],
+    ]);
+  });
+
+  it("opens ONE multi-line Textbox session on edit intent and restores per-run on an unmodified exit", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        paraRun("a", 100, { content: "First line", index: 5 }),
+        paraRun("b", 114, { content: "Second line", index: 6 }),
+        paraRun("c", 128, { content: "Third line", index: 7 }),
+      ],
+      fabricMock,
+    );
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const member = objects.find(
+      (o) => (o.data as Record<string, unknown>)?.elementId === "b",
+    )!;
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      member as never,
+    ) as unknown as Textbox;
+    expect(session).toBeInstanceOf(Textbox);
+    // The per-run members were lifted off; the session box is the only text.
+    expect(objects.filter((o) => o instanceof IText)).toHaveLength(0);
+    expect(session.text).toBe("First line\nSecond line\nThird line");
+    expect(session.enterEditing).toHaveBeenCalled();
+    const data = session.data as Record<string, unknown>;
     expect(data.isParagraph).toBe(true);
-    expect(data.type).toBe("text");
-    // The block adopts the FIRST run's identity + carries all source runs.
+    expect(data.isParagraphSession).toBe(true);
     expect(data.elementId).toBe("a");
-    const stashed = data.paragraphRuns as Array<{ elementId: string; index?: number }>;
+    // Session snapshot: per-line source runs with their engine indices.
+    const lineRuns = data.lineRuns as Array<
+      Array<{ elementId: string; index?: number }>
+    >;
+    expect(lineRuns.map((l) => l.map((r) => r.elementId))).toEqual([
+      ["a"],
+      ["b"],
+      ["c"],
+    ]);
+    expect(lineRuns.flat().map((r) => r.index)).toEqual([5, 6, 7]);
+    // Legacy flat snapshot kept for the block-delete / duplicate flows.
+    const stashed = data.paragraphRuns as Array<{ elementId: string }>;
     expect(stashed.map((r) => r.elementId)).toEqual(["a", "b", "c"]);
-    expect(stashed.map((r) => r.index)).toEqual([5, 6, 7]);
+
+    // UNMODIFIED exit → the exact same per-run objects come back, zero write.
+    expect(restoreParagraphEditSession(canvas, session as never)).toBe(true);
+    expect(objects.filter((o) => o instanceof Textbox)).toHaveLength(0);
+    const restored = objects.filter((o) => o instanceof IText);
+    expect(restored).toHaveLength(3);
+    expect(restored.some((o) => o === member)).toBe(true);
   });
 
   it("renders a NON-UNIFORM block (mixed body/sub-paragraph advance) as per-run ITexts, not a drifting Textbox", async () => {
@@ -1603,7 +2047,7 @@ describe("renderElementsOverlay — paragraph rendering", () => {
     expect(objects.filter((o) => o instanceof IText)).toHaveLength(4);
   });
 
-  it("drives a coalesced Textbox's lineHeight from the runs' measured advance, not the hardcoded 1.2", async () => {
+  it("drives the SESSION Textbox's lineHeight from the measured line advance, not the hardcoded 1.2", async () => {
     // Uniform block, 12pt font, real 14pt advance → lineHeight 14/12 ≈ 1.166,
     // NOT the extractor's per-run style.lineHeight of 1.2.
     const canvas = makeCanvas();
@@ -1612,11 +2056,16 @@ describe("renderElementsOverlay — paragraph rendering", () => {
       [paraRun("a", 100), paraRun("b", 114), paraRun("c", 128)],
       fabricMock,
     );
-    const tb = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
-      (o) => o instanceof Textbox,
-    ) as Textbox | undefined;
-    expect(tb).toBeDefined();
-    expect(tb!.opts.lineHeight as number).toBeCloseTo(14 / 12, 3);
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const member = objects.find(
+      (o) => (o.data as Record<string, unknown>)?.elementId === "a",
+    )!;
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      member as never,
+    ) as unknown as Textbox;
+    expect(session.opts.lineHeight as number).toBeCloseTo(14 / 12, 3);
   });
 
   it("keeps line-by-line IText when groupParagraphs is disabled", async () => {
@@ -1632,19 +2081,28 @@ describe("renderElementsOverlay — paragraph rendering", () => {
     expect(objects.filter((o) => o instanceof IText)).toHaveLength(3);
   });
 
-  it("uses the embedded FontFace for a paragraph Textbox when available", async () => {
+  it("uses the embedded FontFace for the SESSION Textbox when available", async () => {
     const canvas = makeCanvas();
+    const getFontFaceName = () => ({
+      name: "gigapdf-doc-para",
+      embedded: true,
+      exact: true,
+    });
     await renderElementsOverlay(
       canvas,
       [paraRun("a", 100), paraRun("b", 114)],
       fabricMock,
-      { getFontFaceName: () => "gigapdf-doc-para" },
+      { getFontFaceName },
     );
-    const tb = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
-      (o) => o instanceof Textbox,
-    ) as Textbox;
-    expect(tb.opts.fontFamily).toBe("gigapdf-doc-para");
-    expect((tb.data as Record<string, unknown>).usingEmbeddedFont).toBe(true);
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const member = objects.find(
+      (o) => (o.data as Record<string, unknown>)?.elementId === "a",
+    )!;
+    const session = beginParagraphEditSession(canvas, fabricMock, member as never, {
+      getFontFaceName,
+    }) as unknown as Textbox;
+    expect(session.opts.fontFamily).toBe("gigapdf-doc-para");
+    expect((session.data as Record<string, unknown>).usingEmbeddedFont).toBe(true);
   });
 
   it("leaves a lone line as a standalone IText (no Textbox)", async () => {
@@ -1756,14 +2214,13 @@ describe("pageBlockGroupsToParagraphs (pure)", () => {
   });
 });
 
-describe("renderElementsOverlay — engine blockGroups drive paragraph render", () => {
+describe("renderElementsOverlay — engine blockGroups drive paragraph grouping", () => {
   it("uses blockGroups over the positional heuristic and round-trips source indices", async () => {
     const canvas = makeCanvas();
     // A COHERENT block (one run per line, one normal line-advance apart) but with
     // a small left-edge offset (20pt > the heuristic's 6pt xTol) that the
-    // positional heuristic rejects — so a Textbox can only appear if the engine
-    // blockGroups are honoured. The geometry still passes the coherence gate
-    // (contiguous, single-column, no segments) so it stays coalescable.
+    // positional heuristic rejects — so a paragraph GROUP can only form if the
+    // engine blockGroups are honoured. At rest both runs still render per-run.
     await renderElementsOverlay(
       canvas,
       [
@@ -1774,20 +2231,62 @@ describe("renderElementsOverlay — engine blockGroups drive paragraph render", 
       { blockGroups: [{ kind: "paragraph", sourceIndices: [21, 22] }] },
     );
     const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
-    const tb = objects.find((o) => o instanceof Textbox) as Textbox | undefined;
-    expect(tb).toBeDefined();
-    expect(tb!.text).toBe("Intro line one\nIntro line two");
-    const data = tb!.data as Record<string, unknown>;
-    expect(data.isParagraph).toBe(true);
-    const stashed = data.paragraphRuns as Array<{
-      elementId: string;
-      index?: number;
-    }>;
-    expect(stashed.map((r) => r.elementId)).toEqual(["a", "b"]);
-    // Engine source indices preserved → lossless replaceText on save.
-    expect(stashed.map((r) => r.index)).toEqual([21, 22]);
-    // No standalone IText for the folded runs.
-    expect(objects.filter((o) => o instanceof IText)).toHaveLength(0);
+    // At rest: per-run render, TAGGED as one group by the engine structure.
+    expect(objects.filter((o) => o instanceof Textbox)).toHaveLength(0);
+    const itexts = objects.filter((o) => o instanceof IText);
+    expect(itexts).toHaveLength(2);
+    expect(
+      itexts.every(
+        (o) => (o.data as Record<string, unknown>).paragraphGroupId === "pg:a",
+      ),
+    ).toBe(true);
+    // The edit session round-trips the engine source indices per line.
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      itexts[0] as never,
+    ) as unknown as Textbox;
+    expect(session.text).toBe("Intro line one\nIntro line two");
+    const lineRuns = (session.data as Record<string, unknown>)
+      .lineRuns as Array<Array<{ elementId: string; index?: number }>>;
+    expect(lineRuns.flat().map((r) => r.elementId)).toEqual(["a", "b"]);
+    expect(lineRuns.flat().map((r) => r.index)).toEqual([21, 22]);
+  });
+
+  it("consumes the lib `lines` structure: multi-run lines resolve per line", async () => {
+    const canvas = makeCanvas();
+    // One paragraph of TWO visual lines, the first made of TWO runs (the lib's
+    // {t:'br'} structure) — the old one-run-per-line model could not express it.
+    await renderElementsOverlay(
+      canvas,
+      [
+        paraRun("a", 100, { index: 1, content: "Nom :", width: 40 }),
+        paraRun("b", 100, { index: 2, content: "DUPONT", x: 90, width: 60 }),
+        paraRun("c", 114, { index: 3, content: "Deuxième ligne" }),
+      ],
+      fabricMock,
+      {
+        blockGroups: [
+          { kind: "paragraph", sourceIndices: [1, 2, 3], lines: [[1, 2], [3]] },
+        ],
+      },
+    );
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const itexts = objects.filter((o) => o instanceof IText);
+    expect(itexts).toHaveLength(3);
+    const descriptor = (itexts[0]!.data as Record<string, unknown>)
+      .paragraphGroup as { lines: Array<Array<{ elementId: string }>> };
+    expect(descriptor.lines.map((l) => l.map((r) => r.elementId))).toEqual([
+      ["a", "b"],
+      ["c"],
+    ]);
+    // The session joins the same-line runs with a separating space.
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      itexts[1] as never,
+    ) as unknown as Textbox;
+    expect(session.text).toBe("Nom : DUPONT\nDeuxième ligne");
   });
 
   it("falls back to the heuristic when no blockGroups are provided", async () => {
@@ -1918,8 +2417,8 @@ describe("pageBlockGroupsToTablesAndLists (pure)", () => {
   });
 });
 
-describe("renderElementsOverlay — table/list reconstruction", () => {
-  it("renders a multi-run table cell as ONE editable Textbox with lossless runs", async () => {
+describe("renderElementsOverlay — table/list reconstruction (edit-intent)", () => {
+  it("tags a multi-run table cell as one group and opens its Textbox session", async () => {
     const canvas = makeCanvas();
     await renderElementsOverlay(
       canvas,
@@ -1931,19 +2430,29 @@ describe("renderElementsOverlay — table/list reconstruction", () => {
       { blockGroups: [tableGroup([[[1, 2]]])] },
     );
     const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
-    const tb = objects.find((o) => o instanceof Textbox) as Textbox | undefined;
-    expect(tb).toBeDefined();
-    expect(tb!.text).toBe("Cell line A\nCell line B");
-    const data = tb!.data as Record<string, unknown>;
-    // Reuses the paragraph decompose-save path → lossless replaceText.
+    // At rest: per-run render (no Textbox), members tagged as one cell group.
+    expect(objects.filter((o) => o instanceof Textbox)).toHaveLength(0);
+    const itexts = objects.filter((o) => o instanceof IText);
+    expect(itexts).toHaveLength(2);
+    expect(
+      itexts.every(
+        (o) => (o.data as Record<string, unknown>).paragraphGroupId === "pg:a",
+      ),
+    ).toBe(true);
+    // The cell edits as ONE session Textbox with lossless per-line indices.
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      itexts[0] as never,
+    ) as unknown as Textbox;
+    expect(session.text).toBe("Cell line A\nCell line B");
+    const data = session.data as Record<string, unknown>;
     expect(data.isParagraph).toBe(true);
     const stashed = data.paragraphRuns as Array<{ elementId: string; index?: number }>;
     expect(stashed.map((r) => r.index)).toEqual([1, 2]);
-    // No standalone IText for the folded cell runs.
-    expect(objects.filter((o) => o instanceof IText)).toHaveLength(0);
   });
 
-  it("renders a multi-run list item as ONE editable Textbox", async () => {
+  it("tags a multi-run list item and opens its Textbox session", async () => {
     const canvas = makeCanvas();
     await renderElementsOverlay(
       canvas,
@@ -1955,10 +2464,15 @@ describe("renderElementsOverlay — table/list reconstruction", () => {
       { blockGroups: [listGroup([[5, 6]])] },
     );
     const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
-    const tb = objects.find((o) => o instanceof Textbox) as Textbox;
-    expect(tb).toBeDefined();
-    expect(tb.text).toBe("Bullet line 1\nBullet line 2");
-    expect(objects.filter((o) => o instanceof IText)).toHaveLength(0);
+    expect(objects.filter((o) => o instanceof Textbox)).toHaveLength(0);
+    const itexts = objects.filter((o) => o instanceof IText);
+    expect(itexts).toHaveLength(2);
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      itexts[0] as never,
+    ) as unknown as Textbox;
+    expect(session.text).toBe("Bullet line 1\nBullet line 2");
   });
 
   it("FALLBACK: a table whose cell runs don't resolve renders element-by-element (no regression)", async () => {
@@ -1977,5 +2491,191 @@ describe("renderElementsOverlay — table/list reconstruction", () => {
     // No Textbox folded; both runs stay standalone IText — identical to today.
     expect(objects.filter((o) => o instanceof Textbox)).toHaveLength(0);
     expect(objects.filter((o) => o instanceof IText)).toHaveLength(2);
+  });
+});
+
+// --- Per-line coherence gate (edit-intent successor of the run-level gate) ----
+
+describe("isCoherentLineGroup (pure)", () => {
+  const lr = (y: number, x = 40, width = 300, over: Record<string, unknown> = {}) =>
+    paraRun(`r${y}-${x}`, y, { x, width, ...over }) as unknown as TextRun;
+
+  it("accepts a genuine line-contiguous, single-column block", () => {
+    expect(
+      isCoherentLineGroup([[lr(100)], [lr(114)], [lr(128)]]),
+    ).toBe(true);
+  });
+
+  it("accepts MULTI-RUN lines (the lib's {t:'br'} structure)", () => {
+    // Two runs on line 1 (label + value), one on line 2 — the old run-level
+    // gate rejected this ("two runs on the same visual line"); per-line it is
+    // exactly what a paragraph looks like.
+    expect(
+      isCoherentLineGroup([
+        [lr(100, 40, 40), lr(100, 90, 60)],
+        [lr(114, 40, 110)],
+      ]),
+    ).toBe(true);
+  });
+
+  it("accepts a JUSTIFIED paragraph (segmented runs are no longer banned)", () => {
+    const segmented = paraRun("seg", 100, {
+      content: "mot un mot deux",
+      width: 300,
+    }) as unknown as TextRun;
+    (segmented as unknown as { segments: unknown[] }).segments = [
+      { text: "mot un", bounds: { x: 40, y: 100, width: 60, height: 12 } },
+      { text: "mot deux", bounds: { x: 240, y: 100, width: 100, height: 12 } },
+    ];
+    expect(
+      isCoherentLineGroup([[segmented], [lr(114)], [lr(128)]]),
+    ).toBe(true);
+  });
+
+  it("rejects a gap far beyond the measured leading (footer↔header fusion)", () => {
+    // 14pt leading then a 700pt jump — the lib should no longer emit this, but
+    // the gate still refuses to coalesce across the page.
+    expect(
+      isCoherentLineGroup([[lr(100)], [lr(114)], [lr(814)]]),
+    ).toBe(false);
+  });
+
+  it("rejects a TWO-line group whose lone gap dwarfs the font size (anchor)", () => {
+    // With one gap the median IS the gap — the ≤3×fontSize anchor still keeps
+    // a 200pt jump out (the two-run mis-fusions of dense forms).
+    expect(isCoherentLineGroup([[lr(100)], [lr(300)]])).toBe(false);
+  });
+
+  it("accepts a generously-leaded but regular two-line paragraph", () => {
+    expect(isCoherentLineGroup([[lr(100)], [lr(128)]])).toBe(true); // 28pt @12pt
+  });
+
+  it("rejects consecutive lines without horizontal overlap (side-by-side columns)", () => {
+    expect(
+      isCoherentLineGroup([[lr(100, 40, 100)], [lr(114, 400, 100)]]),
+    ).toBe(false);
+  });
+
+  it("rejects two 'lines' sharing the same Y (broken line structure)", () => {
+    expect(
+      isCoherentLineGroup([[lr(100, 40, 100)], [lr(100, 200, 100)]]),
+    ).toBe(false);
+  });
+
+  it("is trivially true for a single line / a lone run", () => {
+    expect(isCoherentLineGroup([[lr(100), lr(100, 90)]])).toBe(true);
+    expect(isCoherentLineGroup([[lr(100)]])).toBe(true);
+    expect(isCoherentLineGroup([])).toBe(false);
+  });
+});
+
+describe("joinLineRunContents (pure)", () => {
+  const runWith = (content: string) =>
+    paraRun(`j-${content}`, 100, { content }) as unknown as TextRun;
+
+  it("injects a single space between two word-adjacent runs", () => {
+    expect(joinLineRunContents([runWith("Nom :"), runWith("DUPONT")])).toBe(
+      "Nom : DUPONT",
+    );
+  });
+
+  it("does NOT double a space already carried by either side", () => {
+    expect(joinLineRunContents([runWith("foo "), runWith("bar")])).toBe("foo bar");
+    expect(joinLineRunContents([runWith("foo"), runWith(" bar")])).toBe("foo bar");
+  });
+
+  it("skips empty runs", () => {
+    expect(joinLineRunContents([runWith(""), runWith("solo")])).toBe("solo");
+  });
+});
+
+describe("beginParagraphEditSession — per-run character styles", () => {
+  it("builds the styles map PER RUN (colour/size per range, not first-run-for-all)", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        paraRun("a", 100, {
+          index: 1,
+          content: "Rouge",
+          width: 50,
+          style: { color: "#ff0000", fontSize: 12 },
+        }),
+        paraRun("b", 100, {
+          index: 2,
+          content: "Bleu",
+          x: 100,
+          width: 40,
+          style: { color: "#0000ff", fontSize: 14 },
+        }),
+        paraRun("c", 114, { index: 3, content: "Suite" }),
+      ],
+      fabricMock,
+      {
+        blockGroups: [
+          { kind: "paragraph", sourceIndices: [1, 2, 3], lines: [[1, 2], [3]] },
+        ],
+      },
+    );
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const member = objects.find(
+      (o) => (o.data as Record<string, unknown>)?.elementId === "a",
+    )!;
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      member as never,
+    ) as unknown as Textbox;
+    expect(session.text).toBe("Rouge Bleu\nSuite");
+    const styles = session.opts.styles as Record<
+      number,
+      Record<number, { fill?: string; fontSize?: number }>
+    >;
+    // "Rouge" chars 0..4 red @12; the injected space char 5 has no entry
+    // (base style); "Bleu" chars 6..9 blue @14.
+    expect(styles[0]![0]!.fill).toBe("#ff0000");
+    expect(styles[0]![0]!.fontSize).toBe(12);
+    expect(styles[0]![5]).toBeUndefined();
+    expect(styles[0]![6]!.fill).toBe("#0000ff");
+    expect(styles[0]![6]!.fontSize).toBe(14);
+    // Line 2 carries its own run style.
+    expect(styles[1]![0]!.fill).toBe("#000000");
+  });
+
+  it("positions/sizes the session box from the lib block frame when present", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        paraRun("a", 100, { index: 1, content: "L1" }),
+        paraRun("b", 114, { index: 2, content: "L2" }),
+      ],
+      fabricMock,
+      {
+        blockGroups: [
+          {
+            kind: "paragraph",
+            sourceIndices: [1, 2],
+            lines: [[1], [2]],
+            align: "justify",
+            frame: { x: 44.4, y: 99.1, width: 506.6, height: 43.3 },
+          },
+        ],
+      },
+    );
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const member = objects.find(
+      (o) => (o.data as Record<string, unknown>)?.elementId === "a",
+    )!;
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      member as never,
+    ) as unknown as Textbox;
+    expect(session.opts.left).toBeCloseTo(44.4);
+    expect(session.opts.top).toBeCloseTo(99.1);
+    expect(session.opts.width).toBeCloseTo(506.6);
+    // The lib alignment drives the session box (justify supported by Fabric).
+    expect(session.opts.textAlign).toBe("justify");
   });
 });

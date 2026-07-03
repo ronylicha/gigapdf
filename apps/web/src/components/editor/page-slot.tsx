@@ -32,6 +32,7 @@ import type {
   ShapeType,
   AnnotationType,
   FieldCreationKind,
+  FormFieldElement,
 } from "@giga-pdf/types";
 import { PageChrome } from "./page-chrome";
 import { PageCanvasHost } from "./page-canvas-host";
@@ -81,6 +82,13 @@ export interface PageSlotProps {
    */
   headerFooterActive?: boolean;
   /**
+   * Remplir & Signer actif — forwarded to the active page's EditorCanvas
+   * (simple clic = curseur dans un champ, clic signature = dialog de capture).
+   */
+  fillSignActive?: boolean;
+  /** Remplir & Signer : clic sur un widget SIGNATURE (forwarded). */
+  onSignatureFieldClick?: (element: FormFieldElement) => void;
+  /**
    * This page's margins (PDF points), or `null` if unknown / not loaded yet.
    * Draggable margin guides render only when present AND the page is active.
    */
@@ -98,7 +106,8 @@ export interface PageSlotProps {
     originalName: string,
     wantVariant?: { bold?: boolean; italic?: boolean },
     text?: string,
-  ) => string | null;
+    fontId?: string,
+  ) => { name: string; embedded: boolean; exact: boolean } | null;
   /** True while embedded fonts load — forwarded to the active page's EditorCanvas
    *  so it re-renders the overlay once when fonts become ready. */
   fontsLoading?: boolean;
@@ -174,6 +183,8 @@ function PageSlotImpl({
   showRulers = false,
   rulerUnit = "mm",
   headerFooterActive = false,
+  fillSignActive = false,
+  onSignatureFieldClick,
   margins,
   onMarginsCommit,
   onActivate,
@@ -237,6 +248,8 @@ function PageSlotImpl({
             height={slot.height}
             tool={tool ?? "select"}
             headerFooterActive={headerFooterActive}
+            fillSignActive={fillSignActive}
+            {...(onSignatureFieldClick ? { onSignatureFieldClick } : {})}
             {...(getFontFaceName ? { getFontFaceName } : {})}
             {...(fontsLoading !== undefined ? { fontsLoading } : {})}
             {...(shapeType !== undefined ? { shapeType } : {})}

@@ -48,6 +48,7 @@ import type {
   ShapeType,
   AnnotationType,
   FieldCreationKind,
+  FormFieldElement,
 } from "@giga-pdf/types";
 import { useViewStore } from "@giga-pdf/editor";
 import { clientLogger } from "@/lib/client-logger";
@@ -134,7 +135,8 @@ export interface ContinuousPageViewProps {
     originalName: string,
     wantVariant?: { bold?: boolean; italic?: boolean },
     text?: string,
-  ) => string | null;
+    fontId?: string,
+  ) => { name: string; embedded: boolean; exact: boolean } | null;
   /** True while embedded fonts load — forwarded to the active page's EditorCanvas
    *  so it re-renders the overlay once when fonts become ready. */
   fontsLoading?: boolean;
@@ -221,6 +223,13 @@ export interface ContinuousPageViewProps {
    * page's EditorCanvas so its background raster excludes the baked `/GPHF` band.
    */
   headerFooterActive?: boolean;
+  /**
+   * Remplir & Signer actif — forwarded to the active page's EditorCanvas
+   * (simple clic = curseur dans un champ, clic signature = dialog de capture).
+   */
+  fillSignActive?: boolean;
+  /** Remplir & Signer : clic sur un widget SIGNATURE (forwarded). */
+  onSignatureFieldClick?: (element: FormFieldElement) => void;
 }
 
 /**
@@ -263,6 +272,8 @@ function ContinuousPageViewImpl(
     onCanvasReady,
     renderActiveOverlay,
     headerFooterActive = false,
+    fillSignActive = false,
+    onSignatureFieldClick,
   }: ContinuousPageViewProps,
   ref: React.ForwardedRef<ContinuousPageViewHandle>,
 ) {
@@ -766,6 +777,10 @@ function ContinuousPageViewImpl(
                     : {})}
                   {...(isActive ? { documentId } : {})}
                   {...(isActive ? { headerFooterActive } : {})}
+                  {...(isActive ? { fillSignActive } : {})}
+                  {...(isActive && onSignatureFieldClick
+                    ? { onSignatureFieldClick }
+                    : {})}
                   {...(isActive && tool ? { tool } : {})}
                   {...(isActive && onElementAdded ? { onElementAdded } : {})}
                   {...(isActive && onInkDrawn ? { onInkDrawn } : {})}

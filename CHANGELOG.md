@@ -5,7 +5,62 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.20.0] - 2026-07-02
+## [1.21.0] - 2026-07-03
+
+### Added — edit whole paragraphs, like Adobe (engine 0.114.x)
+
+- **Double-click a paragraph and edit it as one block.** Instead of hundreds of
+  tiny independent text boxes, the runs of a paragraph are now linked: entering
+  edit mode swaps them for a single multi-line box — real line wrapping, the
+  document's own alignment (justified included) and per-word styles (inline
+  bold/italic keep their look) — and leaving without a change restores the
+  pixel-exact per-run rendering untouched.
+- **Edits write back surgically.** Changing a line rewrites just that line's
+  source runs in place; adding or removing lines reflows the paragraph within
+  its original frame. On a plain administrative letter, the body paragraphs
+  went from 0 to 6/6 editable as blocks — including a 10-line justified one.
+- This is powered by an engine fix: the structural blocks and the editable text
+  runs now share the same index space (images and shapes no longer shift the
+  mapping — the actual root cause of the v1.19.2 "vanishing footer" incident),
+  and the engine's paragraph reconstruction is geometrically hardened so a
+  footer and a header can never fuse into one "paragraph" again.
+
+### Added — form filling reaches Adobe parity
+
+- **An empty field now occupies its whole allotted box**: visible background and
+  border, clickable anywhere inside — and in Fill & Sign mode a **single click
+  puts the caret in the field** so you just type.
+- **What you type respects the field's format**: alignment (left/centre/right),
+  multi-line fields wrap inside their box, comb fields (one character per cell —
+  social-security numbers, dates) lay out cell by cell, auto-size fields shrink
+  to fit, and a max-length is enforced while typing. Long values no longer
+  overflow or overlap the neighbouring content.
+- **Filling no longer duplicates fields.** A filled field used to be re-created
+  on save (two overlapping widgets, format lost, values in conflict in Adobe).
+  The value is now written into the existing AcroForm field and the engine
+  regenerates its appearance faithfully (comb cells, wrapping, auto-size,
+  alignment measured with the field's real font).
+- **Yes/No checkbox pairs work**: official forms often model "Oui/Non" as one
+  checkbox with two named states — checking one now unchecks the other, on
+  every page it appears, and "Non" can actually be selected.
+- **Sign inside a signature field**: in Fill & Sign, clicking a signature widget
+  opens the capture dialog and fits your signature to the field's box.
+
+### Fixed — the document's original fonts are always used
+
+- **The editor now always serves each run's original embedded font — even when
+  the subset is incomplete.** Fonts are matched by the identity of the physical
+  font program instead of by name: a dense CERFA shares 20 real font programs
+  across 69 name variants, each declaring only a few characters; the old
+  name-based match picked the wrong variant and dropped the accents (à/â/é/ê/è
+  showed as tofu or a substituted face). Coverage is no longer a reason to
+  reject a present font — Google/Helvetica fallbacks only apply when a font
+  truly isn't embedded.
+- **Editing can no longer corrupt text silently** (engine 0.114.1): replacing a
+  run's text re-encodes through the exact inverse of how the document decodes
+  it. On the reference CERFA, 527/527 identical-text replacements now survive
+  (it was 140 — the rest came back empty or garbled, the root cause of the
+  historical "tangled text" incidents on saved CERFAs).
 
 ### Added — "Fill & Sign" mode with reusable signatures (Adobe-style)
 

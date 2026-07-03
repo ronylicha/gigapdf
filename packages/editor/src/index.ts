@@ -67,6 +67,7 @@ export type {
   UseEmbeddedFontsResult,
   LoadedFont,
   FontLoadStatus,
+  FontFaceMatch,
 } from "./hooks/use-embedded-fonts";
 
 // Document (embedded) fonts → editor font-picker options

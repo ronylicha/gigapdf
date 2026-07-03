@@ -100,9 +100,12 @@ function toElement(field: FieldInfo, widget: WidgetPlacement, widgetIndex: numbe
     },
     style: {
       fontFamily: 'Helvetica',
-      // `/DA` font size (`0` = auto-size). Kept as 0 so the overlay sizes the
-      // value to fit the field box, matching the field's original render.
-      fontSize: field.daSize > 0 ? field.daSize : 12,
+      // `/DA` font size propagated VERBATIM — `0` means AUTO-SIZE. The overlay
+      // renderer computes a size that fits the widget box (height + width when
+      // a value is present) and the bake keeps the engine's auto (`0 Tf`
+      // shrink-to-fit appearances); coercing to 12 here silently destroyed the
+      // auto-size semantics on every round-trip.
+      fontSize: field.daSize,
       textColor: '#000000',
       backgroundColor: null,
       borderColor: null,

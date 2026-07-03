@@ -102,7 +102,10 @@ import {
   type FormsPanelMode,
   type LoadedFormField,
 } from "@/components/editor/forms-panel";
-import { FormFillOverlay } from "@/components/editor/form-fill-overlay";
+import {
+  FormFillOverlay,
+  type FormFillHighlight,
+} from "@/components/editor/form-fill-overlay";
 import { TableEditOverlay } from "@/components/editor/table-edit-overlay";
 import type {
   TableEditAction,
@@ -482,8 +485,24 @@ export default function EditorPage() {
   // surlignés sur le canvas (FormFillOverlay) ; saisie + application via
   // /api/pdf/forms. États locaux : purement UI, non persistés.
   const [formsMode, setFormsMode] = useState<FormsPanelMode>("design");
-  const [loadedFormFields, setLoadedFormFields] = useState<LoadedFormField[]>([]);
+  // Le FormsPanel charge/rafraîchit ses champs lui-même ; l'overlay de
+  // surlignage lit désormais le SCENE GRAPH (formFillHighlights) — seul le
+  // setter reste câblé (contrat onFieldsLoaded du panel).
+  const [, setLoadedFormFields] = useState<LoadedFormField[]>([]);
   const [focusedFormField, setFocusedFormField] = useState<string | null>(null);
+  // Remplir & Signer actif : le canvas passe en UX Adobe (simple clic = curseur
+  // dans un champ, clic sur un widget signature = dialog de capture) et le
+  // surlignage des champs devient purement visuel.
+  const fillSignActive = showFormsPanel && formsMode === "fill";
+  // Rect (points PDF, repère page) du widget signature cliqué en mode Remplir &
+  // Signer — la prochaine insertion de signature y sera ajustée (ratio
+  // préservé, centrée). Null = insertion libre (bouton toolbar).
+  const signatureTargetRef = useRef<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  } | null>(null);
   // Ref pour l'input file
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -632,6 +651,25 @@ export default function EditorPage() {
     () => pages[effectivePageIndex] ?? null,
     [pages, effectivePageIndex]
   );
+
+  // Surlignage du mode Remplir : UN rect PAR WIDGET, issu du SCENE GRAPH (le
+  // parse produit un élément form_field par widget — pages dupliquées et
+  // paires Oui/non incluses), pas du getFormFields de l'API qui ne remonte que
+  // le premier widget de chaque champ.
+  const formFillHighlights = useMemo<FormFillHighlight[]>(() => {
+    const highlights: FormFillHighlight[] = [];
+    pages.forEach((page, index) => {
+      for (const el of page.elements) {
+        if (el.type !== "form_field") continue;
+        highlights.push({
+          fieldName: el.fieldName,
+          pageNumber: index + 1,
+          bounds: { ...el.bounds },
+        });
+      }
+    });
+    return highlights;
+  }, [pages]);
 
   // Activate a page in the continuous scroller: it becomes the focused page
   // (editable overlay) and drives the page-scoped panels + selection store.
@@ -1601,6 +1639,31 @@ export default function EditorPage() {
       // reads from there, not from Fabric).
       updateElementInPage(element.elementId, element);
 
+      // COHÉRENCE MULTI-WIDGETS : un champ AcroForm porte UNE valeur partagée
+      // par tous ses widgets (le même champ répété p1/p2, les paires Oui/non).
+      // Après l'édition d'un widget, propager la valeur aux éléments JUMEAUX
+      // du scene graph (même fieldName, toutes pages) pour que le widget p2
+      // reflète la saisie p1 — et re-rendre leurs objets Fabric quand ils sont
+      // montés sur la page active (les jumeaux checkables de la même page sont
+      // déjà tenus cohérents par le toggle du canvas ; ce re-render est
+      // idempotent). Pas de queueUpdate pour les jumeaux : le bake ne remplit
+      // le champ qu'UNE fois par nom.
+      if (element.type === "form_field" && element.fieldName) {
+        for (const page of pages) {
+          for (const sibling of page.elements) {
+            if (sibling.type !== "form_field") continue;
+            if (sibling.fieldName !== element.fieldName) continue;
+            if (sibling.elementId === element.elementId) continue;
+            if (sibling.value === element.value) continue;
+            const synced = { ...sibling, value: element.value };
+            updateElementInPage(sibling.elementId, synced);
+            if (page.pageId === effectivePage?.pageId) {
+              canvasHandle?.applyLocalElementUpdate(synced);
+            }
+          }
+        }
+      }
+
       // Queue update with the TRUE oldBounds (tracked by editor-canvas
       // before the modification). Without this, apply-elements clears
       // the new bounds region and the original PDF glyph stays visible
@@ -1656,7 +1719,7 @@ export default function EditorPage() {
       // Sauvegarde debounced vers S3
       saveWithPriority("debounced");
     },
-    [setDirty, emitElementUpdate, saveWithPriority, documentId, currentPageIndex, queueUpdate, updateElementInPage]
+    [setDirty, emitElementUpdate, saveWithPriority, documentId, currentPageIndex, queueUpdate, updateElementInPage, pages, effectivePage, canvasHandle]
   );
 
   // Z-order change (bringToFront / sendToBack): queue a `reorder` op so the new
@@ -1753,6 +1816,14 @@ export default function EditorPage() {
         // selectedPageId from the displayed page. effectivePage drives
         // selectedElements too, so the two stay consistent.
         selectElements(elementIds, effectivePage.pageId);
+        // Mode Remplir : le focus de la ligne du FormsPanel suit la sélection
+        // CANVAS (l'overlay de surlignage est purement visuel désormais).
+        const selected = effectivePage.elements.find(
+          (el) => el.elementId === elementIds[0],
+        );
+        if (selected?.type === "form_field") {
+          setFocusedFormField(selected.fieldName);
+        }
       }
     },
     [effectivePage, selectElements, clearSelection]
@@ -4669,12 +4740,27 @@ export default function EditorPage() {
   }, [setFormsMode, showFormsPanel, toggleFormsPanel]);
 
   // Ouvre le dialog de capture (dessin / texte / import) signature ou paraphe.
+  // Insertion LIBRE (bouton toolbar) : aucun widget cible.
   const handleInsertSignature = useCallback(() => {
+    signatureTargetRef.current = null;
     setSignatureDialogOpen(true);
   }, []);
 
+  // Remplir & Signer : clic sur un WIDGET SIGNATURE du PDF → ouvre le dialog
+  // de capture en mémorisant le rect du widget ; la signature capturée y sera
+  // AJUSTÉE (ratio préservé, centrée) au lieu d'un placement libre.
+  const handleSignatureFieldClick = useCallback(
+    (element: FormFieldElement) => {
+      signatureTargetRef.current = { ...element.bounds };
+      setSignatureDialogOpen(true);
+    },
+    [],
+  );
+
   // Insère la signature/paraphe capturé comme élément image, déplaçable et
   // redimensionnable, exactement comme un ajout d'image (même chemin de save).
+  // Quand un widget signature a été cliqué (Remplir & Signer), l'image est
+  // ajustée aux bounds du widget.
   const handleSignatureInsert = useCallback(
     (sig: {
       dataUrl: string;
@@ -4682,7 +4768,14 @@ export default function EditorPage() {
       height: number;
       kind: "signature" | "initials";
     }) => {
-      canvasHandle?.addImage(sig.dataUrl, sig.width, sig.height);
+      const target = signatureTargetRef.current;
+      signatureTargetRef.current = null;
+      canvasHandle?.addImage(
+        sig.dataUrl,
+        sig.width,
+        sig.height,
+        target ?? undefined,
+      );
       setSignatureDialogOpen(false);
       setDirty(true);
       saveWithPriority("immediate");
@@ -5489,6 +5582,8 @@ export default function EditorPage() {
               onTextSelectionStyleChanged={handleTextSelectionStyleChanged}
               onCanvasReady={setCanvasHandle}
               headerFooterActive={hfEditMode}
+              fillSignActive={fillSignActive}
+              onSignatureFieldClick={handleSignatureFieldClick}
               renderActiveOverlay={(index) => (
                 <>
                   {/* SL2 — Word-like editable running header/footer bands for the
@@ -5510,15 +5605,12 @@ export default function EditorPage() {
                       single-page editor's EditorCanvas `overlay`). PageSlot renders
                       this inside the active page's sheet (page×zoom space), so the
                       field rects line up exactly as in single-page mode. */}
-                  {showFormsPanel &&
-                  formsMode === "fill" &&
-                  loadedFormFields.length > 0 ? (
+                  {fillSignActive && formFillHighlights.length > 0 ? (
                     <FormFillOverlay
-                      fields={loadedFormFields}
+                      fields={formFillHighlights}
                       currentPageIndex={index}
                       zoom={zoom}
                       focusedFieldName={focusedFormField}
-                      onFieldClick={setFocusedFormField}
                     />
                   ) : null}
                   {/* Collaborator cursors for the ACTIVE page only (cursors on
@@ -5579,6 +5671,8 @@ export default function EditorPage() {
                 // EXCLUDES the baked `/GPHF` band so the editable bands below
                 // aren't doubled (parity with the continuous view).
                 headerFooterActive={hfEditMode}
+                fillSignActive={fillSignActive}
+                onSignatureFieldClick={handleSignatureFieldClick}
                 overlay={
                   <>
                     {/* SL2 — Word-like editable running header/footer bands for
@@ -5599,15 +5693,12 @@ export default function EditorPage() {
                         onFocusedTextItemChange={handleHfFocusedChange}
                       />
                     ) : null}
-                    {showFormsPanel &&
-                    formsMode === "fill" &&
-                    loadedFormFields.length > 0 ? (
+                    {fillSignActive && formFillHighlights.length > 0 ? (
                       <FormFillOverlay
-                        fields={loadedFormFields}
+                        fields={formFillHighlights}
                         currentPageIndex={currentPageIndex}
                         zoom={zoom}
                         focusedFieldName={focusedFormField}
-                        onFieldClick={setFocusedFormField}
                       />
                     ) : null}
                     {renderTableEditOverlay()}
@@ -5714,15 +5805,11 @@ export default function EditorPage() {
             onDesignFieldSelect={handleDesignFieldSelect}
             onDesignFieldReorder={handleDesignFieldReorder}
             onPdfUpdated={(blob) => {
-              // Convert blob back to File for subsequent operations
-              const file = new File(
-                [blob],
-                currentPdfFile?.name ?? "document.pdf",
-                { type: "application/pdf" }
-              );
-              updateCurrentPdfFile(file);
-              setDirty(true);
-              saveWithPriority("immediate");
+              // Adopter le binaire modifié PAR LE MÊME CHEMIN que toutes les
+              // autres mutations natives : updateCurrentPdfFile + save +
+              // RE-PARSE. Sans le re-parse, l'overlay (valeurs des champs)
+              // restait STALE après un remplissage via le panneau formulaire.
+              adoptModifiedPdf(blob, { reparse: true });
             }}
           />
         )}
@@ -5770,7 +5857,12 @@ export default function EditorPage() {
       {/* Remplir & Signer — capture (dessin / texte / import) + signatures du compte */}
       <SignatureCaptureDialog
         open={signatureDialogOpen}
-        onClose={() => setSignatureDialogOpen(false)}
+        onClose={() => {
+          setSignatureDialogOpen(false);
+          // Annulation : oublier le widget signature ciblé pour qu'une
+          // insertion ultérieure via la toolbar reste un placement libre.
+          signatureTargetRef.current = null;
+        }}
         onInsert={handleSignatureInsert}
       />
 
