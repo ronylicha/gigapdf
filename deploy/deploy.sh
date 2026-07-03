@@ -6,6 +6,19 @@
 
 set -e
 
+# =============================================================================
+# LEGACY GUARD — this in-place flat-clone deploy is DISABLED once the
+# blue/green release layout is active (it would chown releases/, restart the
+# retired legacy units on ports already used by the blue color, and race the
+# zero-downtime switch). Use deploy/redeploy.sh (laptop) or
+# deploy/server-deploy.sh (on the VPS) instead. See deploy/README.md.
+# =============================================================================
+if [ -f /opt/gigapdf/shared/state/active-color ]; then
+    echo "FATAL: blue/green release layout is active — legacy deploy.sh is disabled." >&2
+    echo "Use deploy/redeploy.sh (laptop) or deploy/server-deploy.sh deploy (VPS)." >&2
+    exit 1
+fi
+
 echo "=========================================="
 echo "  GigaPDF Deployment"
 echo "  $(date '+%Y-%m-%d %H:%M:%S')"

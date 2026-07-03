@@ -1,49 +1,50 @@
 #!/usr/bin/env bash
 # =============================================================================
-# GigaPDF — Idempotent redeploy script
+# GigaPDF — zero-downtime redeploy (laptop wrapper)
 #
-# Runs the full deploy in one shot from a developer laptop:
-#   1. Push HEAD to the production remote
-#   2. SSH into the VPS, fetch + reset, fix perms, clean caches, install,
-#      build (force — no cache), copy static+public, restart systemd
-#      services, and smoke-check the HTTP endpoints.
+# Blue/green release deploy: builds a fresh timestamped release on the VPS
+# while the site keeps serving from the current one, then switches nginx
+# upstreams gracefully. A curl loop hammering the site during the whole
+# deploy must see 0 non-200 responses.
 #
-# Safe to run repeatedly — every step is idempotent and self-healing.
-# Designed to recover from any partially failed previous deploy (mixed
-# ownership, stale .next, missing public copy, Turbo cache hits hiding
-# unchanged BUILD_IDs, etc).
+#   1. Push HEAD to the production remote (bare repo /opt/gigapdf-repo.git)
+#   2. Ship deploy/server-deploy.sh over SSH and run:
+#        clone release → pnpm install → migrations → turbo build --force →
+#        standalone sync → start inactive color → health gates (NRestarts) →
+#        nginx upstream switch (graceful reload) → drain → stop old color →
+#        celery/OCR restart → purge old releases (keep 3)
+#   3. Smoke-check public endpoints + verify served HEAD == local HEAD
 #
 # Usage:
-#   bash deploy/redeploy.sh                  # full deploy
-#   bash deploy/redeploy.sh --web-only       # skip celery/api restart
-#   bash deploy/redeploy.sh --skip-push      # assume origin/main is current
-#   bash deploy/redeploy.sh --skip-install   # reuse node_modules
-#   bash deploy/redeploy.sh --strict         # fail on any smoke check
+#   GIGAPDF_VPS_HOST=1.2.3.4 bash deploy/redeploy.sh            # full deploy
+#   bash deploy/redeploy.sh --web-only     # skip celery restart (workers keep old code!)
+#   bash deploy/redeploy.sh --skip-push    # assume the bare repo already has HEAD
+#   bash deploy/redeploy.sh --strict       # fail on any smoke-check warning
 #
-# Exits non-zero on any hard failure. Smoke checks at the end are warnings
-# unless --strict is passed.
+# Rollback: bash deploy/rollback.sh   (switches back to the previous release <30s)
+# Docs:     deploy/README.md
 # =============================================================================
 
 set -euo pipefail
 
-# ── Configuration ───────────────────────────────────────────────────────────
 VPS_USER="${GIGAPDF_VPS_USER:-ubuntu}"
 VPS_HOST="${GIGAPDF_VPS_HOST:?GIGAPDF_VPS_HOST is required (e.g. 'export GIGAPDF_VPS_HOST=your.vps.example.com')}"
 VPS_PATH="${GIGAPDF_VPS_PATH:-/opt/gigapdf}"
-APP_USER="${GIGAPDF_APP_USER:-gigapdf}"
-APP_GROUP="${GIGAPDF_APP_GROUP:-gigapdf}"
 REMOTE="${GIGAPDF_REMOTE:-production}"
 BRANCH="${GIGAPDF_BRANCH:-main}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_SCRIPT="$SCRIPT_DIR/server-deploy.sh"
+[ -f "$SERVER_SCRIPT" ] || { echo "[fail] $SERVER_SCRIPT missing" >&2; exit 1; }
+
 WEB_ONLY=false
 SKIP_PUSH=false
-SKIP_INSTALL=false
 STRICT=false
 for arg in "$@"; do
   case "$arg" in
     --web-only) WEB_ONLY=true ;;
     --skip-push) SKIP_PUSH=true ;;
-    --skip-install) SKIP_INSTALL=true ;;
+    --skip-install) echo "[warn] --skip-install is obsolete (each release installs fresh from the pnpm store); ignored" >&2 ;;
     --strict) STRICT=true ;;
     -h|--help)
       sed -n '1,/^# ==/p' "$0" | sed 's/^# \{0,1\}//'
@@ -59,263 +60,32 @@ ok()    { printf "${GREEN}[ ok ]${NC} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[warn]${NC} %s\n" "$*"; }
 fail()  { printf "${RED}[fail]${NC} %s\n" "$*" >&2; exit 1; }
 
-# ── 1. Push to production remote ────────────────────────────────────────────
+# ── 1. Push to production remote (bare repo on the VPS) ─────────────────────
+SHA=$(git rev-parse HEAD)
 if ! $SKIP_PUSH; then
-  info "Pushing ${BRANCH} → ${REMOTE}"
-  # The production hook is best-effort: we always re-run a clean build on the
-  # VPS below, so hook failures don't matter. `|| true` keeps the pipe alive.
+  info "Pushing ${BRANCH} → ${REMOTE} (sha ${SHA:0:7})"
   git push "$REMOTE" "$BRANCH" 2>&1 | tail -3 || true
 else
   info "Skipping push (--skip-push)"
 fi
 
-# ── 2. Run the remote sequence ──────────────────────────────────────────────
-# Everything below runs on the VPS in a single SSH session. We stream stdout
-# live (no `tail -N` buffering) so the developer sees progress in real time.
+# ── 2. Ship server-deploy.sh and run the deploy in one SSH session ──────────
+# The script version always matches this wrapper (both live in deploy/).
+DEPLOY_FLAGS="--sha $SHA"
+$WEB_ONLY && DEPLOY_FLAGS="$DEPLOY_FLAGS --skip-celery"
 
-REMOTE_SCRIPT=$(cat <<REMOTE
-set -euo pipefail
+info "Connecting to ${VPS_USER}@${VPS_HOST} — release build runs while the site keeps serving"
+ssh -o StrictHostKeyChecking=accept-new "${VPS_USER}@${VPS_HOST}" \
+  "TMP=\$(mktemp /tmp/gigapdf-server-deploy.XXXXXX.sh) && cat > \"\$TMP\" && bash \"\$TMP\" deploy $DEPLOY_FLAGS; rc=\$?; rm -f \"\$TMP\"; exit \$rc" \
+  < "$SERVER_SCRIPT" || fail "Remote deploy failed — site is still on the previous release (nothing was switched)"
 
-VPS_PATH="${VPS_PATH}"
-APP_USER="${APP_USER}"
-APP_GROUP="${APP_GROUP}"
-BRANCH="${BRANCH}"
-SKIP_INSTALL=${SKIP_INSTALL}
-WEB_ONLY=${WEB_ONLY}
-
-cd "\$VPS_PATH"
-
-section() { printf "\n\033[1;34m▶ %s\033[0m\n" "\$1"; }
-
-# ── 2.1 Normalize ownership so every op works ────────────────────────────
-section "Normalizing ownership to \$USER for git + build ops"
-sudo chown -R "\$USER":"\$USER" "\$VPS_PATH"
-
-# ── 2.2 Fast-forward to the pushed branch ────────────────────────────────
-section "Fetching origin/\$BRANCH and resetting"
-git fetch --prune origin "\$BRANCH"
-git reset --hard "origin/\$BRANCH"
-git clean -fd -- apps/ packages/ deploy/ scripts/ || true
-git log --oneline -3
-
-# ── 2.3 Purge caches that hide unchanged BUILD_IDs ───────────────────────
-# Turbo + Next cache the output of previous builds. If we leave them, turbo
-# returns "cache hit" and next build never regenerates BUILD_ID, so the
-# deployed binary silently stays on the previous commit.
-section "Purging turbo + Next.js build caches"
-rm -rf .turbo
-find apps packages -maxdepth 3 -type d -name '.turbo' -exec rm -rf {} + 2>/dev/null || true
-rm -rf apps/web/.next apps/admin/.next
-
-# ── 2.4 Install deps — DEMO: always track the newest gigapdf-lib ─────────
-# This app is a living demonstration of @qrcommunication/gigapdf-lib and
-# co-evolves with it, so its package.json pins the lib to the "latest" dist-tag
-# (majors included). IMPORTANT: \`--no-frozen-lockfile\` alone does NOT bump an
-# already-resolved dependency — it honors the lockfile's pinned version as long
-# as the package.json spec ("latest") is unchanged. So we EXPLICITLY \`pnpm
-# update\` the lib to its newest published release on every deploy. The build
-# step below is the gate — a breaking lib change fails the build and aborts the
-# deploy, so prod stays on the previous release rather than shipping broken.
-if ! \$SKIP_INSTALL; then
-  section "Installing pnpm deps (forcing latest gigapdf-lib)"
-  pnpm install --no-frozen-lockfile
-  # Force the lib to its newest published version — \`--no-frozen-lockfile\` above
-  # would otherwise keep the lockfile's pinned version. The fixed-version alias
-  # gigapdf-lib-ocr (npm:@qrcommunication/gigapdf-lib@<pinned>) is untouched.
-  pnpm update "@qrcommunication/gigapdf-lib@latest" --recursive
-fi
-
-# ── 2.4-pre (removed) No third-party binaries required ───────────────────
-# The WASM engine (gigapdf-lib) handles Office<->PDF, HTML/URL->PDF, OCR and
-# font embedding/conversion entirely in-process: the app calls officeToPdf /
-# htmlRender / the native font embedder, never a subprocess. The former
-# libreoffice / fontforge / Playwright-Chromium installs are therefore gone.
-
-# ── 2.4c Apply manual SQL migrations ─────────────────────────────────────
-# We don't run \`prisma db push\` here because Prisma's introspection has
-# diverged from production for several legacy tables (PK changes on
-# users/sessions/jwks/user_quotas, the old alembic_version from the
-# Python era…). Pushing would either prompt for --accept-data-loss and
-# silently break auth, or refuse to run.
-#
-# Instead we apply hand-written, idempotent CREATE TABLE IF NOT EXISTS
-# scripts from apps/web/prisma/manual-migrations/. Each file is safe to
-# re-run on every deploy. Order is alphabetical (00X_ prefix).
-section "Applying manual SQL migrations"
-if [ -f "\$VPS_PATH/.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  sudo cat "\$VPS_PATH/.env" > /tmp/gigapdf-env.\$\$ && source /tmp/gigapdf-env.\$\$ && rm -f /tmp/gigapdf-env.\$\$
-  set +a
-fi
-MIG_DIR="\$VPS_PATH/apps/web/prisma/manual-migrations"
-if [ -d "\$MIG_DIR" ] && [ -n "\${DATABASE_URL:-}" ]; then
-  for sql in "\$MIG_DIR"/*.sql; do
-    [ -f "\$sql" ] || continue
-    echo "  applying \$(basename "\$sql")"
-    psql "\$DATABASE_URL" -v ON_ERROR_STOP=1 -f "\$sql" 2>&1 | tail -3 || \\
-      echo "  [warn] \$(basename "\$sql") failed — check schema drift"
-  done
-else
-  echo "  no migrations dir or DATABASE_URL not set, skipping"
-fi
-
-# ── 2.4d Apply alembic migrations (FastAPI backend schema) ───────────────
-# The Python backend owns the SQLAlchemy schema (stored_documents, folders,
-# shares…). Migrations MUST run on every deploy — v1.2.0's env.py fix made
-# them effective again (they were silently rolled back before), so verify
-# the current revision instead of trusting exit 0.
-section "Applying alembic migrations (Python backend)"
-ALEMBIC_BIN=""
-for cand in "\$VPS_PATH/.venv/bin/alembic" "\$VPS_PATH/venv/bin/alembic"; do
-  [ -x "\$cand" ] && ALEMBIC_BIN="\$cand" && break
-done
-if [ -n "\$ALEMBIC_BIN" ]; then
-  ( cd "\$VPS_PATH" && "\$ALEMBIC_BIN" upgrade head 2>&1 | tail -3 ) || \\
-    echo "  [warn] alembic upgrade failed — backend schema may be stale"
-  ALEMBIC_CURRENT=\$( cd "\$VPS_PATH" && "\$ALEMBIC_BIN" current 2>/dev/null | tail -1 )
-  echo "  alembic current: \${ALEMBIC_CURRENT:-unknown}"
-else
-  echo "  [warn] alembic not found in .venv/ or venv/ — apply migrations manually!"
-fi
-
-# ── 2.5 Build all workspace packages (force — no cache) ──────────────────
-section "Building workspace packages (--force)"
-NODE_OPTIONS='--max-old-space-size=1536' pnpm turbo run build \\
-  --filter='./packages/*' \\
-  --concurrency=1 \\
-  --force
-
-# ── 2.6 Build Next.js apps ───────────────────────────────────────────────
-section "Building apps/web"
-NODE_OPTIONS='--max-old-space-size=1536' pnpm --filter=web build
-
-if ! \$WEB_ONLY; then
-  section "Building apps/admin"
-  NODE_OPTIONS='--max-old-space-size=1536' pnpm --filter=admin build || \\
-    echo "[remote] admin build failed, continuing"
-fi
-
-# ── 2.7 Verify BUILD_IDs are fresh ───────────────────────────────────────
-section "Verifying fresh BUILD_IDs"
-for app in web admin; do
-  bid="\$VPS_PATH/apps/\$app/.next/BUILD_ID"
-  if [ -f "\$bid" ]; then
-    printf "  apps/%s: BUILD_ID=%s modified=%s\n" \\
-      "\$app" "\$(cat "\$bid")" "\$(stat -c '%y' "\$bid")"
-  else
-    echo "  apps/\$app: BUILD_ID missing (build failed?)"
-  fi
-done
-
-# ── 2.8 Copy static + public into Next.js standalone ─────────────────────
-# next build outputs a self-contained standalone server that does NOT
-# include .next/static or public/ by default — they must be copied manually.
-# Using rsync --delete so a rebuilt static chunk never leaves stale twins.
-section "Syncing static + public into standalone"
-for app in web admin; do
-  STANDALONE="\$VPS_PATH/apps/\$app/.next/standalone/apps/\$app"
-  if [ ! -d "\$VPS_PATH/apps/\$app/.next/standalone" ]; then
-    echo "  apps/\$app: no standalone output, skipping"
-    continue
-  fi
-  mkdir -p "\$STANDALONE/.next"
-  rsync -a --delete "\$VPS_PATH/apps/\$app/.next/static/" "\$STANDALONE/.next/static/"
-  [ -d "\$VPS_PATH/apps/\$app/public" ] && \\
-    rsync -a --delete "\$VPS_PATH/apps/\$app/public/" "\$STANDALONE/public/" || true
-  echo "  apps/\$app: standalone synced"
-done
-
-# ── 2.9 Env symlinks for standalone ──────────────────────────────────────
-section "Creating .env symlinks"
-for app in web admin; do
-  sudo ln -sf "\$VPS_PATH/.env" "\$VPS_PATH/apps/\$app/.env"
-done
-
-# ── 2.10 Hand ownership back to the service user ─────────────────────────
-section "Handing ownership back to \$APP_USER:\$APP_GROUP"
-sudo chown -R "\$APP_USER":"\$APP_GROUP" "\$VPS_PATH"
-sudo chmod 640 "\$VPS_PATH/.env"
-# Keep .git owned by the deploy user (ubuntu) so the CI auto-deploy's
-# `git fetch` can write .git/FETCH_HEAD on the next push. The service user
-# (\$APP_USER) never reads .git; only the ubuntu deploy user does. Without this,
-# a manual redeploy chowns .git to \$APP_USER and the next CI deploy fails with
-# "cannot open '.git/FETCH_HEAD': Permission denied".
-sudo chown -R ubuntu:ubuntu "\$VPS_PATH/.git" 2>/dev/null || true
-
-# ── 2.10b Fetch host-side OCR engine (gigapdf-ocr-rten binary + .rten models) ──
-# Recognition runs in the gigapdf-ocr service (PaddleOCR PP-OCR via RTen). The
-# prebuilt x86_64 binary + the 14-language model set ship as the lib's
-# "ocr-rten-v1" release asset (kept out of git). Idempotent: a SHA marker skips
-# the ~250MB re-download when nothing changed.
-section "Fetching OCR engine (gigapdf-ocr-rten)"
-OCR_REL="https://github.com/QrCommunication/gigapdf-lib/releases/download/ocr-rten-v1"
-OCR_BIN="\$VPS_PATH/bin/ocr_serve"
-OCR_MODELS_ROOT="/var/lib/gigapdf/rten-models"
-sudo mkdir -p "\$VPS_PATH/bin" "\$OCR_MODELS_ROOT"
-OCR_TMP=\$(mktemp -d)
-if curl -fsSL -o "\$OCR_TMP/gigapdf-ocr.sha256" "\$OCR_REL/gigapdf-ocr.sha256"; then
-  NEWSHA=\$(grep "gigapdf-ocr-models.tar.gz" "\$OCR_TMP/gigapdf-ocr.sha256" | awk '{print \$1}')
-  MARKER="\$OCR_MODELS_ROOT/.asset-sha"
-  if [ ! -x "\$OCR_BIN" ] || [ ! -d "\$OCR_MODELS_ROOT/models" ] || [ "\$(cat "\$MARKER" 2>/dev/null)" != "\$NEWSHA" ]; then
-    echo "  fetching OCR binary + 14-language models (~250MB) …"
-    curl -fsSL -o "\$OCR_TMP/ocr_serve" "\$OCR_REL/ocr_serve"
-    curl -fsSL -o "\$OCR_TMP/gigapdf-ocr-models.tar.gz" "\$OCR_REL/gigapdf-ocr-models.tar.gz"
-    ( cd "\$OCR_TMP" && sha256sum -c gigapdf-ocr.sha256 )
-    sudo install -m 0755 -o gigapdf -g gigapdf "\$OCR_TMP/ocr_serve" "\$OCR_BIN"
-    sudo rm -rf "\$OCR_MODELS_ROOT/models"
-    sudo tar xzf "\$OCR_TMP/gigapdf-ocr-models.tar.gz" -C "\$OCR_MODELS_ROOT"
-    sudo chown -R gigapdf:gigapdf "\$OCR_MODELS_ROOT"
-    echo "\$NEWSHA" | sudo tee "\$MARKER" >/dev/null
-    echo "  ✓ OCR engine updated"
-  else
-    echo "  ✓ OCR engine up-to-date — skipping ~250MB fetch"
-  fi
-else
-  echo "  ⚠ could not reach OCR release asset — leaving existing OCR engine in place"
-fi
-rm -rf "\$OCR_TMP"
-# Upsert the OCR env keys into .env (idempotent — never duplicates a key).
-for kv in "OCR_MODELS_DIR=/var/lib/gigapdf/rten-models/models" "OCR_BIND=127.0.0.1:8077" "OCR_SERVICE_URL=http://127.0.0.1:8077"; do
-  k="\${kv%%=*}"
-  sudo grep -q "^\$k=" "\$VPS_PATH/.env" 2>/dev/null || echo "\$kv" | sudo tee -a "\$VPS_PATH/.env" >/dev/null
-done
-# Install/refresh the systemd unit.
-if [ -f "\$VPS_PATH/deploy/systemd/gigapdf-ocr.service" ]; then
-  sudo cp "\$VPS_PATH/deploy/systemd/gigapdf-ocr.service" /etc/systemd/system/gigapdf-ocr.service
-  sudo systemctl daemon-reload
-  sudo systemctl enable gigapdf-ocr >/dev/null 2>&1 || true
-fi
-
-# ── 2.11 Restart services (api/celery first, then next-js apps) ──────────
-section "Restarting systemd services"
-if ! \$WEB_ONLY; then
-  sudo systemctl restart gigapdf-api gigapdf-celery gigapdf-celery-billing
-  # OCR loads ~250MB of models at boot; restart it here to pick up a new
-  # binary/model set or unit/env change (idempotent fetch above made it current).
-  sudo systemctl restart gigapdf-ocr 2>/dev/null || true
-  sleep 2
-fi
-sudo systemctl restart gigapdf-web gigapdf-admin
-sleep 3
-
-# ── 2.12 Report service states ───────────────────────────────────────────
-section "Service states"
-for svc in gigapdf-api gigapdf-web gigapdf-admin gigapdf-ocr gigapdf-celery gigapdf-celery-billing; do
-  printf "  %-30s %s\n" "\$svc" "\$(sudo systemctl is-active "\$svc" 2>&1 || echo unknown)"
-done
-REMOTE
-)
-
-info "Connecting to ${VPS_USER}@${VPS_HOST}"
-ssh -o StrictHostKeyChecking=accept-new "${VPS_USER}@${VPS_HOST}" "bash -s" <<EOF || fail "Remote deploy failed"
-${REMOTE_SCRIPT}
-EOF
-
-# ── 3. Smoke checks ─────────────────────────────────────────────────────────
+# ── 3. Smoke checks ──────────────────────────────────────────────────────────
 info "Smoke-testing public endpoints"
 FAIL=0
-for path in "" "/pdf-worker/pdf.worker.min.mjs" "/login"; do
+# /gigapdf.wasm is the engine blob copied into public/ by apps/web's
+# postinstall — a fresh release that missed it would break the editor.
+# (The old /pdf-worker/pdf.worker.min.mjs check was a dead legacy artifact.)
+for path in "" "/gigapdf.wasm" "/login"; do
   url="https://giga-pdf.com${path}"
   code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" || echo "000")
   if [[ "$code" =~ ^(200|3[0-9]{2})$ ]]; then
@@ -326,14 +96,14 @@ for path in "" "/pdf-worker/pdf.worker.min.mjs" "/login"; do
   fi
 done
 
-# Verify the freshly-deployed JS bundle by checking BUILD_ID match
-info "Verifying BUILD_ID freshness"
-LOCAL_HEAD=$(git rev-parse --short HEAD)
-REMOTE_HEAD=$(ssh "${VPS_USER}@${VPS_HOST}" "cd ${VPS_PATH} && git rev-parse --short HEAD" 2>/dev/null || echo "?")
-if [ "$LOCAL_HEAD" = "$REMOTE_HEAD" ]; then
-  ok "Remote HEAD matches local: $LOCAL_HEAD"
+info "Verifying served HEAD"
+# .release-sha (written at release creation) instead of git: the release is
+# chowned to the service user, so git as ubuntu hits "dubious ownership".
+REMOTE_HEAD=$(ssh "${VPS_USER}@${VPS_HOST}" "cat ${VPS_PATH}/current/.release-sha" 2>/dev/null || echo "?")
+if [ "$SHA" = "$REMOTE_HEAD" ]; then
+  ok "Served release HEAD matches local: ${SHA:0:7}"
 else
-  warn "Remote HEAD ($REMOTE_HEAD) differs from local ($LOCAL_HEAD)"
+  warn "Served HEAD (${REMOTE_HEAD:0:7}) differs from local (${SHA:0:7})"
   FAIL=$((FAIL + 1))
 fi
 

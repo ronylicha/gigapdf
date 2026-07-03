@@ -3,24 +3,43 @@
 #
 # INSTALL (this file is the source of truth → prod VPS):
 #   sudo install -m 0755 deploy/gigapdf-ci-deploy.sh /usr/local/bin/gigapdf-ci-deploy.sh
+# (deploy/server-deploy.sh re-installs it automatically on every deploy.)
 # The prod deploy key's authorized_keys pins:
 #   command="/usr/local/bin/gigapdf-ci-deploy.sh",no-port-forwarding,... <key>
-# so a CI push can ONLY run this script (reset to origin/main + deploy/deploy.sh).
+# so a CI push can ONLY run this script.
 #
-# prod `origin` = bare repo /opt/gigapdf-repo.git (push-production model, peut être
-# en retard). Le CI a poussé sur GitHub → on déploie depuis le remote `github`.
+# Blue/green generation: fetches github/main into the bare repo
+# (/opt/gigapdf-repo.git, fast-forward only — never rewinds a laptop push),
+# then runs deploy/server-deploy.sh from that exact commit. Zero-502 switch,
+# health gates, automatic release purge. NO chown of /opt/gigapdf, NO restart
+# of the legacy flat-clone units.
 set -euo pipefail
-cd /opt/gigapdf
-# Reclaim deployer (ubuntu) ownership BEFORE git ops. A prior MANUAL redeploy.sh
-# chowns the whole repo to the service user (gigapdf); the CI deploy runs as ubuntu,
-# so `git reset --hard` fails with "unable to unlink old '<file>': Permission denied".
-# deploy.sh's section 0.5 reclaims .turbo/.next but runs AFTER this reset (too late),
-# hence the reclaim lives here, ahead of the fetch/reset.
-echo "[ci-deploy] reclaiming deployer ownership of /opt/gigapdf"
-sudo chown -R ubuntu:ubuntu /opt/gigapdf
-echo "[ci-deploy] fetch github main"
-git fetch github main
-git reset --hard github/main
-echo "[ci-deploy] HEAD now $(git rev-parse --short HEAD)"
-echo "[ci-deploy] running deploy/deploy.sh"
-exec bash deploy/deploy.sh
+
+BARE="/opt/gigapdf-repo.git"
+SHARED_COPY="/opt/gigapdf/shared/bin/server-deploy.sh"
+GITHUB_URL="https://github.com/QrCommunication/gigapdf.git"
+
+echo "[ci-deploy] fetch github/main → bare repo (ff-only)"
+git --git-dir="$BARE" remote get-url github >/dev/null 2>&1 || \
+  git --git-dir="$BARE" remote add github "$GITHUB_URL"
+# Non-forced refspec: refuses a non-fast-forward (bare ahead of GitHub) and
+# aborts the deploy instead of silently deploying older code.
+git --git-dir="$BARE" fetch github "refs/heads/main:refs/heads/main"
+
+SHA=$(git --git-dir="$BARE" rev-parse refs/heads/main)
+echo "[ci-deploy] deploying $SHA"
+
+# Run the deploy logic from the commit being deployed; fall back to the
+# server-cached copy for commits that predate deploy/server-deploy.sh.
+TMP=$(mktemp /tmp/gigapdf-server-deploy.XXXXXX.sh)
+trap 'rm -f "$TMP"' EXIT
+if git --git-dir="$BARE" show "$SHA:deploy/server-deploy.sh" > "$TMP" 2>/dev/null; then
+  echo "[ci-deploy] using deploy/server-deploy.sh from $SHA"
+elif [ -x "$SHARED_COPY" ]; then
+  echo "[ci-deploy] commit predates server-deploy.sh — using cached $SHARED_COPY"
+  cp "$SHARED_COPY" "$TMP"
+else
+  echo "[ci-deploy] FATAL: no server-deploy.sh available (commit + cache both missing)" >&2
+  exit 1
+fi
+bash "$TMP" deploy --sha "$SHA"
