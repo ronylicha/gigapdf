@@ -2158,7 +2158,20 @@
       },
       "squiggly": "Ondulé",
       "freetext": "Texte libre",
-      "tools": "Outils"
+      "tools": "Outils",
+      "mobileTools": {
+        "title": "Tous les outils",
+        "sections": {
+          "edit": "Outils d'\u00e9dition",
+          "colors": "Couleurs",
+          "insert": "Ins\u00e9rer",
+          "annotate": "Annoter",
+          "forms": "Formulaires",
+          "document": "Document",
+          "view": "Affichage",
+          "editing": "\u00c9dition"
+        }
+      }
     },
     "tools": {
       "select": "Sélectionner",

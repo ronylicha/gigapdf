@@ -1,8 +1,19 @@
 /**
- * PDF → XLSX converter via heuristic text-block extraction.
+ * PDF → XLSX converter.
  *
  * Strategy
  * --------
+ * **Default path (no options)** — the engine's own model-based export:
+ * `doc.toXlsx()` reconstructs the PDF into the unified editable model
+ * (`reconstruct_model`) and lowers it through the same corrected exporter
+ * family as `toDocx()`/`toOdt()`. Typed tables become real rows/cells (spans
+ * merged, header rows bold) and every prose block lands as a single-cell row
+ * in reading order — so the full document text is preserved, including runs
+ * the positional heuristic below can mis-bucket or drop.
+ *
+ * **Tuned path (any option set)** — the historical pdfjs text-grid heuristic,
+ * kept because its knobs (`pages`, `yTolerance`, `xTolerance`,
+ * `separateSheets`) only make sense there:
  * 1. Extract TextBlocks with coordinates via extractTextBlocks().
  * 2. Group blocks into visual rows using a Y-band accumulation algorithm.
  * 3. Build a global column anchor list for the page by scanning all rows.
@@ -10,8 +21,8 @@
  * 5. Write the matrices to `.xlsx` via the native engine (`gridsToXlsx`), one
  *    sheet per page (configurable) — no third-party spreadsheet library.
  *
- * Limitations
- * -----------
+ * Limitations (tuned path)
+ * ------------------------
  * - Fidelity depends entirely on the structural regularity of the source PDF.
  *   Free-form layouts (multi-column articles, newsletters) will produce noisy
  *   output because text blocks are placed in reading order but may not form
@@ -95,6 +106,24 @@ export async function convertPdfToXlsx(
   buffer: Uint8Array,
   options?: ConvertPdfToXlsxOptions,
 ): Promise<Uint8Array> {
+  // Default path: the engine's model-based export (see the module doc). Only
+  // an explicitly tuned call falls through to the positional grid heuristic.
+  const tuned =
+    options !== undefined &&
+    (options.pages !== undefined ||
+      options.yTolerance !== undefined ||
+      options.xTolerance !== undefined ||
+      options.separateSheets !== undefined);
+  if (!tuned) {
+    const giga = await getEngine();
+    const doc = giga.open(buffer);
+    try {
+      return doc.toXlsx();
+    } finally {
+      doc.close();
+    }
+  }
+
   const yTolerance = options?.yTolerance ?? 3;
   const xTolerance = options?.xTolerance ?? 5;
   const separateSheets = options?.separateSheets ?? true;

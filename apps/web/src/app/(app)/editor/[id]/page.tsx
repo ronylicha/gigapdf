@@ -5517,6 +5517,23 @@ export default function EditorPage() {
         onRedactClear={handleRedactClear}
         onRedactPiiAuto={() => setShowRedactPiiDialog(true)}
         redactBusy={redactBusy}
+        // Mobile bottom-sheet "Édition" section — the SAME wiring as the
+        // EditorEditTools bar below (hidden < md), so no action is lost when
+        // the secondary bar folds away on small screens.
+        editTools={{
+          onFindReplace: () => setFindReplaceOpen(true),
+          onCopy: handleCopy,
+          onCut: handleCut,
+          onPaste: handlePaste,
+          onCopyFormat: handleCopyFormat,
+          hasSelection: selectedElementIds.length > 0,
+          canCopyFormat,
+          canPaste,
+          formatPainterArmed,
+          onToggleTableEdit: handleToggleTableEdit,
+          tableEditActive: showTableEdit,
+          tableCount: documentTables.length,
+        }}
       />
 
       {/* P7 — Édition (#83) : barre secondaire (rechercher/remplacer,
@@ -6118,13 +6135,20 @@ export default function EditorPage() {
             </>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div
+          className="flex items-center gap-2"
+          title={t("collaborators", { count: collaboratorCount })}
+        >
           <span
             className={`h-1.5 w-1.5 rounded-full ${
               isConnected ? "bg-green-500" : "bg-red-500"
             }`}
           />
-          {t("collaborators", { count: collaboratorCount })}
+          {/* Texte masqué sous md (le point de connexion + title suffisent) :
+              garde le footer sur UNE ligne à 360px. */}
+          <span className="hidden md:inline">
+            {t("collaborators", { count: collaboratorCount })}
+          </span>
         </div>
       </footer>
     </div>

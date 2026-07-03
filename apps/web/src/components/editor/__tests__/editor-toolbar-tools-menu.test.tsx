@@ -56,6 +56,22 @@ vi.mock("@giga-pdf/ui", async () => {
         { type: "button", role: "menuitem", onClick, disabled },
         children,
       ),
+    // Sheet passthroughs: the toolbar's mobile bottom-sheet imports these from
+    // the same module. Unused here (desktop default), but the shared fork
+    // (`isolate: false`) makes factory PARITY across sibling files the safe
+    // contract — see editor-toolbar-mobile-sheet.test.tsx.
+    Sheet: ({
+      open,
+      children,
+    }: {
+      open?: boolean;
+      children?: React.ReactNode;
+    }) => (open ? React.createElement(React.Fragment, null, children) : null),
+    SheetContent: ({ children }: { children?: React.ReactNode }) =>
+      React.createElement("div", { "data-testid": "mobile-tools-sheet" }, children),
+    SheetHeader: passthrough,
+    SheetTitle: ({ children }: { children?: React.ReactNode }) =>
+      React.createElement("h2", null, children),
   };
 });
 

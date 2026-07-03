@@ -39,27 +39,23 @@ export interface AddPageMenuProps {
   ) => void;
 }
 
-/** The "Add page" dropdown: format × orientation × position picker. */
-export function AddPageMenu({ onAddPage }: AddPageMenuProps) {
+export interface AddPageFormProps extends AddPageMenuProps {
+  /** Called after a page is confirmed, so the host surface can close itself. */
+  onDone?: () => void;
+}
+
+/**
+ * The format × orientation × position picker FORM, extracted so the same
+ * wiring is rendered on two surfaces: inside the desktop {@link AddPageMenu}
+ * dropdown, and inline inside the mobile tools bottom-sheet.
+ */
+export function AddPageForm({ onAddPage, onDone }: AddPageFormProps) {
   const t = useTranslations("editor.addPage");
-  const [open, setOpen] = useState(false);
   const [format, setFormat] = useState<PageFormat>("a4");
   const [orientation, setOrientation] = useState<PageOrientation>("portrait");
   const [position, setPosition] = useState<AddPagePosition>("after");
   const [customWidth, setCustomWidth] = useState(595);
   const [customHeight, setCustomHeight] = useState(842);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function onDocPointerDown(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    }
-    // pointerdown couvre souris ET tactile (mousedown seul laissait le menu
-    // bloqué ouvert au doigt).
-    document.addEventListener("pointerdown", onDocPointerDown);
-    return () => document.removeEventListener("pointerdown", onDocPointerDown);
-  }, [open]);
 
   const confirm = () => {
     const custom: PageFormatPoints | undefined =
@@ -67,28 +63,12 @@ export function AddPageMenu({ onAddPage }: AddPageMenuProps) {
         ? { width: customWidth, height: customHeight }
         : undefined;
     onAddPage(format, orientation, position, custom);
-    setOpen(false);
+    onDone?.();
   };
 
   return (
-    <div className="relative" ref={ref}>
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        title={t("toolbarLabel")}
-        aria-label={t("toolbarLabel")}
-        className="flex items-center gap-0.5 rounded-lg p-2 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-      >
-        <FilePlus2 size={20} />
-        <ChevronDown size={12} />
-      </button>
-
-      {open ? (
-        <div
-          data-testid="add-page-menu"
-          className="absolute left-0 top-full z-50 mt-1 flex w-56 flex-col gap-3 rounded-lg border bg-background p-3 shadow-lg"
-        >
-          {/* Format */}
+    <div className="flex flex-col gap-3">
+      {/* Format */}
           <div className="flex flex-col gap-1.5">
             <span className="text-xs font-medium text-muted-foreground">
               {t("formatLabel")}
@@ -203,10 +183,51 @@ export function AddPageMenu({ onAddPage }: AddPageMenuProps) {
           <button
             type="button"
             onClick={confirm}
-            className="rounded bg-primary px-2 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+            className="rounded bg-primary px-2 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 pointer-coarse:min-h-11"
           >
             {t("add")}
           </button>
+    </div>
+  );
+}
+
+/** The "Add page" dropdown: trigger + {@link AddPageForm} in a popover. */
+export function AddPageMenu({ onAddPage }: AddPageMenuProps) {
+  const t = useTranslations("editor.addPage");
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDocPointerDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    // pointerdown couvre souris ET tactile (mousedown seul laissait le menu
+    // bloqué ouvert au doigt).
+    document.addEventListener("pointerdown", onDocPointerDown);
+    return () => document.removeEventListener("pointerdown", onDocPointerDown);
+  }, [open]);
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={t("toolbarLabel")}
+        aria-label={t("toolbarLabel")}
+        className="flex items-center gap-0.5 rounded-lg p-2 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+      >
+        <FilePlus2 size={20} />
+        <ChevronDown size={12} />
+      </button>
+
+      {open ? (
+        <div
+          data-testid="add-page-menu"
+          className="absolute left-0 top-full z-50 mt-1 w-56 rounded-lg border bg-background p-3 shadow-lg"
+        >
+          {/* Unmounting on close resets the picker state for each open. */}
+          <AddPageForm onAddPage={onAddPage} onDone={() => setOpen(false)} />
         </div>
       ) : null}
     </div>

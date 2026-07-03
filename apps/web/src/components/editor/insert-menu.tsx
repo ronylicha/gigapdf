@@ -57,13 +57,23 @@ export interface InsertMenuProps {
 
 type SubMenu = "table" | "shapes" | "page" | "list" | null;
 
+export interface InsertMenuItemsProps extends InsertMenuProps {
+  /**
+   * Called right before each terminal action fires, so the HOST surface can
+   * close itself (the desktop dropdown closes its popover; the mobile tools
+   * bottom-sheet dismisses). Sub-menu toggles do NOT trigger it.
+   */
+  onAction: () => void;
+}
+
 /**
- * Word-like "Insert" menu surfaced as a single toolbar cluster. Every action
+ * The Insert menu CONTENT (items + inline sub-flyouts), extracted so the SAME
+ * wiring is rendered on two surfaces: inside the desktop {@link InsertMenu}
+ * dropdown, and inline inside the mobile tools bottom-sheet. Every action
  * funnels into the editor's existing element-add / page-op / element-update
- * paths — no new save path. The dropdown and its sub-flyouts mirror the toolbar's
- * own custom `Dropdown` pattern (click-outside to close, no external menu lib).
+ * paths — no new save path.
  */
-export function InsertMenu({
+export function InsertMenuItems({
   onInsertImage,
   onInsertSvg,
   onInsertTable,
@@ -72,66 +82,24 @@ export function InsertMenu({
   onInsertBlankPage,
   onInsertList,
   hasTextSelection,
-}: InsertMenuProps) {
+  onAction,
+}: InsertMenuItemsProps) {
   const t = useTranslations("editor.insert");
-  const [open, setOpen] = useState(false);
   const [sub, setSub] = useState<SubMenu>(null);
   const [hover, setHover] = useState<{ r: number; c: number }>({ r: 0, c: 0 });
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    function handleClickOutside(event: MouseEvent) {
-      if (
-        containerRef.current &&
-        !containerRef.current.contains(event.target as Node)
-      ) {
-        setOpen(false);
-        setSub(null);
-      }
-    }
-    // pointerdown couvre souris ET tactile (fermeture au doigt).
-    document.addEventListener("pointerdown", handleClickOutside);
-    return () => document.removeEventListener("pointerdown", handleClickOutside);
-  }, [open]);
 
   const close = () => {
-    setOpen(false);
     setSub(null);
+    onAction();
   };
 
   const itemClass =
-    "flex w-full items-center gap-2 px-2 py-1.5 rounded text-sm transition-colors hover:bg-muted text-foreground";
+    "flex w-full items-center gap-2 px-2 py-1.5 rounded text-sm transition-colors hover:bg-muted text-foreground pointer-coarse:min-h-11";
   const itemDisabledClass =
-    "flex w-full items-center gap-2 px-2 py-1.5 rounded text-sm text-muted-foreground/50 cursor-not-allowed";
+    "flex w-full items-center gap-2 px-2 py-1.5 rounded text-sm text-muted-foreground/50 cursor-not-allowed pointer-coarse:min-h-11";
 
   return (
-    <div className="relative" ref={containerRef}>
-      <button
-        type="button"
-        title={t("menu")}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        onClick={() => {
-          setOpen((v) => !v);
-          setSub(null);
-        }}
-        className={`p-2 rounded-lg transition-colors flex items-center gap-0.5 ${
-          open
-            ? "bg-muted text-foreground"
-            : "hover:bg-muted text-muted-foreground hover:text-foreground"
-        }`}
-      >
-        <Plus size={20} />
-        <ChevronDown size={12} />
-      </button>
-
-      {open ? (
-        <div
-          role="menu"
-          className="absolute top-full left-0 mt-1 bg-background border rounded-lg shadow-lg p-2 z-50 min-w-[200px]"
-        >
-          <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-1">
             {/* Image */}
             <button
               type="button"
@@ -364,7 +332,61 @@ export function InsertMenu({
                 </div>
               ) : null}
             </div>
-          </div>
+    </div>
+  );
+}
+
+/**
+ * Word-like "Insert" menu surfaced as a single toolbar cluster. The dropdown
+ * mirrors the toolbar's own custom `Dropdown` pattern (click-outside to close,
+ * no external menu lib) and renders {@link InsertMenuItems} — the same content
+ * the mobile tools bottom-sheet reuses inline.
+ */
+export function InsertMenu(props: InsertMenuProps) {
+  const t = useTranslations("editor.insert");
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClickOutside(event: MouseEvent) {
+      if (
+        containerRef.current &&
+        !containerRef.current.contains(event.target as Node)
+      ) {
+        setOpen(false);
+      }
+    }
+    // pointerdown couvre souris ET tactile (fermeture au doigt).
+    document.addEventListener("pointerdown", handleClickOutside);
+    return () => document.removeEventListener("pointerdown", handleClickOutside);
+  }, [open]);
+
+  return (
+    <div className="relative" ref={containerRef}>
+      <button
+        type="button"
+        title={t("menu")}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={`p-2 rounded-lg transition-colors flex items-center gap-0.5 ${
+          open
+            ? "bg-muted text-foreground"
+            : "hover:bg-muted text-muted-foreground hover:text-foreground"
+        }`}
+      >
+        <Plus size={20} />
+        <ChevronDown size={12} />
+      </button>
+
+      {open ? (
+        <div
+          role="menu"
+          className="absolute top-full left-0 mt-1 bg-background border rounded-lg shadow-lg p-2 z-50 min-w-[200px]"
+        >
+          {/* Unmounting on close resets the sub-flyout state for each open. */}
+          <InsertMenuItems {...props} onAction={() => setOpen(false)} />
         </div>
       ) : null}
     </div>

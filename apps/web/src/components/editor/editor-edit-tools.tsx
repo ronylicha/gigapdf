@@ -107,7 +107,10 @@ export function EditorEditTools({
   return (
     // flex-wrap: same non-negotiable rule as the main toolbar — fold onto
     // extra rows, never overflow. No overflow-x on this bar either.
-    <div className="flex flex-wrap items-center gap-x-1 gap-y-1 pointer-coarse:gap-x-2 pointer-coarse:gap-y-2 px-3 py-1.5 border-b border-border bg-background/60">
+    // Hidden below md: on mobile these actions are served from the "Édition"
+    // section of the toolbar's tools bottom-sheet (same handlers) so the
+    // chrome stays a single compact row.
+    <div className="hidden md:flex flex-wrap items-center gap-x-1 gap-y-1 pointer-coarse:gap-x-2 pointer-coarse:gap-y-2 px-3 py-1.5 border-b border-border bg-background/60">
       <ToolButton
         icon={<Replace size={18} />}
         label={t("findReplace.open")}

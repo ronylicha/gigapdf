@@ -92,6 +92,13 @@ import {
   Presentation,
   Grid2x2,
   Wrench,
+  LayoutGrid,
+  Replace,
+  ClipboardCopy,
+  ClipboardPaste,
+  Paintbrush,
+  Table,
+  FilePlus2,
   type LucideIcon,
 } from "lucide-react";
 import { MergeDialog } from "./merge-dialog";
@@ -113,14 +120,20 @@ import {
   FormattingToolbar,
   type HeaderFooterToolbarContext,
 } from "./formatting-toolbar";
-import { InsertMenu } from "./insert-menu";
+import { InsertMenu, InsertMenuItems } from "./insert-menu";
 import {
   InsertLinkDialog,
   type InsertLinkValue,
 } from "./insert-link-dialog";
 import { InsertSvgDialog, type InsertSvgValue } from "./insert-svg-dialog";
 import { HeaderFooterPageSetup } from "./header-footer-page-setup";
-import { AddPageMenu } from "./add-page-menu";
+import { AddPageMenu, AddPageForm } from "./add-page-menu";
+import {
+  MobileToolsSheet,
+  type MobileToolEntry,
+  type MobileToolsSection,
+} from "./mobile-tools-sheet";
+import { useIsMobile } from "@/hooks/use-media-query";
 import type {
   PageFormat,
   PageOrientation,
@@ -412,6 +425,27 @@ export interface EditorToolbarProps {
   /** Discard every redaction zone drawn on the active page without applying. */
   onRedactClear?: () => void;
   /**
+   * P7 edit-tools handlers (find & replace, clipboard, format painter, table
+   * edit) — the SAME wiring page.tsx gives {@link EditorEditTools}. On mobile
+   * (< md) that secondary bar is hidden and these actions are served from the
+   * "Édition" section of the mobile tools bottom-sheet instead. Optional so
+   * hosts that don't render the edit-tools bar stay unaffected.
+   */
+  editTools?: {
+    onFindReplace: () => void;
+    onCopy: () => void;
+    onCut: () => void;
+    onPaste: () => void;
+    onCopyFormat: () => void;
+    hasSelection: boolean;
+    canCopyFormat: boolean;
+    canPaste: boolean;
+    formatPainterArmed: boolean;
+    onToggleTableEdit?: () => void;
+    tableEditActive?: boolean;
+    tableCount?: number;
+  };
+  /**
    * Auto-detect PII (emails / phones / IBANs / cards / FR SSN·SIREN) across the
    * document and open the confirmation dialog before redacting.
    */
@@ -460,8 +494,49 @@ function ToolButton({
   );
 }
 
-function Separator() {
-  return <div className="w-px h-6 bg-border mx-1" />;
+function Separator({ className = "" }: { className?: string }) {
+  return <div className={`w-px h-6 bg-border mx-1 ${className}`.trim()} />;
+}
+
+/**
+ * "Add page" accordion for the mobile tools sheet: expands the SAME
+ * {@link AddPageForm} the desktop AddPageMenu popover renders (no absolute
+ * positioning — inline expansion, so the sheet's overflow-y never clips it).
+ */
+function MobileAddPageAccordion({
+  label,
+  onAddPage,
+  onDone,
+}: {
+  label: string;
+  onAddPage: NonNullable<EditorToolbarProps["onAddPageFormat"]>;
+  onDone: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-1 rounded-lg border">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className="flex min-h-11 w-full cursor-pointer items-center justify-between gap-2 px-3 py-2 text-sm transition-colors hover:bg-muted"
+      >
+        <span className="flex items-center gap-2">
+          <FilePlus2 size={16} />
+          {label}
+        </span>
+        <ChevronDown
+          size={14}
+          className={`transition-transform duration-150 ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+      {open ? (
+        <div className="border-t p-3">
+          <AddPageForm onAddPage={onAddPage} onDone={onDone} />
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 interface DropdownProps {
@@ -706,6 +781,7 @@ export function EditorToolbar({
   onRedactClear,
   onRedactPiiAuto,
   redactBusy = false,
+  editTools,
 }: EditorToolbarProps) {
   const t = useTranslations("editor.toolbar");
   const tProperties = useTranslations("editor.properties.text");
@@ -714,6 +790,14 @@ export function EditorToolbar({
   const tPageLabels = useTranslations("editor.pageLabels");
   const tPresentation = useTranslations("editor.presentation");
   const tImposition = useTranslations("editor.imposition");
+  const tEditTools = useTranslations("editor.editTools");
+  const tTableEdit = useTranslations("editor.tableEdit");
+  const tAddPage = useTranslations("editor.addPage");
+  // Mobile (< md) — the toolbar collapses to ONE compact primary row and the
+  // full tool catalogue moves into a bottom-sheet (Adobe-mobile pattern). The
+  // hook defaults to desktop at SSR/jsdom, so the sheet is a mobile-only tree.
+  const isMobile = useIsMobile();
+  const [showMobileTools, setShowMobileTools] = useState(false);
   const [showShapeDropdown, setShowShapeDropdown] = useState(false);
   const [showAnnotationDropdown, setShowAnnotationDropdown] = useState(false);
   const [showFieldDropdown, setShowFieldDropdown] = useState(false);
@@ -945,11 +1029,354 @@ export function EditorToolbar({
         : []),
   ];
 
+  // ---------------------------------------------------------------------
+  // Mobile bottom-sheet sections (< md). Built ONLY on mobile: every entry
+  // wraps the SAME handler as its desktop button/dropdown twin and then
+  // dismisses the sheet (contextual pickers like colours stay open).
+  // ---------------------------------------------------------------------
+  const closeMobileTools = () => setShowMobileTools(false);
+  /** Run a desktop handler then dismiss the sheet (select-and-close UX). */
+  const sheetAction = (fn: () => void) => () => {
+    fn();
+    closeMobileTools();
+  };
+
+  const mobileSections: MobileToolsSection[] = !isMobile
+    ? []
+    : (() => {
+        const editEntries: MobileToolEntry[] = [
+          {
+            key: "image",
+            icon: <Image size={20} />,
+            label: t("image"),
+            isActive: activeTool === "image",
+            onSelect: sheetAction(() => {
+              onToolChange("image");
+              onAddImage?.();
+            }),
+          },
+          {
+            key: "insertSignature",
+            icon: <Signature size={20} />,
+            label: t("insertSignature"),
+            onSelect: sheetAction(() => onInsertSignature?.()),
+          },
+          ...shapes.map(({ type, icon, labelKey }) => ({
+            key: `shape-${type}`,
+            icon,
+            label: t(labelKey),
+            isActive: activeTool === "shape" && shapeType === type,
+            onSelect: sheetAction(() => {
+              onShapeTypeChange?.(type);
+              onToolChange("shape");
+            }),
+          })),
+          {
+            key: "contentEdit",
+            icon: <SquareDashedMousePointer size={20} />,
+            label: t("contentEdit"),
+            ...(isContentEditActive !== undefined
+              ? { isActive: isContentEditActive }
+              : {}),
+            onSelect: sheetAction(() => onToggleContentEdit?.()),
+          },
+        ];
+
+        const annotateEntries: MobileToolEntry[] = [
+          ...annotations.map(({ type, icon, labelKey }) => ({
+            key: `annotation-${type}`,
+            icon,
+            label: t(labelKey),
+            isActive: activeTool === "annotation" && annotationType === type,
+            onSelect: sheetAction(() => {
+              onAnnotationTypeChange?.(type);
+              onToolChange("annotation");
+            }),
+          })),
+          {
+            key: "draw",
+            icon: <PenTool size={20} />,
+            label: t("draw"),
+            isActive: activeTool === "draw",
+            onSelect: sheetAction(() => onToolChange("draw")),
+          },
+          ...(onRedactApply
+            ? [
+                {
+                  key: "redact",
+                  icon: <Eraser size={20} />,
+                  label: t("redact"),
+                  isActive: activeTool === "redact",
+                  onSelect: sheetAction(() => onToolChange("redact")),
+                },
+              ]
+            : []),
+        ];
+
+        const formEntries: MobileToolEntry[] = fieldKinds.map(
+          ({ kind, icon, labelKey }) => ({
+            key: `field-${kind}`,
+            icon,
+            label: t(labelKey),
+            isActive: activeTool === "form_field" && fieldKind === kind,
+            onSelect: sheetAction(() => {
+              onFieldKindChange?.(kind);
+              onToolChange("form_field");
+            }),
+          }),
+        );
+
+        const documentEntries: MobileToolEntry[] = pdfToolItems.map(
+          ({ key, icon: Icon, label, onSelect, disabled, isActive }) => ({
+            key,
+            icon: <Icon size={20} />,
+            label,
+            ...(disabled !== undefined ? { disabled } : {}),
+            ...(isActive !== undefined ? { isActive } : {}),
+            onSelect: sheetAction(onSelect),
+          }),
+        );
+
+        const viewEntries: MobileToolEntry[] = [
+          ...(onViewModeChange
+            ? [
+                {
+                  key: "viewSingle",
+                  icon: <RectangleVertical size={20} />,
+                  label: t("viewModeSingle"),
+                  isActive: viewMode === "single",
+                  onSelect: sheetAction(() => onViewModeChange("single")),
+                },
+                {
+                  key: "viewContinuous",
+                  icon: <Rows3 size={20} />,
+                  label: t("viewModeContinuous"),
+                  isActive: viewMode === "continuous",
+                  onSelect: sheetAction(() => onViewModeChange("continuous")),
+                },
+              ]
+            : []),
+          ...(onToggleRulers
+            ? [
+                {
+                  key: "rulers",
+                  icon: <Ruler size={20} />,
+                  label: t("rulersAndMargins"),
+                  isActive: showRulers,
+                  onSelect: sheetAction(() => onToggleRulers()),
+                },
+              ]
+            : []),
+          ...(showRulers && onRulerUnitChange
+            ? [
+                {
+                  key: "rulerUnit",
+                  icon: (
+                    <span className="text-xs font-medium uppercase">
+                      {rulerUnit}
+                    </span>
+                  ),
+                  label: t("rulerUnit"),
+                  // Cycles the unit in place — the sheet stays open on purpose.
+                  onSelect: () => onRulerUnitChange(nextRulerUnit(rulerUnit)),
+                },
+              ]
+            : []),
+          ...(onFitPage
+            ? [
+                {
+                  key: "fitPage",
+                  icon: <Maximize size={20} />,
+                  label: t("fitPage"),
+                  isActive: fitMode === "page",
+                  onSelect: sheetAction(() => onFitPage()),
+                },
+              ]
+            : []),
+          ...(onFitWidth
+            ? [
+                {
+                  key: "fitWidth",
+                  icon: <MoveHorizontal size={20} />,
+                  label: t("fitWidth"),
+                  isActive: fitMode === "width",
+                  onSelect: sheetAction(() => onFitWidth()),
+                },
+              ]
+            : []),
+        ];
+
+        const editingEntries: MobileToolEntry[] = editTools
+          ? [
+              {
+                key: "findReplace",
+                icon: <Replace size={20} />,
+                label: tEditTools("findReplace.open"),
+                onSelect: sheetAction(editTools.onFindReplace),
+              },
+              {
+                key: "copy",
+                icon: <ClipboardCopy size={20} />,
+                label: tEditTools("clipboard.copy"),
+                disabled: !editTools.hasSelection,
+                onSelect: sheetAction(editTools.onCopy),
+              },
+              {
+                key: "cut",
+                icon: <Scissors size={20} />,
+                label: tEditTools("clipboard.cut"),
+                disabled: !editTools.hasSelection,
+                onSelect: sheetAction(editTools.onCut),
+              },
+              {
+                key: "paste",
+                icon: <ClipboardPaste size={20} />,
+                label: tEditTools("clipboard.paste"),
+                disabled: !editTools.canPaste,
+                onSelect: sheetAction(editTools.onPaste),
+              },
+              {
+                key: "formatPainter",
+                icon: <Paintbrush size={20} />,
+                label: editTools.formatPainterArmed
+                  ? tEditTools("formatPainter.applyHint")
+                  : tEditTools("formatPainter.copy"),
+                disabled:
+                  !editTools.formatPainterArmed && !editTools.canCopyFormat,
+                isActive: editTools.formatPainterArmed,
+                onSelect: sheetAction(editTools.onCopyFormat),
+              },
+              ...(editTools.onToggleTableEdit
+                ? [
+                    {
+                      key: "tableEdit",
+                      icon: <Table size={20} />,
+                      label:
+                        editTools.tableCount && editTools.tableCount > 0
+                          ? tTableEdit("toggle", {
+                              count: editTools.tableCount,
+                            })
+                          : tTableEdit("toggleNone"),
+                      disabled:
+                        !editTools.tableCount || editTools.tableCount === 0,
+                      ...(editTools.tableEditActive !== undefined
+                        ? { isActive: editTools.tableEditActive }
+                        : {}),
+                      onSelect: sheetAction(() =>
+                        editTools.onToggleTableEdit?.(),
+                      ),
+                    },
+                  ]
+                : []),
+            ]
+          : [];
+
+        return [
+          { key: "edit", title: t("mobileTools.sections.edit"), entries: editEntries },
+          {
+            key: "colors",
+            title: t("mobileTools.sections.colors"),
+            content: (
+              <div className="flex flex-col gap-4 px-1 pt-1">
+                <ColorPicker
+                  color={strokeColor}
+                  onChange={(color) => onStrokeColorChange?.(color)}
+                  label={t("strokeColor")}
+                />
+                <ColorPicker
+                  color={fillColor}
+                  onChange={(color) => onFillColorChange?.(color)}
+                  label={t("fillColor")}
+                />
+                <div className="flex flex-col gap-2">
+                  <label className="text-xs text-muted-foreground">
+                    {t("strokeWidth")}
+                  </label>
+                  <input
+                    type="range"
+                    min="1"
+                    max="10"
+                    value={strokeWidth}
+                    onChange={(e) =>
+                      onStrokeWidthChange?.(parseInt(e.target.value, 10))
+                    }
+                    className="w-full"
+                  />
+                  <span className="text-xs text-center">{strokeWidth}px</span>
+                </div>
+              </div>
+            ),
+          },
+          {
+            key: "insert",
+            title: t("mobileTools.sections.insert"),
+            content: (
+              <div className="flex flex-col gap-1">
+                <InsertMenuItems
+                  onInsertImage={() => onAddImage?.()}
+                  onInsertSvg={() => setShowSvgDialog(true)}
+                  onInsertTable={(rows, cols) => onInsertTable?.(rows, cols)}
+                  onInsertShape={(shape) => {
+                    onShapeTypeChange?.(shape);
+                    onToolChange("shape");
+                  }}
+                  onInsertLink={() => setShowLinkDialog(true)}
+                  onInsertBlankPage={(position) =>
+                    onInsertBlankPage?.(position)
+                  }
+                  onInsertList={(kind) => onInsertList?.(kind)}
+                  hasTextSelection={(selectedTextElements?.length ?? 0) === 1}
+                  onAction={closeMobileTools}
+                />
+                {onAddPageFormat ? (
+                  <MobileAddPageAccordion
+                    label={tAddPage("toolbarLabel")}
+                    onAddPage={onAddPageFormat}
+                    onDone={closeMobileTools}
+                  />
+                ) : null}
+              </div>
+            ),
+          },
+          {
+            key: "annotate",
+            title: t("mobileTools.sections.annotate"),
+            entries: annotateEntries,
+          },
+          {
+            key: "forms",
+            title: t("mobileTools.sections.forms"),
+            entries: formEntries,
+          },
+          {
+            key: "document",
+            title: t("mobileTools.sections.document"),
+            entries: documentEntries,
+          },
+          { key: "view", title: t("mobileTools.sections.view"), entries: viewEntries },
+          ...(editingEntries.length > 0
+            ? [
+                {
+                  key: "editing",
+                  title: t("mobileTools.sections.editing"),
+                  entries: editingEntries,
+                },
+              ]
+            : []),
+        ];
+      })();
+
   return (
     // flex-wrap (NON-NEGOTIABLE): the toolbar folds onto extra rows instead of
     // overflowing off-screen. NEVER add overflow-x-auto/overflow-hidden here —
     // the home-made dropdowns are absolutely positioned and would be clipped.
-    <div className="editor-toolbar flex flex-wrap items-center gap-x-1 gap-y-1 pointer-coarse:gap-x-2 pointer-coarse:gap-y-2 p-2 bg-background border-b">
+    // Below md the bar collapses to ONE compact primary row (select/hand/text,
+    // Fill & Sign, undo/redo + the "Tools" bottom-sheet opener): tighter
+    // paddings/gaps keep seven 44px targets within 360px; every secondary
+    // group is `hidden md:*` and lives in the bottom-sheet instead. Contextual
+    // clusters (text formatting, selection actions, redact apply) stay
+    // rendered at every size and may wrap temporarily — that is intended.
+    <div className="editor-toolbar flex flex-wrap items-center gap-x-1 gap-y-1 md:pointer-coarse:gap-x-2 md:pointer-coarse:gap-y-2 px-1 py-0.5 md:p-2 bg-background border-b">
       {/* Undo/Redo */}
       <ToolButton
         icon={<Undo2 size={20} />}
@@ -964,7 +1391,7 @@ export function EditorToolbar({
         disabled={!canRedo}
       />
 
-      <Separator />
+      <Separator className="hidden md:block" />
 
       {/* Outils de base */}
       {basicTools.map(({ tool, icon, labelKey }) => (
@@ -977,18 +1404,20 @@ export function EditorToolbar({
         />
       ))}
 
-      {/* Outil Image avec upload */}
-      <ToolButton
-        icon={<Image size={20} />}
-        label={t("image")}
-        isActive={activeTool === "image"}
-        onClick={() => {
-          onToolChange("image");
-          onAddImage?.();
-        }}
-      />
+      {/* Outil Image avec upload — replié dans le bottom-sheet sous md. */}
+      <span className="hidden md:contents">
+        <ToolButton
+          icon={<Image size={20} />}
+          label={t("image")}
+          isActive={activeTool === "image"}
+          onClick={() => {
+            onToolChange("image");
+            onAddImage?.();
+          }}
+        />
+      </span>
 
-      <Separator />
+      <Separator className="hidden md:block" />
 
       {/* Remplir & Signer (mode Adobe : remplissage des champs + signature) */}
       <ToolButton
@@ -1000,16 +1429,19 @@ export function EditorToolbar({
           onFillSign?.();
         }}
       />
-      <ToolButton
-        icon={<Signature size={20} />}
-        label={t("insertSignature")}
-        onClick={() => onInsertSignature?.()}
-      />
+      {/* Insertion de signature — repliée dans le bottom-sheet sous md. */}
+      <span className="hidden md:contents">
+        <ToolButton
+          icon={<Signature size={20} />}
+          label={t("insertSignature")}
+          onClick={() => onInsertSignature?.()}
+        />
+      </span>
 
-      <Separator />
+      <Separator className="hidden md:block" />
 
-      {/* Formes avec dropdown */}
-      <div className="relative">
+      {/* Formes avec dropdown — replié dans le bottom-sheet sous md. */}
+      <div className="relative hidden md:block">
         <ToolButton
           icon={currentShapeIcon}
           label={t("shape")}
@@ -1050,8 +1482,8 @@ export function EditorToolbar({
         </Dropdown>
       </div>
 
-      {/* Annotations avec dropdown */}
-      <div className="relative">
+      {/* Annotations avec dropdown — replié dans le bottom-sheet sous md. */}
+      <div className="relative hidden md:block">
         <ToolButton
           icon={currentAnnotationIcon}
           label={t("annotation")}
@@ -1233,8 +1665,9 @@ export function EditorToolbar({
         </>
       )}
 
-      {/* Champ de formulaire avec dropdown (text/checkbox/radio/dropdown) */}
-      <div className="relative">
+      {/* Champ de formulaire avec dropdown (text/checkbox/radio/dropdown) —
+          replié dans le bottom-sheet sous md (section Formulaires). */}
+      <div className="relative hidden md:block">
         <ToolButton
           icon={<FileText size={20} />}
           label={t("formField") || "Champ"}
@@ -1276,28 +1709,31 @@ export function EditorToolbar({
         </Dropdown>
       </div>
 
-      {/* Insert menu (Word-like): image, table, shapes, link, page, list */}
-      <InsertMenu
-        onInsertImage={() => onAddImage?.()}
-        onInsertSvg={() => setShowSvgDialog(true)}
-        onInsertTable={(rows, cols) => onInsertTable?.(rows, cols)}
-        onInsertShape={(shape) => {
-          onShapeTypeChange?.(shape);
-          onToolChange("shape");
-        }}
-        onInsertLink={() => setShowLinkDialog(true)}
-        onInsertBlankPage={(position) => onInsertBlankPage?.(position)}
-        onInsertList={(kind) => onInsertList?.(kind)}
-        hasTextSelection={(selectedTextElements?.length ?? 0) === 1}
-      />
+      {/* Insert menu (Word-like): image, table, shapes, link, page, list —
+          replié dans le bottom-sheet sous md (section Insérer, mêmes items). */}
+      <span className="hidden md:contents">
+        <InsertMenu
+          onInsertImage={() => onAddImage?.()}
+          onInsertSvg={() => setShowSvgDialog(true)}
+          onInsertTable={(rows, cols) => onInsertTable?.(rows, cols)}
+          onInsertShape={(shape) => {
+            onShapeTypeChange?.(shape);
+            onToolChange("shape");
+          }}
+          onInsertLink={() => setShowLinkDialog(true)}
+          onInsertBlankPage={(position) => onInsertBlankPage?.(position)}
+          onInsertList={(kind) => onInsertList?.(kind)}
+          hasTextSelection={(selectedTextElements?.length ?? 0) === 1}
+        />
 
-      {/* SL4 — Word-like "Add page" picker (format × orientation × position). */}
-      {onAddPageFormat ? <AddPageMenu onAddPage={onAddPageFormat} /> : null}
+        {/* SL4 — Word-like "Add page" picker (format × orientation × position). */}
+        {onAddPageFormat ? <AddPageMenu onAddPage={onAddPageFormat} /> : null}
+      </span>
 
-      <Separator />
+      <Separator className="hidden md:block" />
 
-      {/* Color Picker */}
-      <div className="relative">
+      {/* Color Picker — replié dans le bottom-sheet sous md (section Couleurs). */}
+      <div className="relative hidden md:block">
         <ToolButton
           icon={
             <div className="relative">
@@ -1347,7 +1783,7 @@ export function EditorToolbar({
         </Dropdown>
       </div>
 
-      <Separator />
+      <Separator className="hidden md:block" />
 
       {/* Font controls (visible only for text elements) */}
       {selectedElement?.type === "text" && onElementStyleChange && (
@@ -1377,7 +1813,7 @@ export function EditorToolbar({
                 }
                 onElementStyleChange(selectedElement.elementId, patch);
               }}
-              className="h-8 w-[160px]"
+              className="h-8 w-[130px] md:w-[160px]"
               placeholder={tProperties("fontFamily")}
             />
             <select
@@ -1522,10 +1958,11 @@ export function EditorToolbar({
       )}
 
       {/* View mode — défilement continu (toutes les pages) vs page unique.
-          Anchored to the right cluster (ml-auto) just before the zoom group. */}
+          Anchored to the right cluster (ml-auto) just before the zoom group.
+          Replié dans le bottom-sheet sous md (section Affichage). */}
       {onViewModeChange && (
         <>
-          <div className="ml-auto flex items-center gap-1">
+          <div className="ml-auto hidden items-center gap-1 md:flex">
             <ToolButton
               icon={<RectangleVertical size={20} />}
               label={t("viewModeSingle")}
@@ -1539,7 +1976,7 @@ export function EditorToolbar({
               onClick={() => onViewModeChange("continuous")}
             />
           </div>
-          <Separator />
+          <Separator className="hidden md:block" />
         </>
       )}
 
@@ -1551,7 +1988,7 @@ export function EditorToolbar({
       {onToggleRulers && (
         <>
           <div
-            className={`flex items-center gap-1 ${onViewModeChange ? "" : "ml-auto"}`}
+            className={`hidden items-center gap-1 md:flex ${onViewModeChange ? "" : "ml-auto"}`}
           >
             <ToolButton
               icon={<Ruler size={20} />}
@@ -1571,7 +2008,7 @@ export function EditorToolbar({
               />
             ) : null}
           </div>
-          <Separator />
+          <Separator className="hidden md:block" />
         </>
       )}
 
@@ -1580,8 +2017,10 @@ export function EditorToolbar({
           un zoom arbitraire issu de la molette ou d'un mode fit). `ml-auto`
           ancre le cluster à droite quand le toggle de vue est absent ; quand
           il est présent, le toggle (ml-auto, en premier) gagne l'espace et le
-          zoom se cale juste après lui. */}
-      <div className="flex items-center gap-1 ml-auto">
+          zoom se cale juste après lui. Sous md le cluster disparaît : le pill
+          flottant MobileZoomControls (±, %, cycle fit) prend le relais et les
+          ajustements fit page/largeur restent dans le bottom-sheet. */}
+      <div className="hidden items-center gap-1 ml-auto md:flex">
         <ToolButton
           icon={<ZoomOut size={20} />}
           label={t("zoomOut")}
@@ -1671,13 +2110,15 @@ export function EditorToolbar({
         />
       </div>
 
-      {/* Content Edit Mode */}
-      <ToolButton
-        icon={<SquareDashedMousePointer size={20} />}
-        label={t("contentEdit")}
-        isActive={isContentEditActive}
-        onClick={() => onToggleContentEdit?.()}
-      />
+      {/* Content Edit Mode — replié dans le bottom-sheet sous md. */}
+      <span className="hidden md:contents">
+        <ToolButton
+          icon={<SquareDashedMousePointer size={20} />}
+          label={t("contentEdit")}
+          isActive={isContentEditActive}
+          onClick={() => onToggleContentEdit?.()}
+        />
+      </span>
 
       {/* PDF Tools — lg+ surface: the historical row of individual buttons.
           `lg:contents` keeps each button an independent flex item so the
@@ -1697,9 +2138,10 @@ export function EditorToolbar({
         ))}
       </div>
 
-      {/* PDF Tools — <lg surface: ONE collapsed "Outils" menu (same handlers,
-          icons and labels as the buttons above — no functionality removed). */}
-      <div className="flex items-center lg:hidden">
+      {/* PDF Tools — md..lg surface: ONE collapsed "Outils" menu (same
+          handlers, icons and labels as the buttons above — no functionality
+          removed). Below md the tools live in the bottom-sheet instead. */}
+      <div className="hidden items-center md:flex lg:hidden">
         <Separator />
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -1728,6 +2170,38 @@ export function EditorToolbar({
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+
+      {/* Mobile (< md) — the "Tools" bottom-sheet opener, anchored right.
+          44px target; the sheet below carries every collapsed group. */}
+      <div className="ml-auto flex items-center md:hidden">
+        <button
+          type="button"
+          data-testid="mobile-tools-open"
+          title={t("tools")}
+          aria-label={t("tools")}
+          aria-haspopup="dialog"
+          aria-expanded={showMobileTools}
+          onClick={() => setShowMobileTools(true)}
+          className={`p-2 rounded-lg transition-colors flex items-center justify-center pointer-coarse:min-h-11 pointer-coarse:min-w-11 cursor-pointer ${
+            showMobileTools
+              ? "bg-primary text-primary-foreground"
+              : "hover:bg-muted text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <LayoutGrid size={20} />
+        </button>
+      </div>
+
+      {/* Mobile tools bottom-sheet — mounted only below md (the hook defaults
+          to desktop at SSR/jsdom, so this whole tree is mobile-only). */}
+      {isMobile ? (
+        <MobileToolsSheet
+          open={showMobileTools}
+          onOpenChange={setShowMobileTools}
+          title={t("mobileTools.title")}
+          sections={mobileSections}
+        />
+      ) : null}
 
       {/* PDF operation dialogs */}
       <MergeDialog

@@ -2158,7 +2158,20 @@
       },
       "squiggly": "Squiggly",
       "freetext": "Free text",
-      "tools": "Tools"
+      "tools": "Tools",
+      "mobileTools": {
+        "title": "All tools",
+        "sections": {
+          "edit": "Edit tools",
+          "colors": "Colors",
+          "insert": "Insert",
+          "annotate": "Annotate",
+          "forms": "Forms",
+          "document": "Document",
+          "view": "View",
+          "editing": "Editing"
+        }
+      }
     },
     "tools": {
       "select": "Select",

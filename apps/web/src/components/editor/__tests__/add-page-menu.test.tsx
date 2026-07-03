@@ -9,10 +9,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 
-// next-intl mock: every key resolves to its own path, so labels are queryable
-// ("format.a4", "orientation.landscape", "add", …).
+// next-intl mock: namespaced (same factory SHAPE as the editor-toolbar test
+// files — the shared fork, `isolate: false`, caches the real add-page-menu
+// module across files, so every file that evaluates it must agree on the
+// next-intl mock). Labels stay queryable ("editor.addPage.format.a4", …).
 vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
+  useTranslations: (ns: string) => (key: string) => `${ns}.${key}`,
 }));
 
 import { AddPageMenu } from "../add-page-menu";
@@ -25,9 +27,9 @@ describe("AddPageMenu", () => {
     render(<AddPageMenu onAddPage={onAddPage} />);
 
     // Open the menu, then confirm with the default selection.
-    fireEvent.click(screen.getByLabelText("toolbarLabel"));
+    fireEvent.click(screen.getByLabelText("editor.addPage.toolbarLabel"));
     expect(screen.getByTestId("add-page-menu")).toBeInTheDocument();
-    fireEvent.click(screen.getByText("add"));
+    fireEvent.click(screen.getByText("editor.addPage.add"));
 
     expect(onAddPage).toHaveBeenCalledWith("a4", "portrait", "after", undefined);
   });
@@ -36,11 +38,11 @@ describe("AddPageMenu", () => {
     const onAddPage = vi.fn();
     render(<AddPageMenu onAddPage={onAddPage} />);
 
-    fireEvent.click(screen.getByLabelText("toolbarLabel"));
-    fireEvent.click(screen.getByText("format.a3"));
-    fireEvent.click(screen.getByText("orientation.landscape"));
-    fireEvent.click(screen.getByText("position.end"));
-    fireEvent.click(screen.getByText("add"));
+    fireEvent.click(screen.getByLabelText("editor.addPage.toolbarLabel"));
+    fireEvent.click(screen.getByText("editor.addPage.format.a3"));
+    fireEvent.click(screen.getByText("editor.addPage.orientation.landscape"));
+    fireEvent.click(screen.getByText("editor.addPage.position.end"));
+    fireEvent.click(screen.getByText("editor.addPage.add"));
 
     expect(onAddPage).toHaveBeenCalledWith("a3", "landscape", "end", undefined);
   });
@@ -49,15 +51,15 @@ describe("AddPageMenu", () => {
     const onAddPage = vi.fn();
     render(<AddPageMenu onAddPage={onAddPage} />);
 
-    fireEvent.click(screen.getByLabelText("toolbarLabel"));
-    fireEvent.click(screen.getByText("format.custom"));
-    fireEvent.change(screen.getByLabelText("customWidth"), {
+    fireEvent.click(screen.getByLabelText("editor.addPage.toolbarLabel"));
+    fireEvent.click(screen.getByText("editor.addPage.format.custom"));
+    fireEvent.change(screen.getByLabelText("editor.addPage.customWidth"), {
       target: { value: "400" },
     });
-    fireEvent.change(screen.getByLabelText("customHeight"), {
+    fireEvent.change(screen.getByLabelText("editor.addPage.customHeight"), {
       target: { value: "650" },
     });
-    fireEvent.click(screen.getByText("add"));
+    fireEvent.click(screen.getByText("editor.addPage.add"));
 
     expect(onAddPage).toHaveBeenCalledWith("custom", "portrait", "after", {
       width: 400,

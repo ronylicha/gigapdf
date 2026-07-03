@@ -5,6 +5,34 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.0] - 2026-07-03
+
+### Fixed — exports keep their images and layout in every format (engine 0.116.0)
+
+- **HTML, RTF, EPUB and Markdown exports carry their images again.** A
+  serialization bug rounded the internal image identifiers in the export
+  bridge (JavaScript cannot represent 64-bit integers), so every image was
+  silently dropped — a pitch deck went from 0 to 37 images in HTML, RTF and
+  EPUB exports.
+- **Excel and ODS exports moved onto the faithful path**: typed tables with
+  merged cells, bold header rows and shading — and no more missing text
+  (names, dates and reference numbers were measurably lost by the old
+  glyph-grid conversion). PDFs without spreadsheet content get one clean
+  worksheet per page in reading order.
+- Fixed a switchover port-pairing bug in the blue/green deployment that could
+  serve editor API errors (502) for a short window around a deploy — the
+  services of each color now pair with each other explicitly, verified live
+  with a double switchover under continuous probing (zero errors).
+
+### Added — a compact mobile toolbar (the document gets the screen back)
+
+- On a phone, the editor chrome went from **~50 % of the screen to ~22 %**:
+  the toolbar becomes a single compact row (undo/redo, select, text, hand,
+  Fill & Sign) plus a **Tools button** opening a bottom sheet organised in
+  clear sections (Edit, Colours, Insert, Annotate, Forms, Document, View) —
+  every tool from the desktop toolbar, same behaviour, thumb-sized targets.
+  The desktop layout is unchanged.
+
 ## [1.23.0] - 2026-07-03
 
 ### Fixed — conversion fidelity, both directions (engine 0.115.0)

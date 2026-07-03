@@ -15,6 +15,16 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.24.0",
+    date: "2026-07-03",
+    type: "minor",
+    changes: [
+      { type: "fix", description: "Exports keep their images and layout in every format: HTML, RTF, EPUB and Markdown exports carry their images again (a serialization bug rounded the internal image identifiers — a pitch deck went from 0 to 37 images), and Excel/ODS exports moved onto the faithful path: typed tables with merged cells and header styling, no more missing names, dates or reference numbers (engine 0.116.0)." },
+      { type: "feature", description: "Compact mobile toolbar: the editor chrome drops from ~50% of a phone screen to ~22% — one row of primary tools plus a Tools button opening a bottom sheet organised in sections (Edit, Colours, Insert, Annotate, Forms, Document, View). Every desktop tool, same behaviour, thumb-sized targets. Desktop unchanged." },
+      { type: "fix", description: "Fixed a blue/green switchover port-pairing bug that could serve editor API errors (502) for a short window around a deploy — each color's services now pair explicitly, verified live with a double switchover under continuous probing (zero errors)." },
+    ],
+  },
+  {
     version: "1.23.0",
     date: "2026-07-03",
     type: "minor",

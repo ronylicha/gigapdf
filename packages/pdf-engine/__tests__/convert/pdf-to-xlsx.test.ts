@@ -122,19 +122,23 @@ describe('convertPdfToXlsx', () => {
     });
   });
 
-  // ── 3. Blank PDF (no text) → sheet with note ──────────────────────────────
+  // ── 3. Blank PDF (no text) ─────────────────────────────────────────────────
   describe('blank PDF (no text content)', () => {
-    let sheets: XlsxSheet[];
-
-    beforeAll(async () => {
-      sheets = await readSheets(await convertPdfToXlsx(loadFixture('blank-shape.pdf')));
-    });
-
-    it('returns a valid XLSX', () => {
+    it('default (model) path returns a valid workbook with no text rows', async () => {
+      // The engine's model-based export emits an honest empty sheet for a
+      // page with no textual content (no advisory note).
+      const sheets = await readSheets(await convertPdfToXlsx(loadFixture('blank-shape.pdf')));
       expect(sheets.length).toBeGreaterThanOrEqual(1);
+      expect(cellValues(sheets[0]!).join(' ')).not.toMatch(/\w{4,}/);
     });
 
-    it('sheet contains the "No text extracted" note', () => {
+    it('tuned (grid heuristic) path keeps the "No text extracted" note', async () => {
+      // Passing any tuning option routes through the historical pdfjs grid
+      // heuristic, which annotates empty pages so the sheet is self-explaining.
+      const sheets = await readSheets(
+        await convertPdfToXlsx(loadFixture('blank-shape.pdf'), { separateSheets: true }),
+      );
+      expect(sheets.length).toBeGreaterThanOrEqual(1);
       const joined = cellValues(sheets[0]!).join(' ').toLowerCase();
       expect(joined).toMatch(/no text extracted/i);
     });
