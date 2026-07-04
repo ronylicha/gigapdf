@@ -1,8 +1,8 @@
 /**
  * Export WebSocket client and hooks
  */
-export { socketClient } from './client';
-export type { SocketEvent, SocketEventData } from './client';
+export { socketClient, setAuthTokenProvider } from './client';
+export type { SocketEvent, SocketEventData, AuthTokenProvider } from './client';
 
 export {
   useSocket,

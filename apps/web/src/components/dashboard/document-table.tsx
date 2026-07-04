@@ -31,8 +31,8 @@ import {
   useToast,
 } from "@giga-pdf/ui";
 import { formatDate, formatBytes } from "@/lib/utils";
+import { FileTypeIcon } from "./file-type-icon";
 import {
-  FileText,
   Trash2,
   Download,
   Loader2,
@@ -94,6 +94,7 @@ interface Document {
   updatedAt: Date;
   folderId?: string | null;
   tags?: string[];
+  mimeType?: string | null;
 }
 
 interface FolderItem {
@@ -661,7 +662,7 @@ export function DocumentTable({
                         }
                       }}
                     >
-                      <FileText className="h-5 w-5 text-red-500" />
+                      <FileTypeIcon mimeType={doc.mimeType} name={doc.name} />
                       <span className={cn("font-medium", !selectionMode && "hover:underline")}>{doc.name}</span>
                       {loadingId === doc.id && (
                         <Loader2 className="h-4 w-4 animate-spin" />

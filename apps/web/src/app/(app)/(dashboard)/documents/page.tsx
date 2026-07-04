@@ -126,6 +126,7 @@ interface Document {
   folderId?: string | null;
   tags: string[];
   thumbnailUrl: string | null;
+  mimeType: string | null;
 }
 
 interface Folder {
@@ -529,6 +530,7 @@ export default function DocumentsPage() {
           folderId: doc.folder_id || null,
           tags: doc.tags ?? [],
           thumbnailUrl: doc.thumbnail_url ?? null,
+          mimeType: doc.mime_type ?? null,
         })
       );
 

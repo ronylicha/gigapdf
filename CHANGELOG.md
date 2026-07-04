@@ -5,6 +5,56 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.25.0] - 2026-07-04
+
+### Added — real-time collaboration
+
+- **Share a document by email.** People who already have an account get
+  instant access; others receive an invitation link and land on an acceptance
+  page. Invited collaborators with edit permission can save.
+- **Live presence.** See who else has the document open, and watch their
+  cursors and element edits appear in real time (the socket is now
+  authenticated and every collaborator joins the same shared room).
+- **Notifications bell** in the dashboard header surfaces shares and
+  invitations, with unread counts and one-click mark-as-read.
+- **Public read-only link** (`/public/<token>`) opens a document in a viewer
+  without an account; `noindex`, token never logged.
+
+### Changed — paragraph recognition
+
+- Opening a Word or PDF document no longer produces dozens of tiny
+  disconnected text boxes: related lines are grouped into editable blocks (a
+  27-page business plan dropped from 308 fragments to 197). A single click
+  selects the whole block, a second click drills into an individual run, and
+  the grouping now survives every page operation (it was previously lost on
+  the first re-parse). Table cells are banded into visual lines so a
+  "Label: value" cell is one editable unit.
+
+### Added — document library file-type icons
+
+- Each document shows a coloured icon for its type (PDF, Word, Excel,
+  PowerPoint, image, archive, EPUB, Markdown, JSON, …) across the grid, list,
+  trash, shared, and detail views.
+
+### Changed — Fill & Sign
+
+- Signature and initials are now two fully independent capture pads (drawing
+  on one no longer affects the other), each reachable directly from the
+  toolbar with one-click reuse of a saved mark. Every placed signature is
+  immediately selectable, movable and resizable on the page; a signed widget
+  no longer re-opens the capture dialog.
+
+### Changed — conversion fidelity (engine 0.117.0)
+
+- Roughly seventy two-way fidelity fixes across every supported format and the
+  HTML/CSS engine. Highlights: Word tables keep their borders and theme fonts;
+  bullet and numbered lists round-trip; Excel exports are typed; right-to-left
+  text, footnotes, chart data labels, slide backgrounds, frozen panes, tab
+  stops and rotation are preserved; `modelToPdf` and legacy `.doc/.xls/.ppt`
+  render images and full Unicode; and the HTML→PDF engine gained `var()`,
+  generated content, `@page`, `calc()`, stacking contexts, multi-column,
+  `writing-mode`, and more. Full detail in the engine's own changelog.
+
 ## [1.24.0] - 2026-07-03
 
 ### Fixed — exports keep their images and layout in every format (engine 0.116.0)

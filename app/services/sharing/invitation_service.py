@@ -49,9 +49,13 @@ class InvitationService:
         """
         Share a document by creating an invitation.
 
-        If the invitee is already a registered user, a notification is sent
-        immediately.  Otherwise the caller is responsible for sending an
-        invitation e-mail containing the returned token.
+        If the invitee is already a registered user, the share is activated
+        **immediately** (Google-Docs behaviour): a ``DocumentShare`` with
+        status ACTIVE is created, the invitation row is kept as an ACCEPTED
+        audit trace, and an in-app notification is sent.  Otherwise the
+        invitation stays PENDING and the caller is responsible for sending an
+        invitation e-mail containing the returned token (the invitee accepts
+        after signing up).
 
         Args:
             document_id: Document to share.
@@ -60,9 +64,14 @@ class InvitationService:
             permission: ``SharePermission.VIEW`` or ``SharePermission.EDIT``.
             message: Optional personal message included in the invitation.
             expires_in_days: Days until the invitation expires (default 7).
+                Only governs the acceptance window of a PENDING invitation;
+                an auto-activated share does not expire (same semantics as a
+                share created through :meth:`accept_invitation`).
 
         Returns:
-            dict: Invitation details including token, expiry and invitee info.
+            dict: Invitation details including token, expiry, invitee info
+            and — when the invitee already has an account — the ``share_id``
+            of the immediately-activated share.
 
         Raises:
             ValueError: If the document is not found, not owned by *inviter_id*,
@@ -125,7 +134,29 @@ class InvitationService:
             )
             session.add(invitation)
 
+            share_id: str | None = None
+
             if existing_user:
+                # Auto-activation: the invitee already has an account, so the
+                # share is granted immediately — no accept/decline friction.
+                # The invitation row is kept as an ACCEPTED audit trace, and
+                # (like a share created via accept_invitation) the active
+                # share itself carries no expiry.
+                invitation.status = InvitationStatus.ACCEPTED
+                invitation.responded_at = now_utc()
+
+                share_id = generate_uuid()
+                share = DocumentShare(
+                    id=share_id,
+                    document_id=document_id,
+                    shared_with_user_id=existing_user.user_id,
+                    permission=permission,
+                    created_by=inviter_id,
+                    status=ShareStatus.ACTIVE,
+                    invitation_id=invitation_id,
+                )
+                session.add(share)
+
                 notification = ShareNotification(
                     id=generate_uuid(),
                     user_id=existing_user.user_id,
@@ -133,11 +164,12 @@ class InvitationService:
                     document_id=document_id,
                     share_invitation_id=invitation_id,
                     title="Document shared with you",
-                    message=f"You have been invited to access '{document.name}'",
-                    metadata={
+                    message=f"You now have access to '{document.name}'",
+                    extra_data={
                         "document_name": document.name,
                         "inviter_id": inviter_id,
                         "permission": permission,
+                        "share_id": share_id,
                     },
                 )
                 session.add(notification)
@@ -145,11 +177,13 @@ class InvitationService:
             await session.commit()
 
             logger.info(
-                "Created share invitation %s for document %s from %s to %s",
+                "Created share invitation %s for document %s from %s to %s "
+                "(auto_activated=%s)",
                 invitation_id,
                 document_id,
                 inviter_id,
                 invitee_email,
+                share_id is not None,
             )
 
             return {
@@ -160,6 +194,7 @@ class InvitationService:
                 "permission": permission,
                 "expires_at": expires_at.isoformat(),
                 "document_name": document.name,
+                "share_id": share_id,
             }
 
     @staticmethod
@@ -234,7 +269,7 @@ class InvitationService:
                     f"{user_email} accepted your invitation to access "
                     f"'{invitation.document.name}'"
                 ),
-                metadata={
+                extra_data={
                     "document_name": invitation.document.name,
                     "accepter_email": user_email,
                     "accepter_id": user_id,
@@ -302,7 +337,7 @@ class InvitationService:
                 message=(
                     f"Your invitation to share '{invitation.document.name}' was declined"
                 ),
-                metadata={
+                extra_data={
                     "document_name": invitation.document.name,
                 },
             )
@@ -315,6 +350,73 @@ class InvitationService:
             return {
                 "invitation_id": invitation.id,
                 "status": InvitationStatus.DECLINED,
+            }
+
+    @staticmethod
+    async def get_invitation_by_token(token: str) -> dict:
+        """
+        Return the details of a share invitation identified by *token*.
+
+        Read-only: the invitation status is **not** mutated (unlike
+        :meth:`accept_invitation`, which stamps EXPIRED). An invitation past
+        its expiry date is reported with the effective status ``expired``.
+
+        Args:
+            token: Invitation token (from the invitation e-mail / URL).
+
+        Returns:
+            dict: Invitation details (document, inviter, permission, status).
+
+        Raises:
+            ValueError: If no invitation exists for *token*.
+        """
+        async with get_db_session() as session:
+            result = await session.execute(
+                select(DocumentShareInvitation)
+                .options(selectinload(DocumentShareInvitation.document))
+                .where(DocumentShareInvitation.token == token)
+            )
+            invitation = result.scalar_one_or_none()
+
+            if not invitation:
+                raise ValueError("Invitation not found")
+
+            inviter_result = await session.execute(
+                select(UserQuota).where(UserQuota.user_id == invitation.inviter_id)
+            )
+            inviter = inviter_result.scalar_one_or_none()
+
+            effective_status = invitation.status
+            if (
+                invitation.status == InvitationStatus.PENDING
+                and invitation.expires_at < now_utc()
+            ):
+                effective_status = InvitationStatus.EXPIRED
+
+            document = invitation.document
+
+            return {
+                "invitation_id": invitation.id,
+                "status": effective_status,
+                "invitee_email": invitation.invitee_email,
+                "document": {
+                    "id": document.id,
+                    "name": document.name,
+                    "page_count": document.page_count,
+                    "thumbnail_path": document.thumbnail_path,
+                },
+                "inviter": {
+                    "user_id": invitation.inviter_id,
+                    "email": inviter.email if inviter else None,
+                },
+                "permission": invitation.permission,
+                "message": invitation.message,
+                "created_at": (
+                    invitation.created_at.isoformat() if invitation.created_at else None
+                ),
+                "expires_at": (
+                    invitation.expires_at.isoformat() if invitation.expires_at else None
+                ),
             }
 
     @staticmethod

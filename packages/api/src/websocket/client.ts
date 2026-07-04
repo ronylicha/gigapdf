@@ -116,6 +116,41 @@ export interface SocketEventData {
 }
 
 /**
+ * Fournisseur de token d'authentification pour le handshake WebSocket.
+ *
+ * Le tokenStorage par défaut (localStorage) n'est jamais alimenté par
+ * apps/web : le JWT Better Auth vit EN MÉMOIRE uniquement (anti-XSS, voir
+ * apps/web/src/lib/auth-token.ts). L'app hôte installe donc un provider via
+ * setAuthTokenProvider() — la même source que l'intercepteur axios — et la
+ * callback `auth` de socket.io le ré-évalue à CHAQUE (re)connexion, ce qui
+ * couvre le refresh du token. Sans provider, fallback sur le tokenStorage
+ * historique (compat consommateurs existants).
+ */
+export type AuthTokenProvider = () => string | null | Promise<string | null>;
+
+let authTokenProvider: AuthTokenProvider | null = null;
+
+/**
+ * Installe (ou retire avec `null`) la source de token utilisée par le
+ * handshake socket.io. À appeler une fois au boot de l'app hôte.
+ */
+export function setAuthTokenProvider(provider: AuthTokenProvider | null): void {
+  authTokenProvider = provider;
+}
+
+/** Résout le token courant : provider installé, sinon tokenStorage legacy. */
+async function resolveAuthToken(): Promise<string | null> {
+  try {
+    if (authTokenProvider) {
+      return (await authTokenProvider()) ?? null;
+    }
+    return getTokenStorage().getAccessToken();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Génère un identifiant unique par onglet/instance de client.
  * Utilisé pour l'anti-écho : un client ignore les événements de collaboration
  * qui portent son propre client_id (cas d'un relay serveur sans skip_sid).
@@ -189,13 +224,18 @@ class SocketClient {
     }
 
     const config = getApiConfig();
-    const token = getTokenStorage().getAccessToken();
 
     this.socket = io(config.websocketURL, {
-      auth: {
-        token,
+      // Callback form : ré-évaluée par socket.io à chaque tentative de
+      // (re)connexion → le token est toujours frais (gère le refresh JWT).
+      auth: async (cb) => {
+        cb({ token: await resolveAuthToken() });
       },
-      transports: ['websocket', 'polling'],
+      // websocket only : le backend tourne en uvicorn multi-workers derrière
+      // nginx SANS sticky sessions. Le handshake HTTP long-polling n'est pas
+      // sticky (l'AsyncRedisManager couvre le broadcast inter-workers, pas le
+      // handshake) → un upgrade polling→websocket échoue aléatoirement.
+      transports: ['websocket'],
       reconnection: true,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,

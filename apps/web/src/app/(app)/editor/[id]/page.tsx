@@ -517,12 +517,15 @@ export default function EditorPage() {
   const fillSignActive = showFormsPanel && formsMode === "fill";
   // Rect (points PDF, repère page) du widget signature cliqué en mode Remplir &
   // Signer — la prochaine insertion de signature y sera ajustée (ratio
-  // préservé, centrée). Null = insertion libre (bouton toolbar).
+  // préservé, centrée). `widgetId` lie l'image posée au widget (le clic suivant
+  // sur le widget SÉLECTIONNE l'image au lieu de rouvrir le dialog).
+  // Null = insertion libre (bouton toolbar).
   const signatureTargetRef = useRef<{
     x: number;
     y: number;
     width: number;
     height: number;
+    widgetId?: string;
   } | null>(null);
   // Ref pour l'input file
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1266,7 +1269,13 @@ export default function EditorPage() {
     }
   }, [handleConfirmRename, handleCancelRename]);
 
-  // Collaboration temps réel (présence, curseurs, émissions update/delete)
+  // Collaboration temps réel (présence, curseurs, émissions update/delete).
+  // Room = storedDocumentId (le [id] de la route, commun à tous les
+  // collaborateurs) — JAMAIS le documentId de session (id Redis recréé PAR
+  // UTILISATEUR à chaque /load : deux utilisateurs n'atterriraient jamais
+  // dans la même room). Le serveur autorise le join par storedDocumentId
+  // (owner ou partage actif — _authorize_document_join) et ses relays
+  // exigent que les émissions portent ce même id (session["document_id"]).
   const {
     collaborators,
     cursors,
@@ -1276,8 +1285,8 @@ export default function EditorPage() {
     emitElementUpdate,
     emitElementDelete,
   } = useCollaboration({
-    documentId,
-    enabled: !!documentId,
+    documentId: storedDocumentId ?? null,
+    enabled: !!storedDocumentId,
   });
 
   // --- Application des événements de collaboration distants ---
@@ -1404,7 +1413,10 @@ export default function EditorPage() {
   );
 
   useElementUpdates(
-    documentId,
+    // Même room que le join : les événements distants portent le
+    // storedDocumentId (les filtres data.document_id === documentId des
+    // hooks laisseraient tout passer à la trappe avec l'id de session).
+    storedDocumentId ?? null,
     handleRemoteElementCreate,
     handleRemoteElementUpdate,
     handleRemoteElementDelete,
@@ -1608,9 +1620,11 @@ export default function EditorPage() {
       // l'enveloppe du hook ne transporte que l'élément. client_id
       // (anti-écho) est estampillé automatiquement par socketClient.emit ;
       // user_id est renseigné côté serveur (même contrat que le hook).
-      if (documentId) {
+      // document_id = storedDocumentId : la room jointe est celle du document
+      // STOCKÉ (le relay serveur droppe toute émission portant un autre id).
+      if (storedDocumentId) {
         socketClient.emit("element:create", {
-          document_id: documentId,
+          document_id: storedDocumentId,
           element,
           user_id: "",
           page_number: pageNumber,
@@ -1647,7 +1661,7 @@ export default function EditorPage() {
       // Sauvegarder le PDF vers S3 (debounced: batch ajouts rapprochés)
       saveWithPriority("debounced");
     },
-    [setDirty, saveWithPriority, documentId, currentPageIndex, queueAdd, addElementToPage, currentPage, selectElements]
+    [setDirty, saveWithPriority, documentId, storedDocumentId, currentPageIndex, queueAdd, addElementToPage, currentPage, selectElements]
   );
 
   const handleElementModified = useCallback(
@@ -2430,6 +2444,12 @@ export default function EditorPage() {
         const token = await getAuthToken();
         const form = new FormData();
         form.append('file', file, file.name);
+        // Request the native engine's structural block grouping so
+        // `page.blockGroups` survives every re-parse (rotate, apply-elements,
+        // watermark, …) — same grouping the initial /api/pdf/parse-from-s3
+        // load attaches. Without it, the first page op of a session silently
+        // dropped the paragraph grouping (heuristic fallback) until reload.
+        form.append('blockGroups', 'true');
         const res = await fetch('/api/pdf/parse', {
           method: 'POST',
           credentials: 'include',
@@ -4265,8 +4285,12 @@ export default function EditorPage() {
 
   // --- PII auto-detect redaction --------------------------------------------
   const [showRedactPiiDialog, setShowRedactPiiDialog] = useState(false);
-  // Fill & Sign — signature/initials capture dialog visibility.
+  // Fill & Sign — signature/initials capture dialog visibility + preset kind
+  // (the toolbar exposes Signature and Paraphe as two distinct entries).
   const [signatureDialogOpen, setSignatureDialogOpen] = useState(false);
+  const [signatureDialogKind, setSignatureDialogKind] = useState<
+    "signature" | "initials"
+  >("signature");
 
   // Redact every auto-detected PII region (whole text runs) across the whole
   // document. Reuses the manual redaction baking path: build per-page geometry,
@@ -4760,19 +4784,29 @@ export default function EditorPage() {
     if (!showFormsPanel) toggleFormsPanel();
   }, [setFormsMode, showFormsPanel, toggleFormsPanel]);
 
-  // Ouvre le dialog de capture (dessin / texte / import) signature ou paraphe.
-  // Insertion LIBRE (bouton toolbar) : aucun widget cible.
-  const handleInsertSignature = useCallback(() => {
-    signatureTargetRef.current = null;
-    setSignatureDialogOpen(true);
-  }, []);
+  // Ouvre le dialog de capture (dessin / texte / import) préréglé sur le kind
+  // demandé (signature ou paraphe). Insertion LIBRE (toolbar) : aucun widget
+  // cible.
+  const handleInsertSignature = useCallback(
+    (kind?: "signature" | "initials") => {
+      signatureTargetRef.current = null;
+      setSignatureDialogKind(kind ?? "signature");
+      setSignatureDialogOpen(true);
+    },
+    [],
+  );
 
   // Remplir & Signer : clic sur un WIDGET SIGNATURE du PDF → ouvre le dialog
-  // de capture en mémorisant le rect du widget ; la signature capturée y sera
-  // AJUSTÉE (ratio préservé, centrée) au lieu d'un placement libre.
+  // de capture en mémorisant le rect ET l'identité du widget ; la signature
+  // capturée y sera AJUSTÉE (ratio préservé, centrée) au lieu d'un placement
+  // libre, et l'image posée restera liée au widget (clic suivant = sélection).
   const handleSignatureFieldClick = useCallback(
     (element: FormFieldElement) => {
-      signatureTargetRef.current = { ...element.bounds };
+      signatureTargetRef.current = {
+        ...element.bounds,
+        widgetId: element.elementId,
+      };
+      setSignatureDialogKind("signature");
       setSignatureDialogOpen(true);
     },
     [],
@@ -4781,7 +4815,9 @@ export default function EditorPage() {
   // Insère la signature/paraphe capturé comme élément image, déplaçable et
   // redimensionnable, exactement comme un ajout d'image (même chemin de save).
   // Quand un widget signature a été cliqué (Remplir & Signer), l'image est
-  // ajustée aux bounds du widget.
+  // ajustée aux bounds du widget. L'outil bascule sur « select » pour que la
+  // marque fraîchement posée soit immédiatement saisissable (déplacement /
+  // redimensionnement sans friction).
   const handleSignatureInsert = useCallback(
     (sig: {
       dataUrl: string;
@@ -4798,10 +4834,27 @@ export default function EditorPage() {
         target ?? undefined,
       );
       setSignatureDialogOpen(false);
+      setActiveTool("select");
       setDirty(true);
       saveWithPriority("immediate");
     },
-    [canvasHandle, setDirty, saveWithPriority],
+    [canvasHandle, setActiveTool, setDirty, saveWithPriority],
+  );
+
+  // Insertion UN-CLIC d'une marque du compte depuis le dropdown de la toolbar
+  // (placement libre — jamais un widget cible, le dropdown n'est pas atteignable
+  // pendant le dialog modal de capture).
+  const handleInsertSavedSignature = useCallback(
+    (sig: {
+      dataUrl: string;
+      width: number;
+      height: number;
+      kind: "signature" | "initials";
+    }) => {
+      signatureTargetRef.current = null;
+      handleSignatureInsert(sig);
+    },
+    [handleSignatureInsert],
   );
 
   // Handler pour le chargement de l'image
@@ -5466,6 +5519,7 @@ export default function EditorPage() {
         onAddImage={handleAddImage}
         onFillSign={handleFillSign}
         onInsertSignature={handleInsertSignature}
+        onInsertSavedSignature={handleInsertSavedSignature}
         onInsertTable={handleInsertTable}
         onInsertLink={handleInsertLink}
         onRemoveLink={handleRemoveLink}
@@ -6077,6 +6131,7 @@ export default function EditorPage() {
       {/* Remplir & Signer — capture (dessin / texte / import) + signatures du compte */}
       <SignatureCaptureDialog
         open={signatureDialogOpen}
+        defaultKind={signatureDialogKind}
         onClose={() => {
           setSignatureDialogOpen(false);
           // Annulation : oublier le widget signature ciblé pour qu'une

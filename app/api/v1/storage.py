@@ -2105,6 +2105,12 @@ version history tracking and rollback capabilities.
 - Track document evolution with descriptive comments
 - Keep search in sync with edits (pass `extracted_text` to re-vectorize)
 
+## Permissions
+- **Owner**: always allowed.
+- **Shared user with edit grant**: allowed — the version is stored under the
+  owner's prefix and `created_by` records the invited editor.
+- **View-only grant / anyone else**: **403 Forbidden**.
+
 ## File Constraints
 - Maximum size: 100 MB
 - Must be a valid PDF (starts with `%PDF-`)
@@ -2126,6 +2132,7 @@ version history tracking and rollback capabilities.
                 }
             }
         },
+        403: {"description": "You do not have edit access to this document"},
         404: {"description": "Stored document or session document not found"},
     },
     openapi_extra={
@@ -2218,12 +2225,18 @@ async def create_version(
 
     The frontend sends the rendered PDF bytes directly — no active editing session required.
 
+    Access: owner OR active **edit** share grant (mirrors the editor load
+    endpoint) — a view-only grantee or a stranger gets **403**. The version is
+    written under the **owner's** S3 prefix (symmetric with the load path) and
+    ``created_by`` records the actual author (the current user, who may be an
+    invited editor).
+
     When ``extracted_text`` is provided, the document's search index is rebuilt
     from it (full-text material + chunked semantic ``ocr_blocks``, a REPLACE) so
     the index always reflects the latest edited content.
 
     Atomicity guarantee (Saga pattern):
-      1. Validate PDF bytes (magic bytes + size) + verify DB ownership.
+      1. Validate PDF bytes (magic bytes + size) + authorize (owner-or-edit-share).
       2. Commit new DocumentVersion + updated StoredDocument to DB first.
       3. Upload new version to S3 after successful commit.
       4. If S3 upload fails → compensate by deleting the partial upload
@@ -2260,10 +2273,12 @@ async def create_version(
     s3_key: str
 
     async with get_db_session() as session:
+        # Load by id; the access guard (not the query) enforces owner-or-shared
+        # — EXACTLY the same pattern as the editor load endpoint above.
         result = await session.execute(
             select(StoredDocument).where(
                 StoredDocument.id == stored_document_id,
-                StoredDocument.owner_id == user.user_id,
+                ~StoredDocument.is_deleted,
             )
         )
         stored_doc = result.scalar_one_or_none()
@@ -2271,8 +2286,19 @@ async def create_version(
         if not stored_doc:
             raise NotFoundError(f"Stored document not found: {stored_document_id}")
 
+        # Owner-or-shared gate; saving requires an EDIT grant (view-only → 403).
+        decision = await authorize_document_access(session, stored_doc, user.user_id)
+        if not decision.can_edit:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have edit access to this document",
+            )
+
+        owner_id = stored_doc.owner_id
         new_version_number = stored_doc.current_version + 1
-        s3_key = s3_service.get_document_key(user.user_id, stored_document_id, new_version_number)
+        # Version files live under the OWNER's S3 prefix (symmetric with the
+        # load path) so an invited editor's save stays with the document.
+        s3_key = s3_service.get_document_key(owner_id, stored_document_id, new_version_number)
 
         version = DocumentVersion(
             document_id=stored_document_id,
@@ -2312,7 +2338,10 @@ async def create_version(
             content_type="application/pdf",
             metadata={
                 "document_id": stored_document_id,
-                "user_id": user.user_id,
+                # Object metadata mirrors the key prefix (the document OWNER);
+                # author_id records who actually saved (may be an edit grantee).
+                "user_id": owner_id,
+                "author_id": user.user_id,
                 "version": str(new_version_number),
             },
         )

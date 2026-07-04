@@ -29,6 +29,12 @@ import {
   restoreParagraphEditSession,
 } from "../render-elements";
 import type { TextRun } from "../render-elements";
+// The single serialisation seam — asserted here so the hover-affordance
+// outline can NEVER reach the operations queue / save path.
+import {
+  fabricObjectToElement,
+  fabricObjectToElements,
+} from "../lib/fabric-element-io";
 
 // --- Minimal Fabric mock: each shape records its constructor options. --------
 class FakeObj {
@@ -44,6 +50,26 @@ class FakeObj {
       return;
     }
     Object.assign(this.opts, patch);
+  }
+  // Mirror Fabric's ABSOLUTE geometry helpers (block selection / hover
+  // affordance hit-test on them). A text object anchored originY:"bottom"
+  // hangs ABOVE its `top` (the baseline anchor), like real Fabric.
+  getBoundingRect() {
+    const w = (this.opts.width as number | undefined) ?? 0;
+    const h =
+      (this.opts.height as number | undefined) ??
+      (this.opts.fontSize as number | undefined) ??
+      0;
+    const left = (this.opts.left as number | undefined) ?? 0;
+    const topRaw = (this.opts.top as number | undefined) ?? 0;
+    const top = this.opts.originY === "bottom" ? topRaw - h : topRaw;
+    return { left, top, width: w, height: h };
+  }
+  containsPoint(p: { x: number; y: number }) {
+    const { left, top, width, height } = this.getBoundingRect();
+    return (
+      p.x >= left && p.x <= left + width && p.y >= top && p.y <= top + height
+    );
   }
 }
 class IText extends FakeObj {
@@ -98,6 +124,20 @@ const FabricImage = {
   fromURL: vi.fn(async () => new FakeObj()),
 };
 
+// Live multi-selection mock: real Fabric reports instance `type` as the
+// lowercased class name ("activeselection") and flattens via getObjects().
+class ActiveSelection extends FakeObj {
+  type = "activeselection";
+  private members: FakeObj[];
+  constructor(objects: FakeObj[] = [], opts: Record<string, unknown> = {}) {
+    super(opts);
+    this.members = objects;
+  }
+  getObjects() {
+    return [...this.members];
+  }
+}
+
 const fabricMock = {
   Rect,
   Circle,
@@ -109,11 +149,15 @@ const fabricMock = {
   FabricImage,
   Path,
   Polygon,
+  ActiveSelection,
 } as unknown as typeof import("fabric");
 
 function makeCanvas() {
   const objects: FakeObj[] = [];
   const handlers: Record<string, Array<(e: unknown) => void>> = {};
+  // Track the active object like real Fabric so mouse:down:before snapshots
+  // (block selection drill-down state) read the same thing they would live.
+  let active: FakeObj | null = null;
   return {
     add: (o: FakeObj) => objects.push(o),
     // A REAL removal (splice) — the paragraph edit session lifts the member
@@ -125,8 +169,13 @@ function makeCanvas() {
     insertAt: vi.fn((index: number, ...objs: FakeObj[]) => {
       objects.splice(index, 0, ...objs);
     }),
-    discardActiveObject: vi.fn(),
-    setActiveObject: vi.fn(),
+    discardActiveObject: vi.fn(() => {
+      active = null;
+    }),
+    setActiveObject: vi.fn((o: FakeObj) => {
+      active = o;
+    }),
+    getActiveObject: () => active,
     getObjects: () => objects,
     // Mirror Fabric v6's canvas.moveObjectTo: pull the object out and re-insert
     // it at the target index (used by the post-image-load z-order re-assert).
@@ -1216,6 +1265,54 @@ describe("renderElementsOverlay — form-field hit-target & format", () => {
     expect(onSignature).toHaveBeenCalledTimes(1);
     const arg = onSignature.mock.calls[0]![0] as { fieldName?: string };
     expect(arg.fieldName).toBe("sign");
+  });
+
+  it("selects the placed stamp (not the capture dialog) on a SIGNED widget click, and re-signs after deletion", async () => {
+    const canvas = makeCanvas();
+    const onElementSelected = vi.fn();
+    await renderElementsOverlay(
+      canvas,
+      [
+        formFieldElement({
+          elementId: "sig",
+          fieldType: "signature",
+          fieldName: "sign",
+          value: "",
+        }),
+      ],
+      fabricMock,
+      { onElementSelected },
+    );
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    const rect = objects.find((o) => o instanceof Rect)!;
+    const onSignature = vi.fn();
+    const meta = canvas as unknown as {
+      _gigaFillSignMode?: boolean;
+      _gigaOnSignatureFieldClick?: (el: unknown) => void;
+    };
+    meta._gigaFillSignMode = true;
+    meta._gigaOnSignatureFieldClick = onSignature;
+    const fire = (canvas as unknown as { fire: (e: string, p: unknown) => void })
+      .fire;
+
+    // A stamp image was inserted INTO the widget: editor-canvas `addImage`
+    // links it at targeted insertion time via `data.signedWidgetId`.
+    const stamp = new FakeObj({ left: 10, top: 10, width: 80, height: 30 });
+    stamp.data = { elementId: "img1", signedWidgetId: "sig" };
+    canvas.add(stamp as unknown as Parameters<typeof canvas.add>[0]);
+
+    // Clicking the SIGNED widget selects the stamp (movable/resizable) —
+    // the capture dialog must NOT reopen over the placed mark.
+    fire("mouse:down", { target: rect });
+    expect(onSignature).not.toHaveBeenCalled();
+    expect(canvas.setActiveObject).toHaveBeenCalledWith(stamp);
+    expect(onElementSelected).toHaveBeenCalledWith("img1");
+
+    // Once the stamp is deleted, the widget becomes signable again: the next
+    // click reopens the capture dialog.
+    canvas.remove(stamp as unknown as Parameters<typeof canvas.remove>[0]);
+    fire("mouse:down", { target: rect });
+    expect(onSignature).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2415,6 +2512,99 @@ describe("pageBlockGroupsToTablesAndLists (pure)", () => {
     expect(paragraphs).toHaveLength(1);
     expect(paragraphs[0]!.runs.map((r) => r.elementId)).toEqual(["a", "b"]);
   });
+
+  it("bands two same-baseline cell runs into ONE visual line (label + value)", () => {
+    const elements = [
+      paraRun("label", 100, { index: 1, content: "Nom :", x: 40, width: 40 }),
+      paraRun("value", 100, { index: 2, content: "DUPONT", x: 90, width: 60 }),
+    ];
+    const { paragraphs } = pageBlockGroupsToTablesAndLists(elements, [
+      tableGroup([[[1, 2]]]),
+    ]);
+    expect(paragraphs).toHaveLength(1);
+    const lines = paragraphs[0]!.lines!;
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!.map((r) => r.elementId)).toEqual(["label", "value"]);
+    // The banded single line clears the coherence gate — the synthetic
+    // one-run-per-"line" model shared a top-Y and was rejected by the
+    // strictly-descending rule, so such cells were never block-editable.
+    expect(isCoherentLineGroup(lines)).toBe(true);
+  });
+
+  it("bands a 2-line × 2-run cell into TWO visual lines (x asc within, y asc across)", () => {
+    // Deliberately out of visual order in sourceIndices: value before label.
+    const elements = [
+      paraRun("v1", 100, { index: 2, content: "DUPONT", x: 90, width: 60 }),
+      paraRun("l1", 100, { index: 1, content: "Nom :", x: 40, width: 40 }),
+      paraRun("l2", 114, { index: 3, content: "Prénom :", x: 40, width: 50 }),
+      paraRun("v2", 114, { index: 4, content: "Jean", x: 100, width: 40 }),
+    ];
+    const { paragraphs } = pageBlockGroupsToTablesAndLists(elements, [
+      tableGroup([[[2, 1, 3, 4]]]),
+    ]);
+    expect(paragraphs).toHaveLength(1);
+    const lines = paragraphs[0]!.lines!;
+    expect(lines.map((l) => l.map((r) => r.elementId))).toEqual([
+      ["l1", "v1"],
+      ["l2", "v2"],
+    ]);
+    // `runs` stays the flattening of `lines` (banded reading order).
+    expect(paragraphs[0]!.runs.map((r) => r.elementId)).toEqual([
+      "l1",
+      "v1",
+      "l2",
+      "v2",
+    ]);
+    expect(isCoherentLineGroup(lines)).toBe(true);
+  });
+
+  it("keeps a mono-run-per-line cell unchanged (non-regression)", () => {
+    const elements = [
+      paraRun("a", 100, { index: 1, content: "Cell L1" }),
+      paraRun("b", 114, { index: 2, content: "Cell L2" }),
+      paraRun("c", 128, { index: 3, content: "Cell L3" }),
+    ];
+    const { paragraphs } = pageBlockGroupsToTablesAndLists(elements, [
+      tableGroup([[[1, 2, 3]]]),
+    ]);
+    expect(paragraphs).toHaveLength(1);
+    expect(paragraphs[0]!.lines!.map((l) => l.map((r) => r.elementId))).toEqual([
+      ["a"],
+      ["b"],
+      ["c"],
+    ]);
+    expect(paragraphs[0]!.runs.map((r) => r.elementId)).toEqual(["a", "b", "c"]);
+  });
+
+  it("keeps runs beyond the 0.5×fontSize banding tolerance on separate lines", () => {
+    // fontSize 12 → tolerance 6pt: a 7pt top offset is a distinct baseline…
+    const far = pageBlockGroupsToTablesAndLists(
+      [
+        paraRun("a", 100, { index: 1, content: "Ligne 1" }),
+        paraRun("b", 107, { index: 2, content: "Ligne 2" }),
+      ],
+      [tableGroup([[[1, 2]]])],
+    );
+    expect(far.paragraphs).toHaveLength(1);
+    expect(far.paragraphs[0]!.lines!.map((l) => l.map((r) => r.elementId))).toEqual([
+      ["a"],
+      ["b"],
+    ]);
+    // …while a 5pt offset (within the 6pt tolerance) still shares the line.
+    const near = pageBlockGroupsToTablesAndLists(
+      [
+        paraRun("a", 100, { index: 1, content: "Nom :", x: 40, width: 40 }),
+        paraRun("b", 105, { index: 2, content: "DUPONT", x: 90, width: 60 }),
+      ],
+      [tableGroup([[[1, 2]]])],
+    );
+    expect(near.paragraphs).toHaveLength(1);
+    expect(near.paragraphs[0]!.lines!).toHaveLength(1);
+    expect(near.paragraphs[0]!.lines![0]!.map((r) => r.elementId)).toEqual([
+      "a",
+      "b",
+    ]);
+  });
 });
 
 describe("renderElementsOverlay — table/list reconstruction (edit-intent)", () => {
@@ -2473,6 +2663,36 @@ describe("renderElementsOverlay — table/list reconstruction (edit-intent)", ()
       itexts[0] as never,
     ) as unknown as Textbox;
     expect(session.text).toBe("Bullet line 1\nBullet line 2");
+  });
+
+  it("tags a same-baseline label+value cell and joins its ONE session line", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        paraRun("a", 100, { index: 1, content: "Nom :", x: 40, width: 40 }),
+        paraRun("b", 100, { index: 2, content: "DUPONT", x: 90, width: 60 }),
+      ],
+      fabricMock,
+      { blockGroups: [tableGroup([[[1, 2]]])] },
+    );
+    const objects = (canvas as unknown as { _objects: FakeObj[] })._objects;
+    // At rest: per-run render (pixel-1:1 path unchanged), members tagged.
+    expect(objects.filter((o) => o instanceof Textbox)).toHaveLength(0);
+    const itexts = objects.filter((o) => o instanceof IText);
+    expect(itexts).toHaveLength(2);
+    expect(
+      itexts.every(
+        (o) => (o.data as Record<string, unknown>).paragraphGroupId === "pg:a",
+      ),
+    ).toBe(true);
+    // The banded line edits as ONE session joining the runs with a space.
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      itexts[0] as never,
+    ) as unknown as Textbox;
+    expect(session.text).toBe("Nom : DUPONT");
   });
 
   it("FALLBACK: a table whose cell runs don't resolve renders element-by-element (no regression)", async () => {
@@ -2677,5 +2897,389 @@ describe("beginParagraphEditSession — per-run character styles", () => {
     expect(session.opts.width).toBeCloseTo(506.6);
     // The lib alignment drives the session box (justify supported by Fabric).
     expect(session.opts.textAlign).toBe("justify");
+  });
+});
+
+// --- Block identity for ALL groups (c3) + click = block selection (c1) -------
+// --- + hover affordance (c2) --------------------------------------------------
+
+/** The rendered IText members of a canvas, in add order. */
+function textMembersOf(canvas: ReturnType<typeof makeCanvas>): FakeObj[] {
+  return (canvas as unknown as { _objects: FakeObj[] })._objects.filter(
+    (o) =>
+      o instanceof IText &&
+      (o.data as Record<string, unknown> | undefined)?.paragraphGroupId !==
+        undefined,
+  );
+}
+
+/** Simulate a full Fabric CLICK on `target`: Fabric selects the target during
+ *  mousedown (activeOn 'down'), then fires mouse:up with isClick. */
+function simulateClick(
+  canvas: ReturnType<typeof makeCanvas>,
+  target: FakeObj | null,
+  over: Partial<{
+    scenePoint: { x: number; y: number };
+    e: Record<string, unknown>;
+    isClick: boolean;
+    fabricSelectsTarget: boolean;
+  }> = {},
+): void {
+  const fire = (canvas as unknown as { fire: (ev: string, e: unknown) => void })
+    .fire;
+  fire("mouse:down:before", { e: over.e ?? {} });
+  // Fabric's own mousedown selection (skipped for a click on empty canvas or
+  // when the target is already the active multi-selection).
+  if (target && over.fabricSelectsTarget !== false) {
+    canvas.setActiveObject(target as never);
+  }
+  fire("mouse:down", { target, e: over.e ?? {} });
+  fire("mouse:up", {
+    target,
+    isClick: over.isClick ?? true,
+    e: over.e ?? {},
+    scenePoint: over.scenePoint ?? { x: 50, y: 110 },
+  });
+}
+
+describe("renderElementsOverlay — block identity for EVERY group (gate → session only)", () => {
+  // A table cell whose two runs sit at footer (y=16) and header (y=792) — the
+  // classic dense-form mis-fusion the coherence gate exists for.
+  const incoherentCellElements = () => [
+    paraRun("foot", 16, { index: 1, content: "Footer legal" }),
+    paraRun("head", 792, { index: 2, content: "VOLET 2" }),
+  ];
+
+  it("tags a gate-REJECTED group's members with the group id and sessionable:false", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(canvas, incoherentCellElements(), fabricMock, {
+      blockGroups: [tableGroup([[[1, 2]]])],
+    });
+    const members = textMembersOf(canvas);
+    expect(members).toHaveLength(2);
+    for (const member of members) {
+      const data = member.data as Record<string, unknown>;
+      expect(data.paragraphGroupId).toBe("pg:foot");
+      expect(data.paragraphSessionable).toBe(false);
+    }
+    // Rejected ⇒ no "text" hover cursor invitation (per-run edit stays).
+    expect(
+      members.every(
+        (m) => (m as FakeObj & { hoverCursor?: string }).hoverCursor === undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it("REFUSES the Textbox session on a gate-rejected member (double-click stays per-run)", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(canvas, incoherentCellElements(), fabricMock, {
+      blockGroups: [tableGroup([[[1, 2]]])],
+    });
+    const members = textMembersOf(canvas);
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      members[0] as never,
+    );
+    expect(session).toBeNull();
+    // Nothing was lifted off the canvas — the per-run objects are untouched.
+    expect(textMembersOf(canvas)).toHaveLength(2);
+    expect(
+      (canvas as unknown as { _objects: FakeObj[] })._objects.filter(
+        (o) => o instanceof Textbox,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("keeps sessionable:true + the text hover cursor on a gate-ACCEPTED group (unchanged)", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        paraRun("a", 100, { index: 1, content: "L1" }),
+        paraRun("b", 114, { index: 2, content: "L2" }),
+      ],
+      fabricMock,
+      { blockGroups: [tableGroup([[[1, 2]]])] },
+    );
+    const members = textMembersOf(canvas);
+    expect(members).toHaveLength(2);
+    for (const member of members) {
+      const data = member.data as Record<string, unknown>;
+      expect(data.paragraphSessionable).toBe(true);
+      expect((member as FakeObj & { hoverCursor?: string }).hoverCursor).toBe(
+        "text",
+      );
+    }
+    const session = beginParagraphEditSession(
+      canvas,
+      fabricMock,
+      members[0] as never,
+    );
+    expect(session).not.toBeNull();
+  });
+});
+
+describe("renderElementsOverlay — single click selects the paragraph BLOCK (c1)", () => {
+  const coherentParagraph = () => [
+    paraRun("a", 100, { index: 1, content: "First line" }),
+    paraRun("b", 114, { index: 2, content: "Second line" }),
+    paraRun("c", 128, { index: 3, content: "Third line" }),
+  ];
+
+  async function renderedParagraph() {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(canvas, coherentParagraph(), fabricMock, {
+      blockGroups: [
+        { kind: "paragraph", sourceIndices: [1, 2, 3], lines: [[1], [2], [3]] },
+      ],
+    });
+    return { canvas, members: textMembersOf(canvas) };
+  }
+
+  it("promotes a click on a member to an ActiveSelection of ALL the block's members", async () => {
+    const { canvas, members } = await renderedParagraph();
+    simulateClick(canvas, members[1]!);
+    const active = canvas.getActiveObject() as unknown as ActiveSelection;
+    expect(active).toBeInstanceOf(ActiveSelection);
+    expect(
+      active
+        .getObjects()
+        .map((o) => (o.data as Record<string, unknown>).elementId)
+        .sort(),
+    ).toEqual(["a", "b", "c"]);
+    expect(members.every((m) => active.getObjects().includes(m))).toBe(true);
+  });
+
+  it("DRILLS DOWN to the run under the pointer when the block is already selected", async () => {
+    const { canvas, members } = await renderedParagraph();
+    simulateClick(canvas, members[1]!); // 1st click → block
+    const block = canvas.getActiveObject() as unknown as FakeObj;
+    expect(block).toBeInstanceOf(ActiveSelection);
+    // 2nd click lands ON the live selection (Fabric targets it, no re-select
+    // at mousedown), pointer over member "b" (baseline 128.64, bbox top 116.64).
+    simulateClick(canvas, block, {
+      fabricSelectsTarget: false,
+      scenePoint: { x: 50, y: 120 },
+    });
+    expect(canvas.getActiveObject()).toBe(members[1]);
+  });
+
+  it("keeps the block selected when the drill-down click misses every member (padding)", async () => {
+    const { canvas, members } = await renderedParagraph();
+    simulateClick(canvas, members[0]!);
+    const block = canvas.getActiveObject() as unknown as FakeObj;
+    simulateClick(canvas, block, {
+      fabricSelectsTarget: false,
+      scenePoint: { x: 50, y: 115.5 }, // between line 1 and line 2 bboxes
+    });
+    expect(canvas.getActiveObject()).toBe(block);
+  });
+
+  it("keeps native single-run behaviour once drilled in (click on the run / a sibling)", async () => {
+    const { canvas, members } = await renderedParagraph();
+    // Drilled-in: member b is the active object. Clicking it again must NOT
+    // re-promote (this is what lets the next click enter inline editing).
+    canvas.setActiveObject(members[1] as never);
+    simulateClick(canvas, members[1]!);
+    expect(canvas.getActiveObject()).toBe(members[1]);
+    // Clicking a SIBLING while drilled in selects that run natively too.
+    simulateClick(canvas, members[2]!);
+    expect(canvas.getActiveObject()).toBe(members[2]);
+  });
+
+  it("Alt+click targets the run directly (never the block)", async () => {
+    const { canvas, members } = await renderedParagraph();
+    simulateClick(canvas, members[0]!, { e: { altKey: true } });
+    expect(canvas.getActiveObject()).toBe(members[0]);
+  });
+
+  it("leaves Shift/Ctrl multi-selection clicks to Fabric (no promotion)", async () => {
+    const { canvas, members } = await renderedParagraph();
+    simulateClick(canvas, members[0]!, { e: { shiftKey: true } });
+    expect(canvas.getActiveObject()).toBe(members[0]);
+    simulateClick(canvas, members[1]!, { e: { ctrlKey: true } });
+    expect(canvas.getActiveObject()).toBe(members[1]);
+  });
+
+  it("ignores drags (isClick=false): a block move must not re-target the selection", async () => {
+    const { canvas, members } = await renderedParagraph();
+    simulateClick(canvas, members[0]!, { isClick: false });
+    // Fabric's own mousedown selection stands; no ActiveSelection was built.
+    expect(canvas.getActiveObject()).toBe(members[0]);
+  });
+
+  it("keeps the current behaviour for objects WITHOUT a group id", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(canvas, [textElement()], fabricMock);
+    const lone = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) => o instanceof IText,
+    )!;
+    simulateClick(canvas, lone);
+    expect(canvas.getActiveObject()).toBe(lone);
+  });
+
+  it("stays inert outside the select tool and in Fill & Sign mode (live stamps)", async () => {
+    const { canvas, members } = await renderedParagraph();
+    const meta = canvas as unknown as {
+      _gigaCurrentTool?: string;
+      _gigaFillSignMode?: boolean;
+    };
+    meta._gigaCurrentTool = "hand";
+    simulateClick(canvas, members[0]!);
+    expect(canvas.getActiveObject()).toBe(members[0]);
+    meta._gigaCurrentTool = "select";
+    meta._gigaFillSignMode = true;
+    simulateClick(canvas, members[1]!);
+    expect(canvas.getActiveObject()).toBe(members[1]);
+    // Back to the plain select tool → the promotion works again (selection
+    // cleared first: a same-group previous active reads as "drilled in").
+    meta._gigaFillSignMode = false;
+    canvas.discardActiveObject();
+    simulateClick(canvas, members[2]!);
+    expect(canvas.getActiveObject()).toBeInstanceOf(ActiveSelection);
+  });
+
+  it("also promotes a gate-REJECTED group (identity ≠ session)", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        paraRun("foot", 16, { index: 1, content: "Footer legal" }),
+        paraRun("head", 792, { index: 2, content: "VOLET 2" }),
+      ],
+      fabricMock,
+      { blockGroups: [tableGroup([[[1, 2]]])] },
+    );
+    const members = textMembersOf(canvas);
+    simulateClick(canvas, members[0]!, { scenePoint: { x: 50, y: 25 } });
+    const active = canvas.getActiveObject() as unknown as ActiveSelection;
+    expect(active).toBeInstanceOf(ActiveSelection);
+    expect(active.getObjects()).toHaveLength(2);
+  });
+});
+
+describe("renderElementsOverlay — paragraph hover affordance (c2)", () => {
+  async function renderedParagraph() {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(
+      canvas,
+      [
+        paraRun("a", 100, { index: 1, content: "First line" }),
+        paraRun("b", 114, { index: 2, content: "Second line" }),
+        paraRun("c", 128, { index: 3, content: "Third line" }),
+      ],
+      fabricMock,
+      {
+        blockGroups: [
+          {
+            kind: "paragraph",
+            sourceIndices: [1, 2, 3],
+            lines: [[1], [2], [3]],
+          },
+        ],
+      },
+    );
+    return { canvas, members: textMembersOf(canvas) };
+  }
+
+  const outlineOf = (canvas: ReturnType<typeof makeCanvas>) =>
+    (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) =>
+        (o.data as Record<string, unknown> | undefined)
+          ?.isParagraphHoverOutline === true,
+    );
+
+  it("draws a non-interactive outline around the UNION of the block on hover", async () => {
+    const { canvas, members } = await renderedParagraph();
+    const fire = (
+      canvas as unknown as { fire: (ev: string, e: unknown) => void }
+    ).fire;
+    fire("mouse:over", { target: members[0] });
+    const outline = outlineOf(canvas)!;
+    expect(outline).toBeInstanceOf(Rect);
+    // Pure chrome: never selectable/evented, never exported, no fill.
+    expect(outline.opts.selectable).toBe(false);
+    expect(outline.opts.evented).toBe(false);
+    expect(outline.opts.excludeFromExport).toBe(true);
+    expect(outline.opts.fill).toBe("transparent");
+    expect(outline.opts.stroke).toBe("rgba(0, 100, 200, 0.35)");
+    expect(outline.opts.strokeWidth).toBe(1);
+    // Union of the members' absolute bboxes (baseline-anchored, fs 12: bbox =
+    // [y + 0.22·fs, y + 1.22·fs] per line) + 2px pad. Lines at y 100/114/128
+    // → union spans y 102.64 → 142.64 (height 40), x 40 → 340 (width 300).
+    expect(outline.opts.left).toBeCloseTo(40 - 2);
+    expect(outline.opts.top).toBeCloseTo(100 + 0.22 * 12 - 2);
+    expect(outline.opts.width).toBeCloseTo(300 + 4);
+    expect(outline.opts.height).toBeCloseTo(40 + 4);
+    // No elementId → clearElementsOverlay ignores it; identity is the flag.
+    expect((outline.data as Record<string, unknown>).elementId).toBeUndefined();
+  });
+
+  it("keeps ONE outline while moving between two members of the SAME block", async () => {
+    const { canvas, members } = await renderedParagraph();
+    const fire = (
+      canvas as unknown as { fire: (ev: string, e: unknown) => void }
+    ).fire;
+    fire("mouse:over", { target: members[0] });
+    const first = outlineOf(canvas);
+    fire("mouse:out", { target: members[0], nextTarget: members[1] });
+    expect(outlineOf(canvas)).toBe(first); // kept — same block
+    fire("mouse:over", { target: members[1] });
+    expect(outlineOf(canvas)).toBe(first); // not re-created either
+  });
+
+  it("removes the outline on mouse-out (to empty) and on mouse-down", async () => {
+    const { canvas, members } = await renderedParagraph();
+    const fire = (
+      canvas as unknown as { fire: (ev: string, e: unknown) => void }
+    ).fire;
+    fire("mouse:over", { target: members[0] });
+    expect(outlineOf(canvas)).toBeDefined();
+    fire("mouse:out", { target: members[0], nextTarget: null });
+    expect(outlineOf(canvas)).toBeUndefined();
+    fire("mouse:over", { target: members[1] });
+    expect(outlineOf(canvas)).toBeDefined();
+    fire("mouse:down", { target: members[1] });
+    expect(outlineOf(canvas)).toBeUndefined();
+  });
+
+  it("never leaks the outline into the save path (io seam + re-render sweep)", async () => {
+    const { canvas, members } = await renderedParagraph();
+    const fire = (
+      canvas as unknown as { fire: (ev: string, e: unknown) => void }
+    ).fire;
+    fire("mouse:over", { target: members[0] });
+    const outline = outlineOf(canvas)!;
+    // The single serialisation seam refuses it → object:added/modified forward
+    // nothing, the operations queue never sees it.
+    expect(fabricObjectToElement(outline as never)).toBeNull();
+    expect(fabricObjectToElements(outline as never)).toEqual([]);
+    // A re-render sweeps a lingering outline (mouse:out may never fire once
+    // the hovered member is re-created).
+    await renderElementsOverlay(
+      canvas,
+      [paraRun("a", 100, { index: 1 }), paraRun("b", 114, { index: 2 })],
+      fabricMock,
+      {
+        blockGroups: [
+          { kind: "paragraph", sourceIndices: [1, 2], lines: [[1], [2]] },
+        ],
+      },
+    );
+    expect(outlineOf(canvas)).toBeUndefined();
+  });
+
+  it("shows no outline on a plain (ungrouped) text run", async () => {
+    const canvas = makeCanvas();
+    await renderElementsOverlay(canvas, [textElement()], fabricMock);
+    const fire = (
+      canvas as unknown as { fire: (ev: string, e: unknown) => void }
+    ).fire;
+    const lone = (canvas as unknown as { _objects: FakeObj[] })._objects.find(
+      (o) => o instanceof IText,
+    )!;
+    fire("mouse:over", { target: lone });
+    expect(outlineOf(canvas)).toBeUndefined();
   });
 });

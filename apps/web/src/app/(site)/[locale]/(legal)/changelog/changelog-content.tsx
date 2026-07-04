@@ -15,6 +15,18 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.25.0",
+    date: "2026-07-04",
+    type: "minor",
+    changes: [
+      { type: "feature", description: "Real-time collaboration: share a document by email (people who already have an account get instant access, others receive an invitation link), see who else is viewing it, and watch their cursors and edits live. A notifications bell surfaces shares and invitations, and a public read-only link lets anyone open a document without an account." },
+      { type: "improvement", description: "Paragraph recognition rebuilt: opening a Word or PDF document no longer produces dozens of tiny disconnected text boxes — related lines are grouped into editable blocks (a 27-page business plan went from 308 fragments to 197). A single click now selects the whole paragraph, a second click drills into an individual run, and the grouping survives every page operation." },
+      { type: "feature", description: "The document library shows a coloured icon for each file type — PDF, Word, Excel, PowerPoint, images, archives, and more — instead of a single generic icon." },
+      { type: "improvement", description: "Fill & Sign: signature and initials now have two fully independent pads (drawing on one no longer clears the other), each reachable directly from the toolbar with one-click reuse of a saved mark, and every placed signature is immediately movable and resizable on the page." },
+      { type: "improvement", description: "Exhaustive two-way conversion fidelity (engine 0.117.0, ~70 fixes): Word tables keep their borders and theme fonts, bullet and numbered lists render correctly both ways, Excel exports are properly typed, right-to-left text, footnotes, chart data labels, slide backgrounds, frozen panes, tab stops and rotation are preserved, and the HTML→PDF engine gained CSS variables, generated content, @page, calc(), multi-column and many more." },
+    ],
+  },
+  {
     version: "1.24.0",
     date: "2026-07-03",
     type: "minor",

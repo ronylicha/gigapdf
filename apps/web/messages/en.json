@@ -2073,6 +2073,12 @@
       "redo": "Redo",
       "fillSign": "Fill & Sign",
       "insertSignature": "Insert a signature or initials",
+      "signatureKindSignature": "Signature",
+      "signatureKindInitials": "Initials",
+      "signatureNewSignature": "New signature…",
+      "signatureNewInitials": "New initials…",
+      "signatureManage": "Manage / new…",
+      "insertSavedSignature": "Insert this mark",
       "zoomIn": "Zoom in",
       "zoomOut": "Zoom out",
       "fitWidth": "Fit width",
@@ -4127,7 +4133,8 @@
       "sharing": "Sharing...",
       "cancel": "Cancel",
       "success": "Invitation sent successfully",
-      "error": "Failed to send invitation"
+      "error": "Failed to send invitation",
+      "emailWarning": "Sharing is active, but the notification email could not be sent"
     },
     "currentShares": {
       "title": "People with access",
@@ -4135,6 +4142,30 @@
       "noShares": "This document is not shared with anyone",
       "revokeAccess": "Revoke access",
       "changePermission": "Change permission"
+    },
+    "invitationPage": {
+      "title": "Share invitation",
+      "invitedBy": "{email} is inviting you to access this document",
+      "someoneFallback": "A GigaPDF user",
+      "wrongAccount": "This invitation was sent to {email}. Sign in with that account to accept it.",
+      "accept": "Accept",
+      "decline": "Decline",
+      "acceptedToast": "Invitation accepted — the document is now in \"Shared with me\"",
+      "declinedToast": "Invitation declined",
+      "acceptFailed": "Failed to accept the invitation",
+      "declineFailed": "Failed to decline the invitation",
+      "notFoundTitle": "Invitation not found",
+      "notFoundDescription": "This invitation link is invalid or no longer exists. Ask the sender to share the document again.",
+      "expiredTitle": "Invitation expired",
+      "expiredDescription": "This invitation has expired. Ask the sender to share the document again.",
+      "acceptedTitle": "Invitation already accepted",
+      "acceptedDescription": "You already have access to this document — find it in \"Shared with me\".",
+      "declinedTitle": "Invitation declined",
+      "declinedDescription": "This invitation was declined. Ask the sender to share the document again if needed.",
+      "revokedTitle": "Invitation revoked",
+      "revokedDescription": "This invitation was revoked by the document owner.",
+      "goToShared": "Open \"Shared with me\"",
+      "goToDashboard": "Go to dashboard"
     },
     "publicLink": {
       "title": "Public link",
@@ -4157,7 +4188,26 @@
       "declined": "Invitation declined",
       "revoked": "Access revoked",
       "markAsRead": "Mark as read",
-      "markAllAsRead": "Mark all as read"
+      "markAllAsRead": "Mark all as read",
+      "ariaLabel": "Notifications",
+      "ariaLabelUnread": "Notifications — {count} unread",
+      "empty": "No notifications",
+      "types": {
+        "share_invitation": "\"{document}\" was shared with you",
+        "share_accepted": "{email} accepted your invitation to \"{document}\"",
+        "share_declined": "Your invitation to \"{document}\" was declined",
+        "share_revoked": "Your access to \"{document}\" was revoked",
+        "permission_changed": "Your permission on \"{document}\" is now: {permission}",
+        "unknown": "Sharing notification"
+      }
+    },
+    "publicPage": {
+      "notFoundTitle": "Invalid or expired link",
+      "notFoundDescription": "This public link no longer exists, was disabled by the document owner, or has expired. Ask the person who shared it for a new link.",
+      "pageCount": "{count, plural, one {# page} other {# pages}}",
+      "viewOnly": "View only",
+      "download": "Download",
+      "fallbackHint": "If the preview does not load, use the Download button."
     }
   },
   "toolsMenu": {

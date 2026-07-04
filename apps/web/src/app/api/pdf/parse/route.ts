@@ -16,10 +16,14 @@
  *      extractAnnotations— "true" | "false" (default: true)
  *      extractFormFields — "true" | "false" (default: true)
  *      extractBookmarks  — "true" | "false" (default: true)
+ *      blockGroups       — "true" | "false" (default: false) — when true
+ *                          (the editor's re-parse sets it), attach the native
+ *                          engine's structural block grouping to each page
+ *                          (same best-effort contract as /api/pdf/parse-from-s3)
  *      documentId        — optional UUID to embed in the result
  *
  *   2. application/json
- *      { "documentId": "<uuid>" }
+ *      { "documentId": "<uuid>", "blockGroups": false }
  *      Fetches the PDF bytes from the Python backend at
  *      GET /api/v1/storage/documents/{documentId}/download
  *      then parses the fetched bytes.
@@ -64,6 +68,7 @@ import type { ParseOptions } from '@giga-pdf/pdf-engine';
 import { auth } from '@/lib/auth';
 import { serverLogger } from '@/lib/server-logger';
 import { MAX_FILE_SIZE_BYTES } from '@/lib/request-validation';
+import { attachPageBlockGroups } from '@/lib/pdf-block-groups';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -76,6 +81,12 @@ const PYTHON_API_BASE =
 
 const jsonBodySchema = z.object({
   documentId: z.string().uuid('documentId must be a valid UUID'),
+  /**
+   * When true (the editor sets this), attach the native engine's structural
+   * block grouping to each parsed page. Opt-in so plain text extraction
+   * callers keep the exact same cost and response shape as before.
+   */
+  blockGroups: z.boolean().optional().default(false),
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -158,6 +169,7 @@ export async function POST(request: NextRequest): Promise<Response> {
     const contentType = request.headers.get('content-type') ?? '';
     let pdfBuffer: Buffer;
     let parseOptions: ParseOptions = {};
+    let wantBlockGroups = false;
 
     // ── 2a. multipart/form-data path ────────────────────────────────────────
     if (contentType.includes('multipart/form-data')) {
@@ -206,6 +218,10 @@ export async function POST(request: NextRequest): Promise<Response> {
           ? { documentId: documentIdField }
           : {}),
       };
+
+      // Opt-in (unlike the extract* flags): only the editor requests block
+      // grouping, so the absent-field default is `false`, not `true`.
+      wantBlockGroups = formData.get('blockGroups') === 'true';
 
       serverLogger.info('[api/pdf/parse] Parsing uploaded file', {
         userId,
@@ -271,6 +287,7 @@ export async function POST(request: NextRequest): Promise<Response> {
       }
 
       parseOptions = { documentId };
+      wantBlockGroups = parsed.data.blockGroups;
 
     } else {
       return NextResponse.json(
@@ -285,6 +302,20 @@ export async function POST(request: NextRequest): Promise<Response> {
 
     // ── 3. Parse the PDF ─────────────────────────────────────────────────────
     const documentObject = await parseDocument(pdfBuffer, parseOptions);
+
+    // Editor re-parse (`blockGroups` requested): attach the native engine's
+    // STRUCTURAL block grouping per page — same best-effort contract as
+    // /api/pdf/parse-from-s3 — so the paragraph grouping survives page
+    // operations (rotate, apply-elements, watermark, forms, …) instead of
+    // silently degrading to the editor's positional heuristic after the first
+    // op of a session. Callers that omit the flag (e.g. plain text extraction)
+    // keep the exact same response shape and cost as before.
+    if (wantBlockGroups && Array.isArray(documentObject.pages)) {
+      await attachPageBlockGroups(documentObject.pages, pdfBuffer, '[api/pdf/parse]', {
+        userId,
+        documentId: documentObject.documentId,
+      });
+    }
 
     serverLogger.info('[api/pdf/parse] Document parsed successfully', {
       userId,

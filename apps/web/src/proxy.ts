@@ -41,6 +41,11 @@ const APP_ROUTES = new Set<string>([
   // Conteneurs app
   "dashboard", "documents", "search", "settings", "billing", "organization",
   "developers", "shared", "trash", "monitoring", "forbidden", "editor", "embed",
+  // Pages à token, URL nue JAMAIS localisée (liens copiés/e-mailés) :
+  // /invitations/[token] (landing invité, sous (app)) et /public/[token]
+  // (viewer public sans auth, root layout dédié). Sans ces entrées, next-intl
+  // réécrit /public/xxx → /fr/public/xxx → 404 (périmètre statique (site)).
+  "invitations", "public",
   // Outils — édition / sécurité / pages
   "merge", "split", "compress", "protect", "unlock", "sign", "watermark", "ocr",
   "pdf-a", "extract-pages", "organize-pages",

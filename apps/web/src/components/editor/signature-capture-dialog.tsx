@@ -3,9 +3,12 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
 import { X, PenLine, Type, Upload, Trash2, FileSignature } from "lucide-react";
-
-/** Whether the mark is a full signature or a short set of initials. */
-type SignatureKind = "signature" | "initials";
+import {
+  fetchUserSignatures,
+  type SignatureInsertPayload,
+  type SignatureKind,
+  type UserSignatureMark,
+} from "./lib/user-signatures";
 
 /** Which capture method the user is currently on. */
 type CaptureTab = "draw" | "type" | "upload";
@@ -18,30 +21,39 @@ interface CapturedSignature {
 }
 
 /**
- * A signature persisted to the caller's account.
- *
- * Mirrors the JSON shape returned by `/api/user/signatures` — kept local to
- * this component so the dialog stays self-contained.
+ * Everything one kind's pad owns. Signature and initials each keep a FULL
+ * independent pad: switching kinds never resets the other pad's in-progress
+ * drawing, typed text, upload or active method.
  */
-interface UserSignature {
-  id: string;
-  kind: SignatureKind;
-  dataUrl: string;
-  width: number;
-  height: number;
-  createdAt: string;
+interface PadState {
+  tab: CaptureTab;
+  typeText: string;
+  upload: CapturedSignature | null;
+  uploadError: string | null;
+  hasInk: boolean;
+}
+
+const KINDS: readonly SignatureKind[] = ["signature", "initials"];
+
+function emptyPad(): PadState {
+  return {
+    tab: "draw",
+    typeText: "",
+    upload: null,
+    uploadError: null,
+    hasInk: false,
+  };
+}
+
+function emptyPads(): Record<SignatureKind, PadState> {
+  return { signature: emptyPad(), initials: emptyPad() };
 }
 
 export interface SignatureCaptureDialogProps {
   open: boolean;
   onClose: () => void;
   /** Called with the captured mark; the dialog closes right after. */
-  onInsert: (sig: {
-    dataUrl: string;
-    width: number;
-    height: number;
-    kind: SignatureKind;
-  }) => void;
+  onInsert: (sig: SignatureInsertPayload) => void;
   /** Which kind to preselect when the dialog opens. Defaults to "signature". */
   defaultKind?: SignatureKind;
 }
@@ -66,6 +78,11 @@ const INK_ALPHA_THRESHOLD = 10;
  *               extent.
  *  - **Upload** a PNG/JPEG/SVG image, sized from its natural dimensions.
  *
+ * The two kinds are TWO INDEPENDENT PADS: each keeps its own in-progress
+ * drawing (both draw canvases stay mounted — the inactive one is only
+ * CSS-hidden so its bitmap survives), its own typed text, its own upload and
+ * its own active method. Toggling kinds never destroys the other pad.
+ *
  * Optionally the mark is persisted to the caller's account
  * (`/api/user/signatures`); previously-saved marks of the current kind are
  * listed as one-click inserts. Insertion is never blocked by a failed save.
@@ -79,63 +96,68 @@ export function SignatureCaptureDialog({
   const t = useTranslations("editor.signature");
 
   const [kind, setKind] = useState<SignatureKind>(defaultKind ?? "signature");
-  const [tab, setTab] = useState<CaptureTab>("draw");
+  const [pads, setPads] = useState<Record<SignatureKind, PadState>>(emptyPads);
 
-  // Draw state.
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
-  const strokeRef = useRef<{ drawing: boolean; points: { x: number; y: number }[] }>({
-    drawing: false,
-    points: [],
+  const patchPad = useCallback(
+    (k: SignatureKind, patch: Partial<PadState>) => {
+      setPads((prev) => ({ ...prev, [k]: { ...prev[k], ...patch } }));
+    },
+    [],
+  );
+
+  // Draw state — one full set per kind (the pads are independent).
+  const canvasRefs = useRef<Record<SignatureKind, HTMLCanvasElement | null>>({
+    signature: null,
+    initials: null,
   });
-  const [hasInk, setHasInk] = useState(false);
-
-  // Type state.
-  const [typeText, setTypeText] = useState("");
-
-  // Upload state.
-  const [upload, setUpload] = useState<CapturedSignature | null>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const ctxRefs = useRef<
+    Record<SignatureKind, CanvasRenderingContext2D | null>
+  >({ signature: null, initials: null });
+  const strokeRefs = useRef<
+    Record<SignatureKind, { drawing: boolean; points: { x: number; y: number }[] }>
+  >({
+    signature: { drawing: false, points: [] },
+    initials: { drawing: false, points: [] },
+  });
+  // Whether a kind's backing store was sized for THIS dialog session. Init is
+  // once-per-open-per-kind: re-running it would reset canvas.width and wipe
+  // the ink, which is exactly what pad independence forbids.
+  const drawInitRef = useRef<Record<SignatureKind, boolean>>({
+    signature: false,
+    initials: false,
+  });
 
   // Persistence.
   const [saveToAccount, setSaveToAccount] = useState(false);
-  const [saved, setSaved] = useState<UserSignature[]>([]);
+  const [saved, setSaved] = useState<UserSignatureMark[]>([]);
 
   const loadSaved = useCallback(async () => {
-    try {
-      const res = await fetch("/api/user/signatures", {
-        credentials: "same-origin",
-      });
-      if (!res.ok) {
-        setSaved([]);
-        return;
-      }
-      const data: unknown = await res.json();
-      const list = (data as { signatures?: UserSignature[] } | null)?.signatures;
-      setSaved(Array.isArray(list) ? list : []);
-    } catch {
-      // Tolerate any failure silently — the saved list is a convenience only.
-      setSaved([]);
-    }
+    setSaved(await fetchUserSignatures());
   }, []);
 
-  // Reset the volatile selections each time the dialog opens.
+  // Reset BOTH pads each time the dialog opens (a fresh capture session).
   useEffect(() => {
     if (!open) return;
     setKind(defaultKind ?? "signature");
-    setTab("draw");
-    setTypeText("");
-    setUpload(null);
-    setUploadError(null);
-    setHasInk(false);
+    setPads(emptyPads());
+    strokeRefs.current = {
+      signature: { drawing: false, points: [] },
+      initials: { drawing: false, points: [] },
+    };
+    // Force a re-init of each draw surface on first visibility (sizing the
+    // backing store clears any ink left over from a previous session).
+    drawInitRef.current = { signature: false, initials: false };
     void loadSaved();
   }, [open, defaultKind, loadSaved]);
 
-  // (Re)initialise the drawing canvas with a device-pixel-ratio-aware backing
-  // store whenever the Draw tab becomes visible.
+  // Initialise the ACTIVE kind's drawing canvas with a device-pixel-ratio-aware
+  // backing store the first time its Draw tab becomes visible in this session.
+  // Never re-runs for an already-initialised kind: switching kind (or method)
+  // and coming back must find the ink exactly as it was left.
   useEffect(() => {
-    if (!open || tab !== "draw") return;
-    const canvas = canvasRef.current;
+    if (!open || pads[kind].tab !== "draw") return;
+    if (drawInitRef.current[kind]) return;
+    const canvas = canvasRefs.current[kind];
     if (!canvas) return;
     const dpr = window.devicePixelRatio || 1;
     const cssW = canvas.clientWidth || 500;
@@ -150,33 +172,42 @@ export function SignatureCaptureDialog({
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     ctx.strokeStyle = "#000000";
-    ctxRef.current = ctx;
-    setHasInk(false);
-  }, [open, tab]);
+    ctxRefs.current[kind] = ctx;
+    drawInitRef.current[kind] = true;
+  }, [open, kind, pads]);
 
   const pointFromEvent = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   };
 
-  const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const ctx = ctxRef.current;
+  const handlePointerDown = (
+    k: SignatureKind,
+    e: React.PointerEvent<HTMLCanvasElement>,
+  ) => {
+    const ctx = ctxRefs.current[k];
     if (!ctx) return;
-    e.currentTarget.setPointerCapture(e.pointerId);
+    // Optional chaining: setPointerCapture is absent in jsdom (same guard as
+    // page-margin-overlay) — in browsers it keeps the stroke through fast
+    // pointer moves that leave the canvas.
+    e.currentTarget.setPointerCapture?.(e.pointerId);
     const pt = pointFromEvent(e);
-    strokeRef.current = { drawing: true, points: [pt] };
+    strokeRefs.current[k] = { drawing: true, points: [pt] };
     // Emit a dot so a simple tap registers as ink.
     ctx.beginPath();
     ctx.moveTo(pt.x, pt.y);
     ctx.lineTo(pt.x + 0.01, pt.y + 0.01);
     ctx.stroke();
-    setHasInk(true);
+    if (!pads[k].hasInk) patchPad(k, { hasInk: true });
   };
 
-  const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    const st = strokeRef.current;
+  const handlePointerMove = (
+    k: SignatureKind,
+    e: React.PointerEvent<HTMLCanvasElement>,
+  ) => {
+    const st = strokeRefs.current[k];
     if (!st.drawing) return;
-    const ctx = ctxRef.current;
+    const ctx = ctxRefs.current[k];
     if (!ctx) return;
     const pt = pointFromEvent(e);
     st.points.push(pt);
@@ -208,25 +239,25 @@ export function SignatureCaptureDialog({
     // on pointer-down; a segment appears once the second point arrives.
   };
 
-  const handlePointerUp = () => {
-    strokeRef.current.drawing = false;
+  const handlePointerUp = (k: SignatureKind) => {
+    strokeRefs.current[k].drawing = false;
   };
 
-  const clearDrawing = () => {
-    const canvas = canvasRef.current;
-    const ctx = ctxRef.current;
+  const clearDrawing = (k: SignatureKind) => {
+    const canvas = canvasRefs.current[k];
+    const ctx = ctxRefs.current[k];
     if (!canvas || !ctx) return;
     ctx.save();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.restore();
-    strokeRef.current = { drawing: false, points: [] };
-    setHasInk(false);
+    strokeRefs.current[k] = { drawing: false, points: [] };
+    patchPad(k, { hasInk: false });
   };
 
-  /** Export the drawn ink cropped to its bounding box, or null when empty. */
-  const exportDrawing = (): CapturedSignature | null => {
-    const canvas = canvasRef.current;
+  /** Export a kind's drawn ink cropped to its bounding box, or null when empty. */
+  const exportDrawing = (k: SignatureKind): CapturedSignature | null => {
+    const canvas = canvasRefs.current[k];
     if (!canvas) return null;
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
@@ -272,9 +303,9 @@ export function SignatureCaptureDialog({
     return { dataUrl: out.toDataURL("image/png"), width: cropW, height: cropH };
   };
 
-  /** Render the typed text to a transparent canvas sized to fit. */
-  const exportTyped = (): CapturedSignature | null => {
-    const text = typeText.trim();
+  /** Render a kind's typed text to a transparent canvas sized to fit. */
+  const exportTyped = (k: SignatureKind): CapturedSignature | null => {
+    const text = pads[k].typeText.trim();
     if (!text) return null;
     const fontPx = 72;
     const pad = 16;
@@ -304,41 +335,47 @@ export function SignatureCaptureDialog({
     const file = e.target.files?.[0];
     if (!file) return;
     if (file.size > MAX_UPLOAD_BYTES) {
-      setUpload(null);
-      setUploadError(t("uploadTooLarge"));
+      patchPad(kind, { upload: null, uploadError: t("uploadTooLarge") });
       return;
     }
-    setUploadError(null);
+    // Capture the target kind NOW: the async reader callbacks must land on the
+    // pad that received the file even if the user switches kinds meanwhile.
+    const k = kind;
+    patchPad(k, { uploadError: null });
     const reader = new FileReader();
     reader.onload = () => {
       const dataUrl = reader.result;
       if (typeof dataUrl !== "string") return;
       const img = new Image();
       img.onload = () => {
-        setUpload({
-          dataUrl,
-          width: img.naturalWidth || img.width || 300,
-          height: img.naturalHeight || img.height || 150,
+        patchPad(k, {
+          upload: {
+            dataUrl,
+            width: img.naturalWidth || img.width || 300,
+            height: img.naturalHeight || img.height || 150,
+          },
         });
       };
-      img.onerror = () => setUpload(null);
+      img.onerror = () => patchPad(k, { upload: null });
       img.src = dataUrl;
     };
     reader.readAsDataURL(file);
   };
 
   const buildCurrentSignature = (): CapturedSignature | null => {
-    if (tab === "draw") return exportDrawing();
-    if (tab === "type") return exportTyped();
-    return upload;
+    const pad = pads[kind];
+    if (pad.tab === "draw") return exportDrawing(kind);
+    if (pad.tab === "type") return exportTyped(kind);
+    return pad.upload;
   };
 
+  const activePad = pads[kind];
   const insertDisabled =
-    tab === "draw"
-      ? !hasInk
-      : tab === "type"
-        ? typeText.trim() === ""
-        : upload === null || uploadError !== null;
+    activePad.tab === "draw"
+      ? !activePad.hasInk
+      : activePad.tab === "type"
+        ? activePad.typeText.trim() === ""
+        : activePad.upload === null || activePad.uploadError !== null;
 
   const handleInsert = async () => {
     const sig = buildCurrentSignature();
@@ -365,7 +402,7 @@ export function SignatureCaptureDialog({
     onClose();
   };
 
-  const handleInsertSaved = (sig: UserSignature) => {
+  const handleInsertSaved = (sig: UserSignatureMark) => {
     onInsert({
       dataUrl: sig.dataUrl,
       width: sig.width,
@@ -439,7 +476,8 @@ export function SignatureCaptureDialog({
           </button>
         </div>
 
-        {/* Kind toggle */}
+        {/* Kind toggle — two INDEPENDENT pads: switching never resets the
+            other kind's in-progress drawing / text / upload / method. */}
         <div
           role="group"
           aria-label={t("title")}
@@ -462,7 +500,7 @@ export function SignatureCaptureDialog({
           ))}
         </div>
 
-        {/* Method tabs */}
+        {/* Method tabs (per-kind: each pad remembers its own active method) */}
         <div
           role="tablist"
           aria-label={t("title")}
@@ -473,10 +511,10 @@ export function SignatureCaptureDialog({
               key={tabItem.value}
               type="button"
               role="tab"
-              aria-selected={tab === tabItem.value}
-              onClick={() => setTab(tabItem.value)}
+              aria-selected={activePad.tab === tabItem.value}
+              onClick={() => patchPad(kind, { tab: tabItem.value })}
               className={`flex items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-sm font-medium transition-colors ${
-                tab === tabItem.value
+                activePad.tab === tabItem.value
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground"
               }`}
@@ -488,9 +526,16 @@ export function SignatureCaptureDialog({
         </div>
 
         <div className="px-6 pb-6 pt-2 space-y-4">
-          {/* Draw */}
-          {tab === "draw" && (
-            <div className="space-y-2">
+          {/* Draw — BOTH kinds' canvases stay mounted so each keeps its ink;
+              only the active kind's (when its pad is on Draw) is visible. */}
+          {KINDS.map((k) => (
+            <div
+              key={k}
+              data-testid={`signature-draw-pad-${k}`}
+              className={
+                kind === k && pads[k].tab === "draw" ? "space-y-2" : "hidden"
+              }
+            >
               <p className="text-xs text-muted-foreground">{t("drawHint")}</p>
               {/* Adaptive drawing height: shorter on small screens so the
                   dialog (kind toggle + tabs + footer) fits a 360×740 viewport
@@ -498,34 +543,36 @@ export function SignatureCaptureDialog({
                   from clientWidth/clientHeight, and the ink-trim export crops
                   to the drawn bounding box — neither depends on a fixed size. */}
               <canvas
-                ref={canvasRef}
+                ref={(el) => {
+                  canvasRefs.current[k] = el;
+                }}
                 className="h-[160px] sm:h-[200px] w-full rounded-md border border-input bg-white touch-none cursor-crosshair"
-                onPointerDown={handlePointerDown}
-                onPointerMove={handlePointerMove}
-                onPointerUp={handlePointerUp}
-                onPointerCancel={handlePointerUp}
-                onPointerLeave={handlePointerUp}
+                onPointerDown={(e) => handlePointerDown(k, e)}
+                onPointerMove={(e) => handlePointerMove(k, e)}
+                onPointerUp={() => handlePointerUp(k)}
+                onPointerCancel={() => handlePointerUp(k)}
+                onPointerLeave={() => handlePointerUp(k)}
               />
               <div className="flex justify-end">
                 <button
                   type="button"
-                  onClick={clearDrawing}
-                  disabled={!hasInk}
+                  onClick={() => clearDrawing(k)}
+                  disabled={!pads[k].hasInk}
                   className="px-3 py-1.5 text-sm rounded-md border border-input hover:bg-muted disabled:opacity-50"
                 >
                   {t("clear")}
                 </button>
               </div>
             </div>
-          )}
+          ))}
 
           {/* Type */}
-          {tab === "type" && (
+          {activePad.tab === "type" && (
             <div className="space-y-2">
               <input
                 type="text"
-                value={typeText}
-                onChange={(e) => setTypeText(e.target.value)}
+                value={activePad.typeText}
+                onChange={(e) => patchPad(kind, { typeText: e.target.value })}
                 placeholder={t("typePlaceholder")}
                 aria-label={t("tabType")}
                 className="w-full px-3 py-2 rounded-md border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
@@ -539,14 +586,14 @@ export function SignatureCaptureDialog({
                   className="truncate text-4xl leading-none text-black"
                   style={{ fontFamily: HANDWRITING_FONT }}
                 >
-                  {typeText.trim() || t("typePlaceholder")}
+                  {activePad.typeText.trim() || t("typePlaceholder")}
                 </span>
               </div>
             </div>
           )}
 
           {/* Upload */}
-          {tab === "upload" && (
+          {activePad.tab === "upload" && (
             <div className="space-y-2">
               <input
                 type="file"
@@ -556,14 +603,16 @@ export function SignatureCaptureDialog({
                 className="w-full text-sm text-foreground file:mr-3 file:px-3 file:py-2 file:rounded-md file:border file:border-input file:bg-background file:text-sm file:font-medium file:text-foreground hover:file:bg-muted file:cursor-pointer"
               />
               <p className="text-xs text-muted-foreground">{t("uploadHint")}</p>
-              {uploadError && (
-                <p className="text-xs text-destructive">{uploadError}</p>
+              {activePad.uploadError && (
+                <p className="text-xs text-destructive">
+                  {activePad.uploadError}
+                </p>
               )}
-              {upload && (
+              {activePad.upload && (
                 <div className="flex items-center justify-center rounded-md border border-input bg-white p-4">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
-                    src={upload.dataUrl}
+                    src={activePad.upload.dataUrl}
                     alt=""
                     className="max-h-40 max-w-full object-contain"
                   />

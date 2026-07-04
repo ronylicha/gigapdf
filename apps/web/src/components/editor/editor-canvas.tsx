@@ -152,13 +152,22 @@ export interface EditorCanvasHandle {
    * Ajouter une image au canvas. `target` (optionnel — Remplir & Signer) :
    * l'image est AJUSTÉE dans ce rect (ratio préservé, centrée) au lieu du
    * placement libre par défaut — utilisé pour poser une signature dans un
-   * widget de champ signature.
+   * widget de champ signature. `target.widgetId` (elementId du widget) est
+   * mémorisé sur l'image (`data.signedWidgetId`) : le clic suivant sur le
+   * widget SÉLECTIONNE l'image posée au lieu de rouvrir le dialog de capture
+   * (render-elements, routage Remplir & Signer).
    */
   addImage: (
     dataUrl: string,
     width: number,
     height: number,
-    target?: { x: number; y: number; width: number; height: number },
+    target?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      widgetId?: string;
+    },
   ) => void;
   /** Annuler la dernière action */
   undo: () => void;
@@ -1301,9 +1310,13 @@ export function EditorCanvas({
     // has already entered editing on the member — baseline its content so the
     // imminent exitEditing() forwards nothing, then (microtask, out of Fabric's
     // enterEditing call stack) swap the group for the session Textbox. Only in
-    // the plain select tool; form fields never carry a group id.
+    // the plain select tool; form fields never carry a group id. EVERY block
+    // member carries a group id (block identity drives click-selection), but
+    // only a SESSIONABLE one (coherence gate) opens the Textbox session — a
+    // rejected group's member falls through to the plain inline edit below.
     if (
       obj.data?.paragraphGroupId &&
+      obj.data?.paragraphSessionable === true &&
       obj.data?.isParagraphSession !== true &&
       toolRef.current === "select"
     ) {
@@ -1638,6 +1651,42 @@ export function EditorCanvas({
       // Use Fabric `type` (stable across minification) — see fabricObjectToElement above.
       const typeName = (obj as FabricObject & { type?: string }).type ?? "";
 
+      // MULTI-SELECTION transform (block selection / marquee): Fabric fires ONE
+      // object:modified with the ActiveSelection as target — and the children
+      // inside it carry coordinates RELATIVE to the selection centre, so
+      // serialising them directly would persist garbage bounds. Discarding the
+      // selection makes Fabric bake the group transform back into every child
+      // (absolute scene coords); each child is then forwarded through the SAME
+      // per-element pipeline as a single-object move, and the selection is
+      // re-created so the user keeps it (selection events suppressed — the net
+      // selection is unchanged, the panel must not flash).
+      if (typeName === "activeselection") {
+        const canvas = fabricRef.current;
+        const children =
+          (
+            obj as unknown as { getObjects?: () => FabricObject[] }
+          ).getObjects?.() ?? [];
+        if (!canvas || children.length === 0) return;
+        suppressSelectionEventsRef.current = true;
+        try {
+          canvas.discardActiveObject();
+          for (const child of children) {
+            forwardElementModified(child as FabricObjectWithData);
+          }
+          const fabricModule = fabricModuleRef.current;
+          if (fabricModule) {
+            canvas.setActiveObject(
+              new fabricModule.ActiveSelection(children, { canvas }),
+            );
+          }
+        } finally {
+          suppressSelectionEventsRef.current = false;
+        }
+        canvas.requestRenderAll();
+        saveHistory(canvas);
+        return;
+      }
+
       // Skip the duplicate fired by Fabric immediately after exitEditing()
       // mutates the IText (we set fill/textBackgroundColor in
       // handleTextEditingExited and that triggers another object:modified
@@ -1870,10 +1919,15 @@ export function EditorCanvas({
       const gigaCanvas = canvas as typeof canvas & {
         _gigaFillSignMode?: boolean;
         _gigaOnSignatureFieldClick?: (element: unknown) => void;
+        _gigaCurrentTool?: string;
       };
       gigaCanvas._gigaFillSignMode = fillSignActiveRef.current;
       gigaCanvas._gigaOnSignatureFieldClick = (element: unknown) =>
         onSignatureFieldClickRef.current?.(element as FormFieldElement);
+      // Outil courant, lu au moment de l'événement par les handlers souris de
+      // render-elements (sélection de bloc / affordance de survol : actifs
+      // uniquement en outil "select"). Maintenu par l'effet [tool] ci-dessous.
+      gigaCanvas._gigaCurrentTool = toolRef.current;
 
       // Event handlers
       canvas.on("selection:created", handleSelectionChange);
@@ -2622,6 +2676,39 @@ export function EditorCanvas({
         const data = obj.data;
         if (data?.linkUrl || data?.linkPage) {
           onHyperlinkClickRef.current?.(data.linkUrl as string | null, data.linkPage as number | null);
+          return;
+        }
+        // BLOCK-SELECTION UX: with single-click block selection, the first
+        // click of this double-click promoted the block (and the second one
+        // drilled down to the run), so Fabric's native "second click on an
+        // already-selected IText enters editing" never fired. Kick the
+        // member's inline editing here — text:editing:entered then routes it:
+        // Textbox SESSION for a sessionable group, plain inline edit for a
+        // gate-rejected one. Segment fragments (editable:false) keep today's
+        // behaviour (no inline editing), as does an already-editing member.
+        if (
+          toolRef.current === "select" &&
+          !fillSignActiveRef.current &&
+          typeof data?.paragraphGroupId === "string" &&
+          data?.isParagraphSession !== true
+        ) {
+          const editable = obj as FabricObjectWithData & {
+            isEditing?: boolean;
+            editable?: boolean;
+            enterEditing?: () => void;
+            setCursorByClick?: (ev: Event) => void;
+          };
+          if (
+            editable.isEditing === true ||
+            editable.editable === false ||
+            typeof editable.enterEditing !== "function"
+          ) {
+            return;
+          }
+          fabricRef.current?.setActiveObject(obj as FabricObject);
+          editable.enterEditing();
+          if (e.e) editable.setCursorByClick?.(e.e as Event);
+          fabricRef.current?.requestRenderAll();
         }
       });
 
@@ -2905,6 +2992,11 @@ export function EditorCanvas({
     // touchmove (crayon libre) ; outils de navigation → scroll natif au doigt.
     // Le gating CSS équivalent vit sur le wrapper (touchActionForTool en JSX).
     fabricRef.current.allowTouchScrolling = allowTouchScrollingForTool(tool);
+    // Stamp live lu par les handlers souris de render-elements (sélection de
+    // bloc de paragraphe / affordance de survol : outil "select" uniquement).
+    (
+      fabricRef.current as FabricCanvas & { _gigaCurrentTool?: string }
+    )._gigaCurrentTool = tool;
     fabricRef.current.renderAll();
   }, [tool]);
 
@@ -3006,7 +3098,13 @@ export function EditorCanvas({
         dataUrl: string,
         _width?: number,
         _height?: number,
-        target?: { x: number; y: number; width: number; height: number },
+        target?: {
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+          widgetId?: string;
+        },
       ) => {
         if (!fabricRef.current) return;
         import("fabric").then(({ FabricImage }) => {
@@ -3041,8 +3139,19 @@ export function EditorCanvas({
               scaleX,
               scaleY,
             });
-            (img as FabricObjectWithData).data = { elementId: generateId() };
+            (img as FabricObjectWithData).data = {
+              elementId: generateId(),
+              // Remplir & Signer : lie l'image posée à SON widget signature —
+              // le routage clic (render-elements) sélectionne alors l'image au
+              // lieu de rouvrir le dialog tant qu'elle existe sur le canvas.
+              ...(target?.widgetId ? { signedWidgetId: target.widgetId } : {}),
+            };
             fabricRef.current?.add(img);
+            // Z-order : l'image DOIT rester au-dessus du rect du widget
+            // signature (et de tout hit-target plein rect) pour être saisie
+            // directement — l'ordre d'insertion suffit en général, l'assert
+            // explicite couvre tout ré-empilement ultérieur.
+            fabricRef.current?.bringObjectToFront(img);
             fabricRef.current?.setActiveObject(img);
             fabricRef.current?.renderAll();
             if (fabricRef.current) {
@@ -3142,6 +3251,7 @@ export function EditorCanvas({
               lineRuns?: unknown;
               paragraphGroupId?: unknown;
               paragraphGroup?: unknown;
+              paragraphSessionable?: unknown;
               sessionLineTexts?: unknown;
               sessionOriginalText?: unknown;
               sessionOrigin?: unknown;
@@ -3166,6 +3276,7 @@ export function EditorCanvas({
             delete keepRuns.lineRuns;
             delete keepRuns.paragraphGroupId;
             delete keepRuns.paragraphGroup;
+            delete keepRuns.paragraphSessionable;
             delete keepRuns.sessionLineTexts;
             delete keepRuns.sessionOriginalText;
             delete keepRuns.sessionOrigin;

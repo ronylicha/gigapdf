@@ -15,7 +15,7 @@
  * Radix dropdown primitives are stubbed as passthroughs (items render inline),
  * so the test drives the toolbar's own wiring — not Radix internals.
  */
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, cleanup, fireEvent, within } from "@testing-library/react";
 import type { Tool } from "@giga-pdf/types";
 
@@ -307,5 +307,105 @@ describe("EditorToolbar — collapsed 'Outils' menu (same handlers as the button
     clickMenuItem("editor.headersFooters.toolbarLabel");
     expect(onToggleHeadersFooters).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("dlg-headers-footers")).toBeInTheDocument();
+  });
+});
+
+describe("EditorToolbar — signature & initials dropdown (two distinct entries)", () => {
+  // One SIGNATURE mark saved to the account, no initials mark: the two
+  // sections must diverge (one-click insert + "manage" vs direct "new").
+  const savedMarks = [
+    {
+      id: "m1",
+      kind: "signature",
+      dataUrl: "data:image/png;base64,SIG",
+      width: 200,
+      height: 80,
+      createdAt: "2026-07-01T00:00:00Z",
+    },
+  ];
+
+  beforeEach(() => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ signatures: savedMarks }),
+      }),
+    );
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** Open the signature dropdown from its toolbar trigger and return it. */
+  function openSignatureMenu() {
+    fireEvent.click(screen.getByTitle("editor.toolbar.insertSignature"));
+    return screen.getByTestId("signature-menu");
+  }
+
+  it("exposes the two kind sections — Signature and Paraphe", () => {
+    render(<EditorToolbar {...baseProps()} onInsertSignature={vi.fn()} />);
+    const menu = openSignatureMenu();
+    expect(
+      within(menu).getByText("editor.toolbar.signatureKindSignature"),
+    ).toBeInTheDocument();
+    expect(
+      within(menu).getByText("editor.toolbar.signatureKindInitials"),
+    ).toBeInTheDocument();
+  });
+
+  it("one-click inserts a saved mark with its kind + dataUrl (thumbnail preview, no dialog)", async () => {
+    const onInsertSavedSignature = vi.fn();
+    const onInsertSignature = vi.fn();
+    render(
+      <EditorToolbar
+        {...baseProps()}
+        onInsertSignature={onInsertSignature}
+        onInsertSavedSignature={onInsertSavedSignature}
+      />,
+    );
+    const menu = openSignatureMenu();
+    const saved = await within(menu).findByLabelText(
+      "editor.toolbar.insertSavedSignature",
+    );
+    // The preview thumbnail is the saved dataUrl.
+    expect(saved.querySelector("img")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,SIG",
+    );
+    fireEvent.click(saved);
+    expect(onInsertSavedSignature).toHaveBeenCalledWith({
+      dataUrl: "data:image/png;base64,SIG",
+      width: 200,
+      height: 80,
+      kind: "signature",
+    });
+    expect(onInsertSignature).not.toHaveBeenCalled();
+    // Select-and-close UX: the dropdown dismisses after the insert.
+    expect(screen.queryByTestId("signature-menu")).toBeNull();
+  });
+
+  it("opens the capture dialog preset per kind — 'manage/new' when marks exist, direct 'new' otherwise", async () => {
+    const onInsertSignature = vi.fn();
+    render(
+      <EditorToolbar {...baseProps()} onInsertSignature={onInsertSignature} />,
+    );
+    const menu = openSignatureMenu();
+    // Signature has a saved mark → its action reads "manage / new…".
+    expect(
+      await within(menu).findByText("editor.toolbar.signatureManage"),
+    ).toBeInTheDocument();
+    // Initials has none → direct "new initials…" preset entry.
+    fireEvent.click(
+      within(menu).getByText("editor.toolbar.signatureNewInitials"),
+    );
+    expect(onInsertSignature).toHaveBeenCalledWith("initials");
+
+    // Reopen and take the signature path: preset on "signature".
+    const menu2 = openSignatureMenu();
+    fireEvent.click(
+      await within(menu2).findByText("editor.toolbar.signatureManage"),
+    );
+    expect(onInsertSignature).toHaveBeenCalledWith("signature");
   });
 });

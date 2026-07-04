@@ -47,6 +47,10 @@ export interface StoredDocument {
   folder_id: string | null;
   tags: string[];
   file_size_bytes?: number;
+  /** Backend-recorded mime (defaults to application/pdf server-side). */
+  mime_type?: string;
+  /** Import source format slug (e.g. "docx"), "pdf" for native uploads. */
+  original_format?: string;
   created_at: string;
   modified_at: string;
   thumbnail_url: string | null;
@@ -1319,6 +1323,17 @@ class APIClient {
   }
 
   /**
+   * Get the details of a share invitation by its token (read-only).
+   * Powers the /invitations/[token] landing page.
+   */
+  async getInvitationByToken(token: string): Promise<InvitationDetails> {
+    const response = await this.request<APIResponse<InvitationDetails>>(
+      `/api/v1/sharing/invitations/${encodeURIComponent(token)}`
+    );
+    return response.data;
+  }
+
+  /**
    * Accept a share invitation.
    */
   async acceptInvitation(token: string): Promise<AcceptedShare> {
@@ -1791,6 +1806,28 @@ export interface ShareInvitation {
   permission: "view" | "edit";
   expires_at: string;
   document_name: string;
+  /** Set when the invitee already has an account (share auto-activated). */
+  share_id: string | null;
+}
+
+export interface InvitationDetails {
+  invitation_id: string;
+  status: "pending" | "accepted" | "declined" | "revoked" | "expired";
+  invitee_email: string;
+  document: {
+    id: string;
+    name: string;
+    page_count: number;
+    thumbnail_path: string | null;
+  };
+  inviter: {
+    user_id: string;
+    email: string | null;
+  };
+  permission: "view" | "edit";
+  message: string | null;
+  created_at: string | null;
+  expires_at: string | null;
 }
 
 export interface SharedWithMeDocument {

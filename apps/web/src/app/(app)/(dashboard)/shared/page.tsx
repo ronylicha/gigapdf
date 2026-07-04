@@ -31,7 +31,6 @@ import {
 } from "@giga-pdf/ui";
 import {
   Search,
-  FileText,
   MoreVertical,
   Eye,
   Download,
@@ -48,6 +47,7 @@ import {
   ChevronLeft,
   ChevronRight,
 } from "lucide-react";
+import { FileTypeIcon } from "@/components/dashboard/file-type-icon";
 import { api, SharedWithMeDocument } from "@/lib/api";
 import { clientLogger } from "@/lib/client-logger";
 import { formatDate, formatBytes } from "@/lib/utils";
@@ -290,7 +290,7 @@ export default function SharedWithMePage() {
               <Card key={doc.id} className="group hover:shadow-lg transition-shadow">
                 <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-2">
                   <div className="flex items-center space-x-2 min-w-0 flex-1">
-                    <FileText className="h-5 w-5 flex-shrink-0 text-red-500" />
+                    <FileTypeIcon name={doc.name} className="h-5 w-5 flex-shrink-0" />
                     <h3 className="font-semibold truncate" title={doc.name}>
                       {doc.name}
                     </h3>

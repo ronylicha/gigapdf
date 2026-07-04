@@ -29,8 +29,8 @@ import {
   useToast,
 } from "@giga-pdf/ui";
 import { formatDate, formatBytes } from "@/lib/utils";
+import { FileTypeIcon } from "./file-type-icon";
 import {
-  FileText,
   Trash2,
   Download,
   Loader2,
@@ -87,6 +87,7 @@ interface DocumentCardProps {
   updatedAt: Date;
   tags?: string[];
   thumbnailUrl?: string | null;
+  mimeType?: string | null;
   onDelete?: () => void;
   onRename?: (newName: string) => void;
   /** Refresh callback after duplicate / tags update. */
@@ -107,6 +108,7 @@ export function DocumentCard({
   updatedAt,
   tags = [],
   thumbnailUrl = null,
+  mimeType = null,
   onDelete,
   onRename,
   onChanged,
@@ -375,7 +377,7 @@ export function DocumentCard({
                 <Square className="h-5 w-5 flex-shrink-0 text-muted-foreground" />
               )
             ) : (
-              <FileText className="h-5 w-5 flex-shrink-0 text-red-500" />
+              <FileTypeIcon mimeType={mimeType} name={documentName} className="h-5 w-5 flex-shrink-0" />
             )}
             <h3 className="font-semibold truncate" title={documentName}>
               {documentName}

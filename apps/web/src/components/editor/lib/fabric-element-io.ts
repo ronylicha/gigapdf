@@ -152,6 +152,11 @@ export function fabricObjectToElement(
   // `elementId` is `hit:`-prefixed so element lookups never resolve it, and it
   // must never round-trip as an element of its own.
   if (obj.data?.isFieldHitTarget === true) return null;
+  // The paragraph hover-affordance outline (render-elements) is pure chrome
+  // too: a transient Rect drawn while a block member is hovered. It carries no
+  // elementId and must NEVER be serialised nor queued as an operation — this
+  // is the single seam that keeps it out of the save path.
+  if (obj.data?.isParagraphHoverOutline === true) return null;
   const elementId = obj.data?.elementId || generateId();
   const scaleY = obj.scaleY ?? 1;
   // A user resize bakes obj.scaleX into bounds.width here. There is no longer a

@@ -180,6 +180,111 @@ export function getPasswordResetEmailTemplate(
   return { subject, html };
 }
 
+/**
+ * Escapes HTML-special characters. Share e-mails interpolate caller-supplied
+ * strings (document name, inviter name from a POST body) into the HTML body —
+ * unlike the auth templates whose inputs come from our own account records.
+ */
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export interface ShareInvitationEmailParams {
+  /** Display name (or e-mail) of the person sharing the document. */
+  inviterName: string;
+  documentName: string;
+  permission: "view" | "edit";
+  /** Absolute link — /shared for existing accounts, /invitations/{token} otherwise. */
+  ctaUrl: string;
+  /**
+   * When true the share is already ACTIVE (auto-activated for an existing
+   * account) — the e-mail points at "Shared with me". When false the invitee
+   * has no account yet and must open the invitation link to accept it.
+   */
+  inviteeHasAccount: boolean;
+}
+
+export function getShareInvitationEmailTemplate(
+  params: ShareInvitationEmailParams,
+  locale: string = "fr",
+): { subject: string; html: string } {
+  const { permission, ctaUrl, inviteeHasAccount } = params;
+  const isEnglish = locale === "en";
+
+  // Subject is a plain-text header; HTML-escape only what lands in the body.
+  const subject = isEnglish
+    ? `${params.inviterName} shared "${params.documentName}" with you`
+    : `${params.inviterName} a partagé « ${params.documentName} » avec vous`;
+
+  const inviterName = escapeHtml(params.inviterName);
+  const documentName = escapeHtml(params.documentName);
+
+  const permissionLabel = isEnglish
+    ? permission === "edit"
+      ? "can edit"
+      : "read-only"
+    : permission === "edit"
+      ? "modification autorisée"
+      : "lecture seule";
+
+  const accessLine = inviteeHasAccount
+    ? isEnglish
+      ? "Your access is already active — the document is waiting for you in your <strong>Shared with me</strong> space."
+      : "Votre accès est déjà actif — le document vous attend dans votre espace <strong>Partagés avec moi</strong>."
+    : isEnglish
+      ? "Open the invitation below to accept it and access the document. You'll be asked to create a free GigaPDF account first."
+      : "Ouvrez l'invitation ci-dessous pour l'accepter et accéder au document. La création d'un compte GigaPDF gratuit vous sera d'abord demandée.";
+
+  const bodyHtml = `
+    <p style="margin: 0 0 20px;">${isEnglish ? "Hi," : "Bonjour,"}</p>
+    <p style="margin: 0 0 20px;">${
+      isEnglish
+        ? `<strong>${inviterName}</strong> shared the document <strong>"${documentName}"</strong> with you on GigaPDF (${permissionLabel}).`
+        : `<strong>${inviterName}</strong> a partagé le document <strong>« ${documentName} »</strong> avec vous sur GigaPDF (${permissionLabel}).`
+    }</p>
+    <p style="margin: 0 0 22px;">${accessLine}</p>
+    <p style="margin: 22px 0 0; color: #64748B; font-size: 13px; line-height: 1.6; word-break: break-all;">
+      ${isEnglish ? "If the button doesn't work, copy and paste this link:" : "Si le bouton ne fonctionne pas, copiez-collez ce lien :"}<br />
+      <a href="${ctaUrl}" style="color: ${BRAND.colors.primary};">${ctaUrl}</a>
+    </p>`;
+
+  const html = renderEmail({
+    locale,
+    preview: isEnglish
+      ? `${inviterName} shared "${documentName}" with you on GigaPDF.`
+      : `${inviterName} a partagé « ${documentName} » avec vous sur GigaPDF.`,
+    subtitle: isEnglish ? "Document sharing" : "Partage de document",
+    heading: isEnglish
+      ? "A document was shared with you"
+      : "Un document a été partagé avec vous",
+    bodyHtml,
+    cta: {
+      label: inviteeHasAccount
+        ? isEnglish
+          ? "Open the shared document"
+          : "Ouvrir le document partagé"
+        : isEnglish
+          ? "View the invitation"
+          : "Voir l'invitation",
+      url: ctaUrl,
+    },
+    footerNote: inviteeHasAccount
+      ? isEnglish
+        ? "This link is personal. If you don't know the sender, you can safely ignore this email."
+        : "Ce lien est personnel. Si vous ne connaissez pas l'expéditeur, vous pouvez ignorer cet email."
+      : isEnglish
+        ? "This invitation link is personal — please don't forward it. If you don't know the sender, you can safely ignore this email."
+        : "Ce lien d'invitation est personnel — merci de ne pas le transférer. Si vous ne connaissez pas l'expéditeur, vous pouvez ignorer cet email.",
+  });
+
+  return { subject, html };
+}
+
 export function getVerificationEmailTemplate(
   verificationUrl: string,
   locale: string = "fr",

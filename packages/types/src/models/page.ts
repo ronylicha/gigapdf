@@ -139,6 +139,25 @@ export interface PageBlockGroup {
   frame?: { x: number; y: number; width: number; height: number };
   /** First-line indent (positive) or hanging indent (negative), in points. */
   firstLineIndentPt?: number;
+  /** Left indent of the paragraph body, in points (additive, lib 0.117). */
+  indentLeftPt?: number;
+  /** Space before the paragraph, in points (additive, lib 0.117). */
+  spaceBeforePt?: number;
+  /** Space after the paragraph, in points (additive, lib 0.117). */
+  spaceAfterPt?: number;
+  /**
+   * Per-line break softness (additive, lib 0.117): `true` where the engine
+   * judged the line break SOFT (produced by wrapping — a full-width or
+   * justified line), `false` for a HARD break (a deliberately short line:
+   * address, verse, signature). Aligned index-for-index with the `{t:'br'}`
+   * breaks between `lines`. Lets a block editor decide whether to reflow.
+   */
+  softBreaks?: boolean[];
+  /**
+   * Writing direction from the lib's `ParagraphStyle.direction` (additive,
+   * lib 0.117). Absent means left-to-right.
+   */
+  direction?: "ltr" | "rtl";
 }
 
 export interface PageObject {

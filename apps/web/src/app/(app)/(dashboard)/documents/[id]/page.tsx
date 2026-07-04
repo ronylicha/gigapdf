@@ -39,7 +39,6 @@ import {
   Copy,
   Download,
   ExternalLink,
-  FileText,
   FileX,
   History,
   Loader2,
@@ -49,6 +48,7 @@ import {
   Tags,
   Trash2,
 } from "lucide-react";
+import { FileTypeIcon } from "@/components/dashboard/file-type-icon";
 import { api } from "@/lib/api";
 import { formatBytes, formatDate } from "@/lib/utils";
 import { ShareDialog } from "@/components/sharing";
@@ -391,8 +391,12 @@ export default function DocumentPage({ params }: DocumentPageProps) {
               />
             </div>
           ) : (
-            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-red-500/10">
-              <FileText className="h-6 w-6 text-red-500" />
+            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-muted">
+              <FileTypeIcon
+                mimeType={meta?.mime_type}
+                name={session.name}
+                className="h-6 w-6"
+              />
             </div>
           )}
           <div className="min-w-0 space-y-1">

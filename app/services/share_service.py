@@ -97,6 +97,11 @@ class ShareService:
         """Delegate to :meth:`InvitationService.get_pending_invitations`."""
         return await InvitationService.get_pending_invitations(user_email=user_email)
 
+    @staticmethod
+    async def get_invitation_by_token(token: str) -> dict:
+        """Delegate to :meth:`InvitationService.get_invitation_by_token`."""
+        return await InvitationService.get_invitation_by_token(token=token)
+
     # ------------------------------------------------------------------
     # Permission operations — delegates to PermissionService
     # ------------------------------------------------------------------
@@ -201,6 +206,16 @@ class ShareService:
             document_id=document_id,
             owner_id=owner_id,
         )
+
+    @staticmethod
+    async def resolve_public_link(token: str) -> dict:
+        """Delegate to :meth:`ShareCrudService.resolve_public_link`."""
+        return await ShareCrudService.resolve_public_link(token=token)
+
+    @staticmethod
+    async def download_public_document(token: str) -> tuple[bytes, str]:
+        """Delegate to :meth:`ShareCrudService.download_public_document`."""
+        return await ShareCrudService.download_public_document(token=token)
 
 
 # Singleton — identical name kept for backward compatibility.

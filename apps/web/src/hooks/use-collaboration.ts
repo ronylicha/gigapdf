@@ -12,7 +12,13 @@ import {
 import type { Element, PageObject } from "@giga-pdf/types";
 
 interface UseCollaborationOptions {
-  /** ID du document à collaborer */
+  /**
+   * ID du document à collaborer — le storedDocumentId (le `[id]` de la route
+   * éditeur, commun à tous les collaborateurs), JAMAIS l'id de session Redis
+   * retourné par /load (recréé par utilisateur : chacun finirait seul dans sa
+   * propre room). Sert au join de la room, aux émissions ET au filtre des
+   * événements reçus (data.document_id).
+   */
   documentId: string | null;
   /** Callback quand le document est mis à jour */
   onDocumentUpdate?: (changes: unknown) => void;

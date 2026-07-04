@@ -100,7 +100,7 @@ class ShareCrudService:
                     document_id=share.document_id,
                     title="Access revoked",
                     message=f"Your access to '{document.name}' has been revoked",
-                    metadata={
+                    extra_data={
                         "document_name": document.name,
                         "revoker_id": revoker_id,
                     },
@@ -558,6 +558,128 @@ class ShareCrudService:
                 "expires_at": expires_at.isoformat() if expires_at else None,
                 "already_existed": False,
             }
+
+    @staticmethod
+    async def _get_active_public_share(
+        session, token: str
+    ) -> tuple[DocumentShare, StoredDocument]:
+        """
+        Resolve an ACTIVE, non-expired public link token.
+
+        The query filters on ``share_token`` + ``status == ACTIVE`` + document
+        not deleted, so revoked links and deleted documents never match. The
+        expiry check happens in Python (``expires_at`` may be NULL = no expiry).
+
+        Security note: the *token* is a capability secret — it must never be
+        logged or embedded in error messages (callers map ``ValueError`` to a
+        generic 404).
+
+        Args:
+            session: Active async DB session.
+            token: The public link token (``DocumentShare.share_token``).
+
+        Returns:
+            tuple: ``(share, document)``.
+
+        Raises:
+            ValueError: If no active link matches or the link has expired.
+        """
+        if not token:
+            raise ValueError("Public link not found")
+
+        result = await session.execute(
+            select(DocumentShare, StoredDocument)
+            .join(StoredDocument, DocumentShare.document_id == StoredDocument.id)
+            .where(
+                DocumentShare.share_token == token,
+                DocumentShare.status == ShareStatus.ACTIVE,
+                ~StoredDocument.is_deleted,
+            )
+        )
+        row = result.first()
+        if row is None:
+            raise ValueError("Public link not found")
+
+        share, document = row
+
+        if share.expires_at is not None and share.expires_at <= now_utc():
+            raise ValueError("Public link expired")
+
+        return share, document
+
+    @staticmethod
+    async def resolve_public_link(token: str) -> dict:
+        """
+        Resolve a public link token into display metadata (UNAUTHENTICATED).
+
+        Powers the public ``/public/[token]`` viewer page: only non-sensitive
+        display fields are returned (never the owner identity, never IDs that
+        would allow enumeration of other endpoints).
+
+        Args:
+            token: The public link token.
+
+        Returns:
+            dict: ``{document_name, page_count, file_size_bytes, permission}``.
+
+        Raises:
+            ValueError: If the link is unknown, revoked, or expired.
+        """
+        async with get_db_session() as session:
+            _share, document = await ShareCrudService._get_active_public_share(
+                session, token
+            )
+
+            return {
+                "document_name": document.name,
+                "page_count": document.page_count,
+                "file_size_bytes": document.file_size_bytes,
+                "permission": SharePermission.VIEW,
+            }
+
+    @staticmethod
+    async def download_public_document(token: str) -> tuple[bytes, str]:
+        """
+        Load the PDF bytes behind a public link (UNAUTHENTICATED).
+
+        Reuses the standard storage download path (current version, S3,
+        decryption) **with the OWNER identity**: documents are encrypted at
+        rest with an AAD bound to ``(document_id, owner_id)``, so the owner's
+        user id is required for decryption — the anonymous caller only ever
+        receives the plaintext bytes, never key material.
+
+        Args:
+            token: The public link token.
+
+        Returns:
+            tuple: ``(pdf_bytes, document_name)``.
+
+        Raises:
+            ValueError: If the link is unknown/revoked/expired or the stored
+                file cannot be loaded.
+        """
+        # Lazy import to keep sharing services import-light (and cycle-free).
+        from app.services.storage_service import storage_service
+
+        async with get_db_session() as session:
+            share, document = await ShareCrudService._get_active_public_share(
+                session, token
+            )
+
+            data = await storage_service.load_document_file(
+                session, document.id, document.owner_id
+            )
+
+            if data is None:
+                # Log by share/document id only — NEVER the token.
+                logger.error(
+                    "Public link %s: stored file missing for document %s",
+                    share.id,
+                    document.id,
+                )
+                raise ValueError("Document file unavailable")
+
+            return data, document.name
 
     @staticmethod
     async def revoke_public_link(document_id: str, owner_id: str) -> dict:

@@ -7,8 +7,9 @@ notifications, and accessing shared documents.
 
 import time
 from typing import Literal
+from urllib.parse import quote
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel, EmailStr, Field
 
 from app.middleware.auth import AuthenticatedUser
@@ -688,6 +689,123 @@ async def get_pending_invitations(
             processing_time_ms=processing_time,
         ),
     )
+
+
+@router.get(
+    "/invitations/{token}",
+    response_model=APIResponse[dict],
+    summary="Get a share invitation by token",
+    description="""
+Retrieve the details of a share invitation using its unique token.
+
+This read-only endpoint powers the invitation landing page: it lets the
+invitee review the document, the inviter and the offered permission before
+accepting or declining. The invitation status is **not** modified.
+
+## Path Parameters
+- **token**: The unique invitation token received in the invitation e-mail
+
+## Response
+Returns the invitation details with:
+- Invitation ID and effective status (pending, accepted, declined, revoked, expired)
+- Document information (name, page count, thumbnail)
+- Inviter information (email)
+- Permission level being offered
+- Invitation message (if any)
+- Creation and expiration dates
+""",
+    response_description="Invitation details including effective status, document, inviter, permission level and expiration date",
+    responses={
+        200: {"description": "Invitation retrieved successfully"},
+        404: {"description": "Invitation not found"},
+    },
+    openapi_extra={
+        "x-codeSamples": [
+            {
+                "lang": "curl",
+                "label": "cURL",
+                "source": """curl -X GET "https://api.giga-pdf.com/api/v1/sharing/invitations/{invitation_token}" \\
+  -H "Authorization: Bearer $TOKEN" """
+            },
+            {
+                "lang": "python",
+                "label": "Python",
+                "source": """import requests
+
+# Look up a share invitation before accepting it
+invitation_token = "inv_abc123xyz"
+response = requests.get(
+    f"https://api.giga-pdf.com/api/v1/sharing/invitations/{invitation_token}",
+    headers={"Authorization": "Bearer YOUR_TOKEN"}
+)
+result = response.json()
+
+invitation = result["data"]
+print(f"Document: {invitation['document']['name']}")
+print(f"From: {invitation['inviter']['email']}")
+print(f"Permission: {invitation['permission']}")
+print(f"Status: {invitation['status']}")"""
+            },
+            {
+                "lang": "javascript",
+                "label": "JavaScript",
+                "source": """// Look up a share invitation before accepting it
+const invitationToken = 'inv_abc123xyz';
+const response = await fetch(
+  `https://api.giga-pdf.com/api/v1/sharing/invitations/${invitationToken}`,
+  {
+    method: 'GET',
+    headers: { 'Authorization': 'Bearer YOUR_TOKEN' }
+  }
+);
+const result = await response.json();
+
+const invitation = result.data;
+console.log(`Document: ${invitation.document.name}`);
+console.log(`From: ${invitation.inviter.email} (${invitation.permission})`);"""
+            }
+        ]
+    }
+)
+async def get_invitation_by_token(
+    token: str,
+    user: AuthenticatedUser,
+) -> APIResponse[dict]:
+    """
+    Get a share invitation by its token.
+
+    Read-only lookup used by the invitation landing page so the invitee can
+    review the invitation before responding. Does not mutate the invitation.
+
+    Args:
+        token: The unique invitation token.
+        user: The authenticated user making the request.
+
+    Returns:
+        APIResponse containing the invitation details.
+
+    Raises:
+        HTTPException 404: If the invitation is not found.
+    """
+    start_time = time.time()
+
+    try:
+        result = await share_service.get_invitation_by_token(token=token)
+
+        processing_time = int((time.time() - start_time) * 1000)
+
+        return APIResponse(
+            success=True,
+            data=result,
+            meta=MetaInfo(
+                request_id=get_request_id(),
+                timestamp=now_utc(),
+                processing_time_ms=processing_time,
+            ),
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.post(
@@ -2285,4 +2403,192 @@ async def mark_all_notifications_read(
             timestamp=now_utc(),
             processing_time_ms=processing_time,
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public link resolution (UNAUTHENTICATED)
+#
+# These two routes intentionally have NO ``AuthenticatedUser`` dependency:
+# auth in this backend is enforced exclusively at route level (the JWT
+# middleware is best-effort and never blocks), so omitting the dependency is
+# what makes them public. The capability is the token itself.
+#
+# Security invariants:
+#   - The token is a secret: it must NEVER appear in our log statements or in
+#     error messages (only share/document ids are ever logged).
+#   - Responses carry ``X-Robots-Tag: noindex`` and are never cached long
+#     (``Cache-Control: private, no-store``) — a revoked link must die
+#     immediately, and token-bearing URLs must not be indexed.
+# ---------------------------------------------------------------------------
+
+_PUBLIC_LINK_404_DETAIL = "Public link not found or expired"
+
+
+def _public_no_store_headers() -> dict[str, str]:
+    """Common headers for public-link responses (no indexing, no caching)."""
+    return {
+        "X-Robots-Tag": "noindex, nofollow",
+        "Cache-Control": "private, no-store",
+    }
+
+
+def _content_disposition(document_name: str, inline: bool) -> str:
+    """
+    Build a header-injection-safe ``Content-Disposition`` value.
+
+    Uses the RFC 5987 ``filename*`` form for non-ASCII names with a sanitized
+    ASCII fallback (quotes and control characters stripped).
+    """
+    sanitized = "".join(
+        c for c in (document_name or "") if c not in '"\\\r\n' and c.isprintable()
+    ).strip()
+    ascii_fallback = (
+        sanitized.encode("ascii", "ignore").decode("ascii").strip() or "document.pdf"
+    )
+    disposition = "inline" if inline else "attachment"
+    utf8_name = quote(sanitized or "document.pdf", safe="")
+    return (
+        f'{disposition}; filename="{ascii_fallback}"; '
+        f"filename*=UTF-8''{utf8_name}"
+    )
+
+
+@router.get(
+    "/public/{token}",
+    response_model=APIResponse[dict],
+    summary="Resolve a public link (no authentication)",
+    description="""
+Resolve a public share link token into document display metadata.
+
+This endpoint is **public** — no authentication is required. Anyone holding
+the link can see the document name, page count and size before viewing it.
+
+## Path Parameters
+- **token**: The public link token (from the shared URL)
+
+## Response
+Returns the document name, page count, file size and the (always ``view``)
+permission. Unknown, revoked or expired tokens return **404** without
+distinguishing the cause (anti-enumeration).
+""",
+    response_description="Display metadata for the publicly shared document",
+    responses={
+        200: {"description": "Public link resolved successfully"},
+        404: {"description": "Public link not found, revoked, or expired"},
+    },
+)
+async def get_public_link_document(
+    token: str,
+    response: Response,
+) -> APIResponse[dict]:
+    """
+    Resolve a public link token (unauthenticated).
+
+    Args:
+        token: The public link token from the shared URL.
+        response: FastAPI response (used to attach noindex/no-store headers).
+
+    Returns:
+        APIResponse with ``{document_name, page_count, file_size_bytes,
+        permission}``.
+
+    Raises:
+        HTTPException 404: If the link is unknown, revoked, or expired.
+    """
+    start_time = time.time()
+
+    for header, value in _public_no_store_headers().items():
+        response.headers[header] = value
+
+    try:
+        result = await share_service.resolve_public_link(token=token)
+    except ValueError:
+        # Generic 404 — never echo the token or the precise failure cause.
+        raise HTTPException(status_code=404, detail=_PUBLIC_LINK_404_DETAIL)
+
+    processing_time = int((time.time() - start_time) * 1000)
+
+    return APIResponse(
+        success=True,
+        data=result,
+        meta=MetaInfo(
+            request_id=get_request_id(),
+            timestamp=now_utc(),
+            processing_time_ms=processing_time,
+        ),
+    )
+
+
+@router.get(
+    "/public/{token}/download",
+    summary="Download a publicly shared document (no authentication)",
+    description="""
+Stream the PDF behind a public share link.
+
+This endpoint is **public** — no authentication is required. The PDF served
+is the current version of the owner's document (decrypted server-side).
+
+## Path Parameters
+- **token**: The public link token (from the shared URL)
+
+## Query Parameters
+- **dl**: If true, serve as an attachment (forces a download) instead of
+  inline (browser viewer)
+
+## Response
+The raw PDF bytes with `Content-Disposition: inline` (or `attachment`),
+`X-Robots-Tag: noindex` and no caching. Unknown, revoked or expired tokens
+return **404**.
+""",
+    response_description="The PDF file bytes",
+    response_class=Response,
+    responses={
+        200: {
+            "description": "PDF streamed successfully",
+            "content": {"application/pdf": {}},
+        },
+        404: {"description": "Public link not found, revoked, or expired"},
+    },
+)
+async def download_public_link_document(
+    token: str,
+    dl: bool = Query(default=False, description="Force attachment download"),
+) -> Response:
+    """
+    Stream the PDF behind a public link (unauthenticated).
+
+    The bytes are loaded through the standard storage path with the OWNER
+    identity (required for at-rest decryption) — see
+    :meth:`ShareCrudService.download_public_document`.
+
+    Args:
+        token: The public link token from the shared URL.
+        dl: If True, serve with ``Content-Disposition: attachment``.
+
+    Returns:
+        Response: The PDF bytes.
+
+    Raises:
+        HTTPException 404: If the link is unknown, revoked, or expired, or
+            the stored file is unavailable.
+    """
+    try:
+        pdf_bytes, document_name = await share_service.download_public_document(
+            token=token
+        )
+    except ValueError:
+        # Generic 404 — never echo the token or the precise failure cause.
+        raise HTTPException(status_code=404, detail=_PUBLIC_LINK_404_DETAIL)
+
+    headers = {
+        "Content-Disposition": _content_disposition(document_name, inline=not dl),
+        "Content-Length": str(len(pdf_bytes)),
+        **_public_no_store_headers(),
+    }
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers=headers,
     )

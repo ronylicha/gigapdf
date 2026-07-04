@@ -2,7 +2,12 @@
 
 import dynamic from "next/dynamic";
 import { useEffect } from "react";
-import { apiClient, setApiConfig, QueryProvider } from "@giga-pdf/api";
+import {
+  apiClient,
+  setApiConfig,
+  setAuthTokenProvider,
+  QueryProvider,
+} from "@giga-pdf/api";
 import { getAuthToken } from "@/lib/auth-token";
 
 // The shared apiClient (packages/api) attaches its bearer token from
@@ -28,6 +33,11 @@ function installApiAuthInterceptor(): void {
 }
 if (typeof window !== "undefined") {
   installApiAuthInterceptor();
+  // Même source de token pour le handshake WebSocket : le SocketClient lisait
+  // getTokenStorage() (localStorage, jamais alimenté ici) → auth vide → toute
+  // connexion collaboration refusée par le backend. La callback `auth` de
+  // socket.io ré-évalue ce provider à chaque (re)connexion (refresh couvert).
+  setAuthTokenProvider(getAuthToken);
 }
 
 // Lazy load ThemeProvider to avoid SSG issues

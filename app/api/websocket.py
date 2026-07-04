@@ -12,10 +12,15 @@ import logging
 
 import socketio
 from fastapi import HTTPException
+from sqlalchemy import select
 
 from app.config import get_settings
+from app.core.database import get_db_session
 from app.middleware.auth import decode_jwt_token
+from app.models.database import StoredDocument
+from app.repositories.document_repo import document_sessions
 from app.services.collaboration_service import collaboration_manager
+from app.services.sharing.access_guard import authorize_document_access
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +127,60 @@ async def get_document_room(document_id: str) -> str:
     return f"document:{document_id}"
 
 
+async def _authorize_document_join(document_id: str, user_id: str) -> bool:
+    """
+    Owner-or-shared gate applied BEFORE entering a document room.
+
+    Mirrors the editor load path (storage.load_stored_document): a stored
+    document may be joined by its owner or by a user holding an active,
+    non-expired share — enforced by
+    :func:`app.services.sharing.access_guard.authorize_document_access`.
+
+    The editor also collaborates on transient SESSION documents (Redis,
+    created per-user by ``POST /storage/documents/{id}/load``). Those have no
+    share table and are only ever owned by the user who loaded them, so only
+    their owner may join. Unknown ids are refused (fail-closed).
+
+    Args:
+        document_id: Target document (stored document id or session id).
+        user_id: Authenticated user from the socket session.
+
+    Returns:
+        bool: True when the user may join the room, False otherwise.
+    """
+    try:
+        async with get_db_session() as db:
+            result = await db.execute(
+                select(StoredDocument).where(
+                    StoredDocument.id == document_id,
+                    ~StoredDocument.is_deleted,
+                )
+            )
+            stored_doc = result.scalar_one_or_none()
+
+            if stored_doc is not None:
+                try:
+                    await authorize_document_access(db, stored_doc, user_id)
+                    return True
+                except HTTPException:
+                    return False
+    except Exception as e:
+        # DB lookup failure must not grant access — fall through to the
+        # session-document check (which does not depend on the database).
+        logger.error(
+            f"Room authorization lookup failed for document {document_id}: {e}"
+        )
+
+    # Not a stored document — transient editing session (Redis-backed).
+    try:
+        session = await document_sessions.get_session_async(document_id)
+    except Exception as e:
+        logger.error(f"Session lookup failed for document {document_id}: {e}")
+        return False
+
+    return session is not None and session.owner_id == user_id
+
+
 # Event handlers
 @sio.event
 async def connect(sid: str, environ: dict, auth: dict) -> bool:
@@ -180,11 +239,13 @@ async def disconnect(sid: str):
         collab_session = await collaboration_manager.remove_session(sid)
 
         if collab_session:
-            # Notify other users
+            # Notify other users — "user:leave" with document_id is the
+            # contract the web client listens to.
             room = await get_document_room(document_id)
             await sio.emit(
-                "user:left",
+                "user:leave",
                 {
+                    "document_id": document_id,
                     "user_id": collab_session.user_id,
                     "user_name": collab_session.user_name,
                     "timestamp": collab_session.last_seen_at.isoformat(),
@@ -201,10 +262,13 @@ async def disconnect(sid: str):
         logger.error(f"Error handling disconnect for {sid}: {e}")
 
 
-@sio.event
-async def join_document(sid: str, data: dict) -> dict:
+async def _join_document_impl(sid: str, data: dict) -> dict:
     """
     Join a document collaboration room.
+
+    Shared implementation behind both event names: the historical
+    ``join_document`` and the ``document:join`` contract the web client
+    actually emits (packages/api/src/websocket/client.ts joinDocument()).
 
     Args:
         sid: Socket ID.
@@ -214,24 +278,48 @@ async def join_document(sid: str, data: dict) -> dict:
         dict: Response with session info and active users.
     """
     try:
-        document_id = data.get("document_id")
+        document_id = data.get("document_id") if isinstance(data, dict) else None
         if not document_id:
             return {
                 "success": False,
                 "error": "Missing document_id",
             }
 
-        # Get user from session
+        # Get user from session (do NOT mark the document as joined yet —
+        # the element relays trust session["document_id"], so it must only
+        # be set after the authorization gate below).
         async with sio.session(sid) as session:
             user_id = session.get("user_id")
             user_name = session.get("user_name")
-            session["document_id"] = document_id
 
         if not user_id:
             return {
                 "success": False,
                 "error": "Not authenticated",
             }
+
+        # Owner-or-shared gate (same rule as the editor load endpoint).
+        if not await _authorize_document_join(document_id, user_id):
+            logger.warning(
+                f"User {user_id} denied access to document {document_id} "
+                f"room (socket: {sid})"
+            )
+            await sio.emit(
+                "error",
+                {
+                    "event": "document:join",
+                    "document_id": document_id,
+                    "message": "You do not have access to this document",
+                },
+                to=sid,
+            )
+            return {
+                "success": False,
+                "error": "Access denied to this document",
+            }
+
+        async with sio.session(sid) as session:
+            session["document_id"] = document_id
 
         # Create collaboration session
         collab_session = await collaboration_manager.create_session(
@@ -241,9 +329,10 @@ async def join_document(sid: str, data: dict) -> dict:
             socket_id=sid,
         )
 
-        # Join Socket.IO room
+        # Join Socket.IO room (coroutine since python-socketio 5.10 — an
+        # un-awaited call is a silent no-op and the user never joins).
         room = await get_document_room(document_id)
-        sio.enter_room(sid, room)
+        await sio.enter_room(sid, room)
 
         # Get other active users
         active_users = await collaboration_manager.get_active_users(document_id)
@@ -251,10 +340,13 @@ async def join_document(sid: str, data: dict) -> dict:
         # Get active locks
         active_locks = await collaboration_manager.get_document_locks(document_id)
 
-        # Notify other users
+        # Notify other users — "user:join" with document_id is the contract
+        # the web client listens to (packages/api/src/websocket/hooks.ts
+        # filters on data.document_id).
         await sio.emit(
-            "user:joined",
+            "user:join",
             {
+                "document_id": document_id,
                 "user_id": collab_session.user_id,
                 "user_name": collab_session.user_name,
                 "user_color": collab_session.user_color,
@@ -263,6 +355,23 @@ async def join_document(sid: str, data: dict) -> dict:
             room=room,
             skip_sid=sid,
         )
+
+        # Presence backfill: the client does not consume the ack, it only
+        # builds presence from "user:join" events — replay the already
+        # active users to the newcomer so both sides see each other.
+        for active_user in active_users:
+            if active_user.socket_id == sid:
+                continue
+            await sio.emit(
+                "user:join",
+                {
+                    "document_id": document_id,
+                    "user_id": active_user.user_id,
+                    "user_name": active_user.user_name,
+                    "user_color": active_user.user_color,
+                },
+                to=sid,
+            )
 
         logger.info(
             f"User {user_id} joined document {document_id} (socket: {sid})"
@@ -305,9 +414,24 @@ async def join_document(sid: str, data: dict) -> dict:
 
 
 @sio.event
-async def leave_document(sid: str, data: dict) -> dict:
+async def join_document(sid: str, data: dict) -> dict:
+    """Historical event name — delegates to the shared join implementation."""
+    return await _join_document_impl(sid, data)
+
+
+@sio.on("document:join")
+async def document_join(sid: str, data: dict) -> dict:
+    """Client contract event name (SocketClient.joinDocument) — same logic."""
+    return await _join_document_impl(sid, data)
+
+
+async def _leave_document_impl(sid: str, data: dict) -> dict:
     """
     Leave a document collaboration room.
+
+    Shared implementation behind both event names: the historical
+    ``leave_document`` and the ``document:leave`` contract the web client
+    actually emits (packages/api/src/websocket/client.ts leaveDocument()).
 
     Args:
         sid: Socket ID.
@@ -331,14 +455,17 @@ async def leave_document(sid: str, data: dict) -> dict:
         collab_session = await collaboration_manager.remove_session(sid)
 
         if collab_session:
-            # Leave Socket.IO room
+            # Leave Socket.IO room (coroutine since python-socketio 5.10 —
+            # an un-awaited call is a silent no-op).
             room = await get_document_room(document_id)
-            sio.leave_room(sid, room)
+            await sio.leave_room(sid, room)
 
-            # Notify other users
+            # Notify other users — "user:leave" with document_id is the
+            # contract the web client listens to.
             await sio.emit(
-                "user:left",
+                "user:leave",
                 {
+                    "document_id": document_id,
                     "user_id": collab_session.user_id,
                     "user_name": collab_session.user_name,
                     "timestamp": collab_session.last_seen_at.isoformat(),
@@ -358,6 +485,18 @@ async def leave_document(sid: str, data: dict) -> dict:
             "success": False,
             "error": str(e),
         }
+
+
+@sio.event
+async def leave_document(sid: str, data: dict) -> dict:
+    """Historical event name — delegates to the shared leave implementation."""
+    return await _leave_document_impl(sid, data)
+
+
+@sio.on("document:leave")
+async def document_leave(sid: str, data: dict) -> dict:
+    """Client contract event name (SocketClient.leaveDocument) — same logic."""
+    return await _leave_document_impl(sid, data)
 
 
 @sio.event
@@ -569,6 +708,94 @@ async def cursor_move(sid: str, data: dict) -> None:
         logger.error(f"Error broadcasting cursor movement: {e}")
 
 
+@sio.on("cursor:move")
+async def cursor_move_relay(sid: str, data: dict) -> None:
+    """
+    Broadcast cursor movement using the CLIENT contract.
+
+    The web client emits ``cursor:move`` with
+    ``{document_id, position: {x, y}, page_id?}``
+    (packages/api/src/websocket/client.ts sendCursorPosition) and listens to
+    ``cursor:move`` carrying
+    ``{document_id, user_id, user_name, position, page_id?}``
+    (packages/api/src/websocket/hooks.ts useDocumentCollaboration).
+
+    The historical ``cursor_move`` handler ({page, x, y} → "cursor:moved")
+    is kept above for backward compatibility.
+
+    Args:
+        sid: Socket ID.
+        data: Client payload with document_id, position {x, y} and page_id.
+    """
+    try:
+        if not isinstance(data, dict):
+            return
+
+        position = data.get("position")
+        if not isinstance(position, dict):
+            return
+        x = position.get("x")
+        y = position.get("y")
+        if x is None or y is None:
+            return
+        page_id = data.get("page_id")
+
+        # Get session info
+        async with sio.session(sid) as session:
+            user_id = session.get("user_id")
+            user_name = session.get("user_name")
+            document_id = session.get("document_id")
+
+        if not document_id:
+            return
+
+        # Emitter must target the room it joined (same rule as the relays).
+        target_document_id = data.get("document_id")
+        if target_document_id and target_document_id != document_id:
+            logger.debug(
+                f"cursor:move: emitter {sid} targets {target_document_id!r} "
+                f"but joined {document_id!r}, dropped"
+            )
+            return
+
+        # Best-effort persistence: the collaboration session stores an
+        # integer page number while the client contract carries an opaque
+        # page_id — persist only when coercible, the broadcast below is the
+        # source of truth for live cursors.
+        page_number: int | None = None
+        if page_id is not None:
+            try:
+                page_number = int(page_id)
+            except (TypeError, ValueError):
+                page_number = None
+        if page_number is not None:
+            await collaboration_manager.update_cursor(
+                socket_id=sid,
+                page=page_number,
+                x=x,
+                y=y,
+            )
+
+        # Broadcast to other users in room, under the name the client listens
+        # to and with the payload shape it expects.
+        room = await get_document_room(document_id)
+        await sio.emit(
+            "cursor:move",
+            {
+                "document_id": document_id,
+                "user_id": user_id,
+                "user_name": user_name,
+                "position": {"x": x, "y": y},
+                "page_id": page_id,
+            },
+            room=room,
+            skip_sid=sid,
+        )
+
+    except Exception as e:
+        logger.error(f"Error relaying cursor movement: {e}")
+
+
 @sio.event
 async def document_update(sid: str, data: dict) -> None:
     """
@@ -588,17 +815,21 @@ async def document_update(sid: str, data: dict) -> None:
         if not document_id:
             return
 
-        # Broadcast update to other users
+        # Broadcast update to other users — "document:update" with document_id
+        # is the contract the web client listens to (hooks.ts filters on
+        # data.document_id; nothing ever listened to "document:updated").
         room = await get_document_room(document_id)
         await sio.emit(
-            "document:updated",
+            "document:update",
             {
+                "document_id": document_id,
                 "user_id": user_id,
                 "user_name": user_name,
                 "update_type": data.get("update_type", "unknown"),
                 "affected_elements": data.get("affected_elements", []),
                 "affected_pages": data.get("affected_pages", []),
                 "timestamp": data.get("timestamp"),
+                "changes": data.get("changes"),
                 "data": data.get("data", {}),
             },
             room=room,
@@ -631,6 +862,10 @@ _ELEMENT_RELAY_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "element:create": ("document_id", "element"),
     "element:update": ("document_id", "element_id"),
     "element:delete": ("document_id", "element_id"),
+    # document:update follows the same pure-relay contract: the client emits
+    # {document_id, user_id, changes, client_id} and listens to the SAME
+    # event name (hooks.ts useDocumentUpdates filters on data.document_id).
+    "document:update": ("document_id",),
 }
 
 
@@ -710,6 +945,21 @@ async def element_delete(sid: str, data: dict) -> None:
     Payload: {document_id, element_id, user_id, client_id}
     """
     await _relay_element_event("element:delete", sid, data)
+
+
+@sio.on("document:update")
+async def document_update_relay(sid: str, data: dict) -> None:
+    """
+    Relay a document-level update using the CLIENT contract.
+
+    The web client emits AND listens to ``document:update`` (see
+    useCollaboration.emitDocumentUpdate / useDocumentUpdates). The payload is
+    rebroadcast untouched (client_id preserved for anti-echo). The historical
+    ``document_update`` handler above is kept for backward compatibility.
+
+    Payload: {document_id, user_id, changes, client_id}
+    """
+    await _relay_element_event("document:update", sid, data)
 
 
 # Periodic cleanup tasks

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { useTranslations } from "next-intl";
+import { useTranslations, useLocale } from "next-intl";
 import {
   Dialog,
   DialogContent,
@@ -20,6 +20,7 @@ import {
   SelectValue,
   Badge,
   Separator,
+  useToast,
 } from "@giga-pdf/ui";
 import {
   Loader2,
@@ -33,7 +34,8 @@ import {
   Check,
   X,
 } from "lucide-react";
-import { api, DocumentShareInfo } from "@/lib/api";
+import { api, DocumentShareInfo, ShareInvitation } from "@/lib/api";
+import { useSession } from "@/lib/auth-client";
 import { clientLogger } from "@/lib/client-logger";
 
 interface ShareDialogProps {
@@ -48,10 +50,13 @@ export function ShareDialog({
   open,
   onOpenChange,
   documentId,
-  documentName: _documentName,
+  documentName,
   onShareSuccess,
 }: ShareDialogProps) {
   const t = useTranslations("sharing");
+  const locale = useLocale();
+  const { toast } = useToast();
+  const { data: session } = useSession();
 
   // Form states
   const [email, setEmail] = useState("");
@@ -106,6 +111,44 @@ export function ShareDialog({
     }
   };
 
+  /**
+   * Fire-and-forget invitation e-mail. An e-mail failure never blocks the
+   * share (it is already effective server-side) — it only surfaces as a
+   * non-blocking warning toast. The token never reaches the console/logs.
+   */
+  const notifyInvitee = async (
+    invitation: ShareInvitation,
+    inviteeEmail: string,
+  ) => {
+    try {
+      const response = await fetch("/api/share/notify", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: inviteeEmail,
+          documentName,
+          permission: invitation.permission,
+          inviterName:
+            session?.user?.name || session?.user?.email || undefined,
+          locale,
+          invitationId: invitation.invitation_id,
+          // Existing account → share is already ACTIVE, e-mail links to
+          // /shared. No account yet → e-mail carries the invitation link.
+          ...(invitation.invitee_user_exists
+            ? { shareId: invitation.share_id ?? invitation.invitation_id }
+            : { invitationToken: invitation.token }),
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+    } catch (err) {
+      clientLogger.warn("share-dialog.notify-email-failed", err);
+      toast({ title: t("dialog.emailWarning") });
+    }
+  };
+
   const handleShare = async () => {
     if (!email.trim()) {
       setError(t("dialog.emailRequired"));
@@ -116,12 +159,16 @@ export function ShareDialog({
       setSharing(true);
       setError(null);
 
-      await api.shareDocument({
+      const inviteeEmail = email.trim();
+      const invitation = await api.shareDocument({
         document_id: documentId,
-        invitee_email: email.trim(),
+        invitee_email: inviteeEmail,
         permission,
         message: message.trim() || undefined,
       });
+
+      // Fire-and-forget: the share is done; the e-mail must not block it.
+      void notifyInvitee(invitation, inviteeEmail);
 
       setSuccess(true);
       setEmail("");

@@ -29,6 +29,7 @@ import {
   Image,
   Square,
   PenTool,
+  PenLine,
   MessageSquare,
   Hand,
   ZoomIn,
@@ -141,6 +142,12 @@ import type {
   PageFormatPoints,
 } from "./lib/page-formats";
 import type { HeaderFooterKind } from "./lib/page-headers-footers";
+import {
+  fetchUserSignatures,
+  type SignatureInsertPayload,
+  type SignatureKind,
+  type UserSignatureMark,
+} from "./lib/user-signatures";
 import type { HeaderFooterSpec } from "@qrcommunication/gigapdf-lib";
 
 export interface EditorToolbarProps {
@@ -230,8 +237,17 @@ export interface EditorToolbarProps {
   onAddImage?: () => void;
   /** Activate Adobe-style "Fill & Sign" mode (fill form fields on the page). */
   onFillSign?: () => void;
-  /** Open the signature/initials capture dialog to place a stamp on the page. */
-  onInsertSignature?: () => void;
+  /**
+   * Open the signature/initials capture dialog to place a stamp on the page,
+   * preset on the given kind ("signature" by default). Signature and initials
+   * are surfaced as TWO distinct toolbar entries.
+   */
+  onInsertSignature?: (kind?: SignatureKind) => void;
+  /**
+   * One-click insert of an account-saved mark (free placement, no dialog).
+   * Offered by the signature dropdown when the user has saved marks.
+   */
+  onInsertSavedSignature?: (sig: SignatureInsertPayload) => void;
   /**
    * Insert menu (Word-like) — inserts a table of editable cells + borders. Each
    * cell flows through the normal element-add + apply-elements path.
@@ -730,6 +746,7 @@ export function EditorToolbar({
   onAddImage,
   onFillSign,
   onInsertSignature,
+  onInsertSavedSignature,
   onInsertTable,
   onInsertLink,
   onRemoveLink,
@@ -799,6 +816,12 @@ export function EditorToolbar({
   const isMobile = useIsMobile();
   const [showMobileTools, setShowMobileTools] = useState(false);
   const [showShapeDropdown, setShowShapeDropdown] = useState(false);
+  // Signature/initials dropdown — account-saved marks are (re)fetched on each
+  // open so a mark saved from the capture dialog shows up without a reload.
+  const [showSignatureDropdown, setShowSignatureDropdown] = useState(false);
+  const [savedSignatureMarks, setSavedSignatureMarks] = useState<
+    UserSignatureMark[]
+  >([]);
   const [showAnnotationDropdown, setShowAnnotationDropdown] = useState(false);
   const [showFieldDropdown, setShowFieldDropdown] = useState(false);
   const [showLinkDialog, setShowLinkDialog] = useState(false);
@@ -1055,11 +1078,20 @@ export function EditorToolbar({
               onAddImage?.();
             }),
           },
+          // Signature et Paraphe : DEUX entrées distinctes — chacune ouvre le
+          // dialog de capture préréglé sur son kind (les marques du compte y
+          // sont insérables un-clic).
           {
             key: "insertSignature",
             icon: <Signature size={20} />,
-            label: t("insertSignature"),
-            onSelect: sheetAction(() => onInsertSignature?.()),
+            label: t("signatureKindSignature"),
+            onSelect: sheetAction(() => onInsertSignature?.("signature")),
+          },
+          {
+            key: "insertInitials",
+            icon: <PenLine size={20} />,
+            label: t("signatureKindInitials"),
+            onSelect: sheetAction(() => onInsertSignature?.("initials")),
           },
           ...shapes.map(({ type, icon, labelKey }) => ({
             key: `shape-${type}`,
@@ -1429,14 +1461,101 @@ export function EditorToolbar({
           onFillSign?.();
         }}
       />
-      {/* Insertion de signature — repliée dans le bottom-sheet sous md. */}
-      <span className="hidden md:contents">
+      {/* Signature & Paraphe — deux entrées distinctes dans un dropdown :
+          insertion UN-CLIC des marques du compte (aperçu miniature) +
+          « Gérer / nouveau… » qui ouvre le dialog préréglé sur le kind.
+          Replié dans le bottom-sheet sous md (deux entrées dédiées). */}
+      <div className="relative hidden md:block">
         <ToolButton
           icon={<Signature size={20} />}
           label={t("insertSignature")}
-          onClick={() => onInsertSignature?.()}
+          hasDropdown
+          onClick={() => {
+            const next = !showSignatureDropdown;
+            setShowSignatureDropdown(next);
+            if (next) {
+              void fetchUserSignatures().then(setSavedSignatureMarks);
+            }
+          }}
         />
-      </span>
+        <Dropdown
+          isOpen={showSignatureDropdown}
+          onClose={() => setShowSignatureDropdown(false)}
+        >
+          <div
+            className="flex w-56 flex-col gap-2"
+            data-testid="signature-menu"
+          >
+            {(
+              [
+                {
+                  kind: "signature",
+                  title: t("signatureKindSignature"),
+                  newLabel: t("signatureNewSignature"),
+                },
+                {
+                  kind: "initials",
+                  title: t("signatureKindInitials"),
+                  newLabel: t("signatureNewInitials"),
+                },
+              ] as const
+            ).map(({ kind, title, newLabel }) => {
+              const marks = savedSignatureMarks.filter(
+                (m) => m.kind === kind,
+              );
+              return (
+                <div key={kind} className="flex flex-col gap-1">
+                  <span className="px-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    {title}
+                  </span>
+                  {marks.map((mark) => (
+                    <button
+                      key={mark.id}
+                      type="button"
+                      title={t("insertSavedSignature")}
+                      aria-label={t("insertSavedSignature")}
+                      onClick={() => {
+                        onInsertSavedSignature?.({
+                          dataUrl: mark.dataUrl,
+                          width: mark.width,
+                          height: mark.height,
+                          kind: mark.kind,
+                        });
+                        setShowSignatureDropdown(false);
+                      }}
+                      className="flex cursor-pointer items-center justify-center rounded-md border border-input bg-white px-2 py-1 transition-colors hover:border-primary"
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img
+                        src={mark.dataUrl}
+                        alt=""
+                        className="max-h-10 max-w-[120px] object-contain"
+                      />
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onInsertSignature?.(kind);
+                      setShowSignatureDropdown(false);
+                    }}
+                    className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm transition-colors hover:bg-muted"
+                  >
+                    {kind === "signature" ? (
+                      <Signature size={16} />
+                    ) : (
+                      <PenLine size={16} />
+                    )}
+                    <span>
+                      {marks.length > 0 ? t("signatureManage") : newLabel}
+                    </span>
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </Dropdown>
+      </div>
 
       <Separator className="hidden md:block" />
 

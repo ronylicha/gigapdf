@@ -11,6 +11,7 @@ import { cn } from "@/lib/utils";
 import { useState } from "react";
 import { AuthGuard } from "@/components/auth/auth-guard";
 import { LanguageSwitcher } from "@/components/language-switcher";
+import { NotificationBell } from "@/components/notifications/notification-bell";
 import { ThemeSwitcher } from "@/components/theme-switcher";
 
 // Auth par cookies + locale par cookie → rendu dynamique obligatoire.
@@ -93,6 +94,7 @@ export default function DashboardLayout(props: { children?: React.ReactNode }) {
               <Menu className="h-6 w-6" />
             </Button>
             <div className="flex items-center gap-4 ml-auto">
+              <NotificationBell />
               <ThemeSwitcher />
               <LanguageSwitcher />
               <div className="flex items-center gap-2">

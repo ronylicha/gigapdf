@@ -141,11 +141,27 @@ function paragraphGroupStyle(
   block: GigaBlock,
 ): Pick<
   PageBlockGroup,
-  'align' | 'lineHeightMultiple' | 'frame' | 'firstLineIndentPt'
+  | 'align'
+  | 'lineHeightMultiple'
+  | 'frame'
+  | 'firstLineIndentPt'
+  | 'indentLeftPt'
+  | 'spaceBeforePt'
+  | 'spaceAfterPt'
+  | 'softBreaks'
+  | 'direction'
 > {
   const out: Pick<
     PageBlockGroup,
-    'align' | 'lineHeightMultiple' | 'frame' | 'firstLineIndentPt'
+    | 'align'
+    | 'lineHeightMultiple'
+    | 'frame'
+    | 'firstLineIndentPt'
+    | 'indentLeftPt'
+    | 'spaceBeforePt'
+    | 'spaceAfterPt'
+    | 'softBreaks'
+    | 'direction'
   > = {};
 
   const style = paragraphBody(block)?.style as
@@ -153,6 +169,11 @@ function paragraphGroupStyle(
         align?: unknown;
         line_height?: { t?: unknown; v?: unknown };
         first_line_pt?: unknown;
+        indent_left_pt?: unknown;
+        space_before_pt?: unknown;
+        space_after_pt?: unknown;
+        soft_breaks?: unknown;
+        direction?: unknown;
       }
     | undefined;
   if (style && typeof style === 'object') {
@@ -171,6 +192,31 @@ function paragraphGroupStyle(
     }
     if (typeof style.first_line_pt === 'number' && style.first_line_pt !== 0) {
       out.firstLineIndentPt = style.first_line_pt;
+    }
+    if (typeof style.indent_left_pt === 'number' && style.indent_left_pt !== 0) {
+      out.indentLeftPt = style.indent_left_pt;
+    }
+    if (
+      typeof style.space_before_pt === 'number' &&
+      style.space_before_pt !== 0
+    ) {
+      out.spaceBeforePt = style.space_before_pt;
+    }
+    if (
+      typeof style.space_after_pt === 'number' &&
+      style.space_after_pt !== 0
+    ) {
+      out.spaceAfterPt = style.space_after_pt;
+    }
+    if (
+      Array.isArray(style.soft_breaks) &&
+      style.soft_breaks.length > 0 &&
+      style.soft_breaks.every((b) => typeof b === 'boolean')
+    ) {
+      out.softBreaks = style.soft_breaks as boolean[];
+    }
+    if (style.direction === 'rtl' || style.direction === 'ltr') {
+      out.direction = style.direction;
     }
   }
 

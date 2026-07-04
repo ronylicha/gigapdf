@@ -11,6 +11,7 @@ interface Document {
   updatedAt: Date;
   tags?: string[];
   thumbnailUrl?: string | null;
+  mimeType?: string | null;
 }
 
 interface DocumentGridProps {
@@ -57,6 +58,7 @@ export function DocumentGrid({
           updatedAt={doc.updatedAt}
           tags={doc.tags}
           thumbnailUrl={doc.thumbnailUrl}
+          mimeType={doc.mimeType}
           onDelete={onDelete}
           onChanged={onChanged}
           onDragStart={onDragStart}

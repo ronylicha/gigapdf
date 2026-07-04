@@ -22,11 +22,11 @@ import {
 import {
   ChevronLeft,
   ChevronRight,
-  FileText,
   Loader2,
   RotateCcw,
   Trash2,
 } from "lucide-react";
+import { FileTypeIcon } from "@/components/dashboard/file-type-icon";
 import { api, StoredDocument } from "@/lib/api";
 import { formatBytes, formatDate } from "@/lib/utils";
 import { clientLogger } from "@/lib/client-logger";
@@ -167,7 +167,11 @@ export default function TrashPage() {
                 <Card key={doc.stored_document_id}>
                   <CardHeader className="flex flex-row items-center space-y-0 pb-2">
                     <div className="flex min-w-0 items-center gap-2">
-                      <FileText className="h-5 w-5 flex-shrink-0 text-muted-foreground" />
+                      <FileTypeIcon
+                        mimeType={doc.mime_type}
+                        name={doc.name}
+                        className="h-5 w-5 flex-shrink-0"
+                      />
                       <h3 className="truncate font-semibold" title={doc.name}>
                         {doc.name}
                       </h3>

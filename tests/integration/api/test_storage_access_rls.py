@@ -4,6 +4,7 @@ plus keeping the original format + indexing content at import.
 Routes under test:
   GET  /api/v1/storage/documents/{id}            → 403 for non-owner/non-shared
   GET  /api/v1/storage/documents/{id}/versions   → 403 for non-owner/non-shared
+  POST /api/v1/storage/documents/{id}/versions   → owner OR edit grantee (403 otherwise)
   GET  /api/v1/storage/folders/{id}/stats        → 403 for non-owner/non-shared
   POST /api/v1/storage/documents (multipart)     → non-PDF stored as-is + indexed
 
@@ -357,6 +358,128 @@ class TestFolderStatsRLS:
         resp = client.get(f"/api/v1/storage/folders/{FOLDER_ID}/stats")
 
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /documents/{id}/versions — owner OR edit grantee saves, 403 otherwise
+# ---------------------------------------------------------------------------
+
+class _CtxSession:
+    """Wrap a FakeSession in the async-context shape of get_db_session()."""
+
+    def __init__(self, sess: FakeSession):
+        self._sess = sess
+
+    async def __aenter__(self):
+        return self._sess
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class TestCreateVersionRLS:
+    """The editor save path (create_version) honours the shared-edit grant.
+
+    The version must land under the OWNER's S3 prefix (symmetric with the
+    load endpoint) and ``created_by`` must record the actual author.
+    """
+
+    PDF_BYTES = b"%PDF-1.4\n" + b"%fake body\n" * 8
+
+    @pytest.fixture
+    def harness(self, app, monkeypatch):
+        """Patch get_db_session / page counting / S3 for the versions route."""
+        from app.api.v1 import storage as storage_module
+
+        session = FakeSession(stamp_timestamps=True)
+        monkeypatch.setattr(
+            storage_module, "get_db_session", lambda: _CtxSession(session)
+        )
+        monkeypatch.setattr(storage_module, "_count_pdf_pages_sync", lambda b: 1)
+
+        upload_file = MagicMock(return_value={"key": "x"})
+        monkeypatch.setattr(storage_module.s3_service, "upload_file", upload_file)
+
+        yield SimpleNamespace(session=session, upload_file=upload_file)
+        app.dependency_overrides.pop(get_current_user, None)
+
+    def _post_version(self, client):
+        return client.post(
+            f"/api/v1/storage/documents/{DOC_ID}/versions",
+            files={"file": ("doc.pdf", io.BytesIO(self.PDF_BYTES), "application/pdf")},
+            data={"comment": "edited in browser"},
+        )
+
+    def test_owner_can_save_version(self, client, app, harness):
+        _as_user(app, OWNER_ID)
+        harness.session._results = [
+            FakeResult(scalar=_make_doc()),  # doc lookup (guard: owner → no share query)
+        ]
+
+        resp = self._post_version(client)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["version"] == 3
+        kwargs = harness.upload_file.call_args.kwargs
+        assert kwargs["key"] == f"documents/{OWNER_ID}/{DOC_ID}/v3.pdf"
+
+    def test_edit_grantee_can_save_under_owner_prefix(self, client, app, harness):
+        _as_user(app, SHARED_ID)
+        harness.session._results = [
+            FakeResult(scalar=_make_doc()),                      # doc lookup
+            FakeResult(scalar=_make_share(permission="edit")),   # guard: edit grant
+        ]
+
+        resp = self._post_version(client)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["version"] == 3
+
+        # Version file lands under the OWNER's prefix, never the grantee's.
+        kwargs = harness.upload_file.call_args.kwargs
+        assert kwargs["key"] == f"documents/{OWNER_ID}/{DOC_ID}/v3.pdf"
+        assert kwargs["metadata"]["user_id"] == OWNER_ID
+        assert kwargs["metadata"]["author_id"] == SHARED_ID
+
+        # The version row records the actual author (the invited editor).
+        version = next(
+            o for o in harness.session.added if isinstance(o, DocumentVersion)
+        )
+        assert version.created_by == SHARED_ID
+        assert version.version_number == 3
+
+    def test_view_grantee_gets_403(self, client, app, harness):
+        _as_user(app, SHARED_ID)
+        harness.session._results = [
+            FakeResult(scalar=_make_doc()),
+            FakeResult(scalar=_make_share(permission="view")),  # view-only grant
+        ]
+
+        resp = self._post_version(client)
+
+        assert resp.status_code == 403
+        harness.upload_file.assert_not_called()
+
+    def test_stranger_gets_403(self, client, app, harness):
+        _as_user(app, STRANGER_ID)
+        harness.session._results = [
+            FakeResult(scalar=_make_doc()),  # doc exists…
+            FakeResult(scalar=None),         # …but no share for the stranger
+        ]
+
+        resp = self._post_version(client)
+
+        assert resp.status_code == 403
+        harness.upload_file.assert_not_called()
+
+    def test_missing_document_is_404(self, client, app, harness):
+        _as_user(app, OWNER_ID)
+        harness.session._results = [FakeResult(scalar=None)]
+
+        resp = self._post_version(client)
+
+        assert resp.status_code == 404
+        harness.upload_file.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

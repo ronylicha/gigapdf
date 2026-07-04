@@ -2073,6 +2073,12 @@
       "redo": "Rétablir",
       "fillSign": "Remplir et signer",
       "insertSignature": "Insérer une signature ou un paraphe",
+      "signatureKindSignature": "Signature",
+      "signatureKindInitials": "Paraphe",
+      "signatureNewSignature": "Nouvelle signature…",
+      "signatureNewInitials": "Nouveau paraphe…",
+      "signatureManage": "Gérer / nouveau…",
+      "insertSavedSignature": "Insérer cette marque",
       "zoomIn": "Zoom avant",
       "zoomOut": "Zoom arrière",
       "fitWidth": "Ajuster à la largeur",
@@ -4127,7 +4133,8 @@
       "sharing": "Partage en cours...",
       "cancel": "Annuler",
       "success": "Invitation envoyée avec succès",
-      "error": "Échec de l'envoi de l'invitation"
+      "error": "Échec de l'envoi de l'invitation",
+      "emailWarning": "Le partage est actif, mais l'e-mail de notification n'a pas pu être envoyé"
     },
     "currentShares": {
       "title": "Personnes ayant accès",
@@ -4135,6 +4142,30 @@
       "noShares": "Ce document n'est partagé avec personne",
       "revokeAccess": "Révoquer l'accès",
       "changePermission": "Modifier l'autorisation"
+    },
+    "invitationPage": {
+      "title": "Invitation de partage",
+      "invitedBy": "{email} vous invite à accéder à ce document",
+      "someoneFallback": "Un utilisateur GigaPDF",
+      "wrongAccount": "Cette invitation a été envoyée à {email}. Connectez-vous avec ce compte pour l'accepter.",
+      "accept": "Accepter",
+      "decline": "Refuser",
+      "acceptedToast": "Invitation acceptée — le document est dans « Partagés avec moi »",
+      "declinedToast": "Invitation refusée",
+      "acceptFailed": "Échec de l'acceptation de l'invitation",
+      "declineFailed": "Échec du refus de l'invitation",
+      "notFoundTitle": "Invitation introuvable",
+      "notFoundDescription": "Ce lien d'invitation est invalide ou n'existe plus. Demandez à l'expéditeur de partager à nouveau le document.",
+      "expiredTitle": "Invitation expirée",
+      "expiredDescription": "Cette invitation a expiré. Demandez à l'expéditeur de partager à nouveau le document.",
+      "acceptedTitle": "Invitation déjà acceptée",
+      "acceptedDescription": "Vous avez déjà accès à ce document — retrouvez-le dans « Partagés avec moi ».",
+      "declinedTitle": "Invitation refusée",
+      "declinedDescription": "Cette invitation a été refusée. Demandez à l'expéditeur de partager à nouveau le document si nécessaire.",
+      "revokedTitle": "Invitation révoquée",
+      "revokedDescription": "Cette invitation a été révoquée par le propriétaire du document.",
+      "goToShared": "Ouvrir « Partagés avec moi »",
+      "goToDashboard": "Aller au tableau de bord"
     },
     "publicLink": {
       "title": "Lien public",
@@ -4157,7 +4188,26 @@
       "declined": "Invitation refusée",
       "revoked": "Accès révoqué",
       "markAsRead": "Marquer comme lu",
-      "markAllAsRead": "Tout marquer comme lu"
+      "markAllAsRead": "Tout marquer comme lu",
+      "ariaLabel": "Notifications",
+      "ariaLabelUnread": "Notifications — {count} non lue(s)",
+      "empty": "Aucune notification",
+      "types": {
+        "share_invitation": "« {document} » a été partagé avec vous",
+        "share_accepted": "{email} a accepté votre invitation pour « {document} »",
+        "share_declined": "Votre invitation pour « {document} » a été refusée",
+        "share_revoked": "Votre accès à « {document} » a été révoqué",
+        "permission_changed": "Votre autorisation sur « {document} » est maintenant : {permission}",
+        "unknown": "Notification de partage"
+      }
+    },
+    "publicPage": {
+      "notFoundTitle": "Lien invalide ou expiré",
+      "notFoundDescription": "Ce lien public n'existe plus, a été désactivé par le propriétaire du document ou a expiré. Demandez un nouveau lien à la personne qui l'a partagé.",
+      "pageCount": "{count, plural, one {# page} other {# pages}}",
+      "viewOnly": "Lecture seule",
+      "download": "Télécharger",
+      "fallbackHint": "Si l'aperçu ne s'affiche pas, utilisez le bouton Télécharger."
     }
   },
   "toolsMenu": {

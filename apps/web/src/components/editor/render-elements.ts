@@ -104,6 +104,38 @@ export interface ElementObjectData {
    */
   rotation0?: number;
   originalFont?: string | null;
+  /**
+   * Block identity (EDIT-INTENT model): the paragraph/cell/item group this text
+   * run belongs to. Tagged on EVERY engine block's members — including groups
+   * the coherence gate rejects — so a single click can always select the whole
+   * block (`attachParagraphBlockSelection`). `pg:` + first run's elementId.
+   */
+  paragraphGroupId?: string;
+  /**
+   * Whether a double-click on this member may open the multi-line Textbox edit
+   * session (result of {@link isCoherentLineGroup} on the group's lines). The
+   * gate no longer gates the group IDENTITY — only the session: a geometrically
+   * incoherent group (footer↔header fusion on a dense form) would drift inside
+   * a single Textbox, so its members keep the per-run inline edit instead.
+   */
+  paragraphSessionable?: boolean;
+  /**
+   * Transient hover-affordance outline drawn around a paragraph block while a
+   * member is hovered (`attachParagraphHoverAffordance`). Pure chrome: never a
+   * scene-graph element, never serialised (fabric-element-io returns null),
+   * never queued for the save, swept on every overlay re-render.
+   */
+  isParagraphHoverOutline?: boolean;
+  /**
+   * Fill & Sign: elementId of the SIGNATURE WIDGET this image was stamped into
+   * (set by editor-canvas `addImage` on a targeted insertion). While the image
+   * lives on the canvas, clicking its widget SELECTS the image (movable /
+   * resizable) instead of reopening the capture dialog; once the image is
+   * deleted the widget becomes clickable again to re-sign. Session-local link:
+   * never serialised into the scene graph (fabric-element-io builds typed
+   * elements), so a reload naturally clears it.
+   */
+  signedWidgetId?: string;
   [key: string]: unknown;
 }
 
@@ -543,10 +575,11 @@ export interface ParagraphGroup {
   runs: TextRun[];
   /**
    * The runs grouped per VISUAL LINE (reading order). Produced from the lib's
-   * `{t:'br'}` line structure when the block groups carry `lines`; every other
-   * producer (positional heuristic, table cells, list items, flat
-   * `sourceIndices`) emits ONE run per line — the legacy model. `runs` is
-   * always the flattening of `lines`.
+   * `{t:'br'}` line structure when the block groups carry `lines`; table cells
+   * and list items (which carry no `{t:'br'}` structure) band their runs into
+   * true visual lines by baseline (see bandRunsIntoVisualLines); the remaining
+   * producers (positional heuristic, flat `sourceIndices`) emit ONE run per
+   * line — the legacy model. `runs` is always the flattening of `lines`.
    */
   lines?: TextRun[][];
   /** Paragraph alignment from the lib block (drives the edit-session Textbox). */
@@ -1078,6 +1111,44 @@ export function pageBlockGroupsToParagraphs(
 // ---------------------------------------------------------------------------
 
 /**
+ * Band a cell/item's resolved runs into TRUE visual lines. Table cells and
+ * list items carry no `{t:'br'}` line structure, yet a cell routinely holds
+ * several runs on ONE baseline ("Nom :" + "DUPONT"). Two runs share a line
+ * when their tops sit within `0.5 × fontSize` of the line's anchor run (the
+ * topmost run that opened the line — the tolerance is expressed in ITS font
+ * size). Each banded line is sorted left→right and the lines run top→bottom,
+ * so the result reads in visual order; a run with no baseline neighbour stays
+ * a one-run line — identical to the legacy one-run-per-line model. Pure &
+ * deterministic.
+ */
+function bandRunsIntoVisualLines(runs: readonly TextRun[]): TextRun[][] {
+  const byTop = [...runs].sort((a, b) => {
+    const dy = a.bounds.y - b.bounds.y;
+    if (dy !== 0) return dy;
+    return a.bounds.x - b.bounds.x;
+  });
+  const lines: TextRun[][] = [];
+  let current: TextRun[] = [];
+  let anchorTop = 0;
+  let anchorTol = 0;
+  for (const run of byTop) {
+    if (current.length > 0 && Math.abs(run.bounds.y - anchorTop) <= anchorTol) {
+      current.push(run);
+    } else {
+      if (current.length > 0) lines.push(current);
+      current = [run];
+      anchorTop = run.bounds.y;
+      anchorTol = (run.style.fontSize || 12) * 0.5;
+    }
+  }
+  if (current.length > 0) lines.push(current);
+  for (const line of lines) {
+    line.sort((a, b) => a.bounds.x - b.bounds.x);
+  }
+  return lines;
+}
+
+/**
  * Reconstruct paragraph groups from the engine's `table` / `list` block groups.
  * Each cell (table) / item (list) with ≥ 2 resolvable runs becomes one
  * {@link ParagraphGroup}; cells/items with 0–1 resolvable run are skipped and
@@ -1121,8 +1192,15 @@ export function pageBlockGroupsToTablesAndLists(
       consumed.add(run);
     }
     if (runs.length >= 2) {
-      // Cells/items carry no `{t:'br'}` structure → legacy one-run-per-line.
-      paragraphs.push({ runs, lines: runs.map((r) => [r]) });
+      // Cells/items carry no `{t:'br'}` structure — band the runs into TRUE
+      // visual lines instead (see bandRunsIntoVisualLines). The synthetic
+      // one-run-per-"line" model made two same-baseline runs ("Nom :" +
+      // "DUPONT") produce two "lines" sharing a top-Y → rejected by the
+      // strictly-descending rule of isCoherentLineGroup, so such cells were
+      // never block-editable. `runs` stays the flattening of `lines` (banded
+      // reading order), per the ParagraphGroup contract.
+      const lines = bandRunsIntoVisualLines(runs);
+      paragraphs.push({ runs: lines.flat(), lines });
     } else {
       for (const r of runs) consumed.delete(r);
     }
@@ -1183,6 +1261,19 @@ export async function renderElementsOverlay(
     Path: FabricPath,
     Polygon,
   } = fabricModule;
+
+  // Sweep any lingering hover-affordance outline (transient chrome). It carries
+  // NO elementId, so clearElementsOverlay never removes it — without this sweep
+  // a re-render fired mid-hover would stack a stale outline over the fresh
+  // overlay (its mouse:out may never fire once the hovered member is gone).
+  for (const stale of canvas
+    .getObjects()
+    .filter(
+      (o) =>
+        (o as FabricObjectWithData).data?.isParagraphHoverOutline === true,
+    )) {
+    canvas.remove(stale);
+  }
 
   // Collect image-load promises to await them all before the final renderAll
   const imageLoadPromises: Promise<void>[] = [];
@@ -1295,17 +1386,15 @@ export async function renderElementsOverlay(
       ? pageBlockGroupsToTablesAndLists(dedupedElements, blockGroups).paragraphs
       : [];
 
-  // Gate every coalesced candidate (paragraph, table cell OR list item) with
-  // the PER-LINE coherence check (see isCoherentLineGroup): lines strictly
-  // descending, inter-line gaps within [0.4, 2.5]× the measured leading, and
-  // ≥ 20% horizontal overlap between consecutive lines. Multi-run lines and
-  // justified (segmented) paragraphs are now ACCEPTED — the lib 0.114 line
-  // structure says which runs share a line, and acceptance no longer changes
-  // the resting render (EDIT-INTENT model below): a rejected group simply
-  // keeps per-run editing, so this can only ever widen paragraph editing.
-  const allCoalescedGroups = [...paragraphGroups, ...tableListGroups].filter(
-    (group) => isCoherentLineGroup(linesOfGroup(group)),
-  );
+  // EVERY coalesced candidate (paragraph, table cell OR list item) keeps its
+  // BLOCK IDENTITY — the per-line coherence gate (see isCoherentLineGroup) no
+  // longer decides membership, only whether the double-click may open the
+  // multi-line Textbox SESSION (`data.paragraphSessionable`, computed at
+  // tagging time below). A rejected group still tags its members with the
+  // group id, so a single click selects the whole block; its double-click
+  // stays the per-run inline edit (a geometrically incoherent group would
+  // drift inside one Textbox). The resting render is per-run either way.
+  const allCoalescedGroups = [...paragraphGroups, ...tableListGroups];
 
   for (const element of dedupedElements) {
     // Guard: skip elements with missing or zero-size bounds
@@ -2406,17 +2495,24 @@ export async function renderElementsOverlay(
   }
 
   // 4. TAG PARAGRAPH GROUPS (EDIT-INTENT model). At rest every run was rendered
-  //    per-run/per-segment above — the proven pixel-1:1 path, UNCHANGED. Each
-  //    accepted group's member objects (including the per-segment fragments of
-  //    a justified run) are tagged with the group id + the shared descriptor;
-  //    a double-click on any member then swaps the group for ONE multi-line
-  //    Textbox edit session (beginParagraphEditSession) with wrap/reflow, and
-  //    an unmodified exit restores the per-run objects untouched (zero write).
-  //    Skipped in read-only surfaces (no edit intent there).
+  //    per-run/per-segment above — the proven pixel-1:1 path, UNCHANGED. EVERY
+  //    group's member objects (including the per-segment fragments of a
+  //    justified run) are tagged with the group id + the shared descriptor so
+  //    a single click can select the whole block (attachParagraphBlockSelection)
+  //    — the coherence gate only decides `paragraphSessionable`: whether a
+  //    double-click on a member swaps the group for ONE multi-line Textbox
+  //    edit session (beginParagraphEditSession) with wrap/reflow (an
+  //    unmodified exit restores the per-run objects untouched, zero write), or
+  //    keeps the per-run inline edit (rejected group — a single Textbox would
+  //    drift). Skipped in read-only surfaces (no edit intent there).
   if (!readonly && allCoalescedGroups.length > 0) {
     const objects = canvas.getObjects();
     for (const group of allCoalescedGroups) {
       const lines = linesOfGroup(group);
+      // Session eligibility (NOT identity): lines strictly descending, gaps
+      // within [0.4, 2.5]× the measured leading, ≥ 20% horizontal overlap of
+      // consecutive lines — see isCoherentLineGroup.
+      const sessionable = isCoherentLineGroup(lines);
       const first = group.runs[0]!;
       const descriptor: RegisteredParagraphGroup = {
         groupId: `pg:${first.elementId}`,
@@ -2434,8 +2530,13 @@ export async function renderElementsOverlay(
         if (!memberIds.has(data.elementId)) continue;
         data.paragraphGroupId = descriptor.groupId;
         data.paragraphGroup = descriptor;
-        // Light affordance: an editable-paragraph member invites a text cursor.
-        (obj as FabricObject & { hoverCursor?: string }).hoverCursor = "text";
+        data.paragraphSessionable = sessionable;
+        if (sessionable) {
+          // Light affordance: an editable-paragraph member invites a text
+          // cursor. Non-sessionable members keep the default cursor (their
+          // double-click stays the plain per-run inline edit).
+          (obj as FabricObject & { hoverCursor?: string }).hoverCursor = "text";
+        }
       }
     }
   }
@@ -2538,6 +2639,12 @@ export async function renderElementsOverlay(
     attachShapeStyleReveal(canvas);
     // Toggle checkbox/radio fields on click (fill them in directly on the page).
     attachFormFieldToggle(canvas, onElementSelected);
+    // Paragraph blocks: a single click selects the WHOLE block (re-click drills
+    // down to the run, Alt+click targets the run directly) + a light outline is
+    // drawn around the block while a member is hovered. Both are idempotent per
+    // canvas and read the live tool/Fill&Sign flags stamped by the surface.
+    attachParagraphBlockSelection(canvas, fabricModule);
+    attachParagraphHoverAffordance(canvas, fabricModule);
   }
 }
 
@@ -2641,6 +2748,11 @@ export function beginParagraphEditSession(
     | undefined;
   const groupId = memberObj.data?.paragraphGroupId as string | undefined;
   if (!descriptor || !groupId || descriptor.groupId !== groupId) return null;
+  // Block identity ≠ session eligibility: every group's members are tagged (so
+  // click-selection can target the block), but only a group the per-line
+  // coherence gate ACCEPTED may open the Textbox session — a rejected group
+  // (footer↔header fusion on a dense form) would drift inside a single box.
+  if (memberObj.data?.paragraphSessionable !== true) return null;
   const lines = descriptor.lines.filter((l) => l.length > 0);
   if (lines.length === 0) return null;
   const { Textbox } = fabricModule;
@@ -3065,6 +3177,45 @@ function attachFormFieldToggle(
     }) as FabricObjectWithData | undefined;
 
   /**
+   * The signature-stamp image placed into a widget during Fill & Sign
+   * (`data.signedWidgetId` set by editor-canvas `addImage`), or undefined when
+   * the widget is unsigned / its stamp was deleted from the canvas.
+   */
+  const findSignedImage = (
+    widgetElementId: unknown,
+  ): FabricObjectWithData | undefined => {
+    if (typeof widgetElementId !== "string" || widgetElementId.length === 0) {
+      return undefined;
+    }
+    return canvas.getObjects().find((o) => {
+      const od = (o as FabricObjectWithData).data;
+      return od?.signedWidgetId === widgetElementId;
+    }) as FabricObjectWithData | undefined;
+  };
+
+  /**
+   * Fill & Sign click on a SIGNATURE widget: when a stamp image is already
+   * placed in it, SELECT the image (so it stays movable/resizable without
+   * friction) instead of reopening the capture dialog; otherwise open the
+   * capture. Deleting the stamp makes the widget re-signable again.
+   */
+  const handleSignatureWidgetClick = (
+    widget: FabricObjectWithData,
+  ): void => {
+    const signed = findSignedImage(widget.data?.elementId);
+    if (signed) {
+      canvas.setActiveObject(signed as FabricObject);
+      const imageId = signed.data?.elementId;
+      if (typeof imageId === "string" && imageId && onElementSelected) {
+        onElementSelected(imageId);
+      }
+      canvas.requestRenderAll();
+      return;
+    }
+    fillSignMeta._gigaOnSignatureFieldClick?.(widget.data?.formFieldElement);
+  };
+
+  /**
    * Toggle a checkable widget + keep its GROUP coherent across the page's
    * sibling widgets (same fieldName):
    *   - a widget with the SAME on-state (duplicate-page twin) mirrors this one;
@@ -3138,9 +3289,7 @@ function attachFormFieldToggle(
           return;
         }
         if (fillSign && content.data.fieldType === "signature") {
-          fillSignMeta._gigaOnSignatureFieldClick?.(
-            content.data.formFieldElement,
-          );
+          handleSignatureWidgetClick(content);
           return;
         }
         canvas.setActiveObject(content as FabricObject);
@@ -3154,9 +3303,11 @@ function attachFormFieldToggle(
       if (data.type !== "form_field") return;
 
       // Fill & Sign: clicking a SIGNATURE widget opens the capture dialog so
-      // the drawn/typed/imported signature lands INSIDE the widget rect.
+      // the drawn/typed/imported signature lands INSIDE the widget rect —
+      // unless a stamp is already placed there, in which case the click
+      // SELECTS the stamp (movable/resizable) instead of reopening.
       if (fillSign && data.fieldType === "signature") {
-        fillSignMeta._gigaOnSignatureFieldClick?.(data.formFieldElement);
+        handleSignatureWidgetClick(target);
         return;
       }
 
@@ -3195,4 +3346,371 @@ function attachFormFieldToggle(
       canvas.requestRenderAll();
     },
   );
+}
+
+// ---------------------------------------------------------------------------
+// Paragraph BLOCK selection (click = block, re-click = run, Alt+click = run)
+// + hover affordance (light outline around the hovered block)
+//
+// The EDIT-INTENT tagging above gives every engine block's members a shared
+// `data.paragraphGroupId`. These two attachments turn that identity into the
+// Word/Illustrator selection model the user expects: one click selects the
+// WHOLE block as a Fabric ActiveSelection (move/delete/restyle then flow
+// per-run through the standard pipeline), a second click drills down to the
+// run under the pointer, Alt+click targets the run directly, and hovering a
+// member draws a discreet outline around the block so the affordance is
+// visible BEFORE the click. Both are presentation-only: no scene-graph change,
+// no operation queued, nothing serialised.
+// ---------------------------------------------------------------------------
+
+/**
+ * Live editor-surface flags stamped on the Fabric canvas instance by
+ * editor-canvas.tsx (same mechanism as the Fill & Sign flags): reading them at
+ * event time lets the behaviour follow the CURRENT tool without re-attaching
+ * listeners. Absent stamps (tests, secondary surfaces) behave like the plain
+ * select tool.
+ */
+interface GigaCanvasLiveFlags {
+  _gigaFillSignMode?: boolean;
+  _gigaCurrentTool?: string;
+}
+
+/** Narrow an event target to a live Fabric multi-selection (never a data Group
+ *  such as a radio widget — those carry an elementId and type "group"). */
+function isLiveActiveSelection(
+  obj: FabricObject | null | undefined,
+): obj is FabricObject & { getObjects: () => FabricObject[] } {
+  if (!obj) return false;
+  const typeName = (obj as FabricObject & { type?: string }).type ?? "";
+  return (
+    typeName === "activeselection" &&
+    typeof (obj as { getObjects?: unknown }).getObjects === "function"
+  );
+}
+
+/**
+ * The single paragraph group id shared by ALL members of a live selection, or
+ * `null` when the selection is empty/mixed (marquee across blocks, block +
+ * image, …) — mixed selections keep Fabric's native click behaviour.
+ */
+function blockGroupIdOfSelection(sel: {
+  getObjects: () => FabricObject[];
+}): string | null {
+  const children = sel.getObjects();
+  if (children.length < 2) return null;
+  let groupId: string | null = null;
+  for (const child of children) {
+    const data = (child as FabricObjectWithData).data;
+    const id = data?.paragraphGroupId;
+    if (typeof id !== "string" || data?.isParagraphSession === true) {
+      return null;
+    }
+    if (groupId === null) groupId = id;
+    else if (groupId !== id) return null;
+  }
+  return groupId;
+}
+
+/**
+ * Absolute (scene-space) bounding box of an object. Fabric ≥ 6 composes the
+ * parent group transform inside `getBoundingRect()`, so this is correct even
+ * for a member currently inside an ActiveSelection (whose own left/top are
+ * RELATIVE to the selection centre — the classic multi-selection pitfall).
+ */
+function absBoundingRectOf(
+  obj: FabricObject,
+): { left: number; top: number; width: number; height: number } | null {
+  const withRect = obj as FabricObject & {
+    getBoundingRect?: () => {
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+    };
+  };
+  if (typeof withRect.getBoundingRect !== "function") return null;
+  try {
+    return withRect.getBoundingRect();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Single-click BLOCK selection for paragraph groups (Illustrator/Figma model):
+ *
+ *   - click on a member run → the WHOLE block becomes the active selection
+ *     (Fabric `ActiveSelection` of every live member — move/scale/delete then
+ *     flow per-run through the existing object:modified/removed pipeline);
+ *   - click while the block IS the active selection → DRILL-DOWN to the run
+ *     under the pointer (hit-tested with `containsPoint`, which is absolute
+ *     even inside a selection);
+ *   - once drilled in (a member run is the active object), further clicks keep
+ *     Fabric's native single-run behaviour — including the second-click
+ *     inline-edit path;
+ *   - Alt+click targets the run directly; Shift/Ctrl/Meta keep Fabric's native
+ *     multi-selection; drags (marquee, move) are untouched (`isClick` guard).
+ *
+ * Promotion happens on mouse:up so Fabric's own mousedown selection/transform
+ * setup has fully settled (same reasoning as the Fill & Sign caret placement):
+ * swapping the active object DURING mousedown would leave Fabric's transform
+ * pointing at the lone run while the selection holds it — corrupting a drag.
+ * Idempotent per canvas; only active in the plain select tool, outside
+ * Fill & Sign (live flags stamped by the surface).
+ */
+function attachParagraphBlockSelection(
+  canvas: FabricCanvas,
+  fabricModule: FabricModule,
+): void {
+  const canvasWithMeta = canvas as unknown as {
+    _paragraphBlockSelectAttached?: boolean;
+  } & GigaCanvasLiveFlags;
+  if (canvasWithMeta._paragraphBlockSelectAttached) return;
+  canvasWithMeta._paragraphBlockSelectAttached = true;
+
+  const interactionAllowed = (): boolean => {
+    if (canvasWithMeta._gigaFillSignMode === true) return false;
+    const tool = canvasWithMeta._gigaCurrentTool;
+    return typeof tool !== "string" || tool === "select";
+  };
+
+  // Active object BEFORE Fabric's own mousedown selection. Fabric selects the
+  // clicked run DURING __onMouseDown (activeOn 'down'), so by mouse:up the run
+  // is always active — only this snapshot distinguishes a first click on a
+  // block (→ promote) from a click while already drilled into it (→ native).
+  let prevActiveAtDown: FabricObject | null = null;
+  canvas.on("mouse:down:before", () => {
+    prevActiveAtDown =
+      (
+        canvas as unknown as { getActiveObject?: () => FabricObject | null }
+      ).getActiveObject?.() ?? null;
+  });
+
+  canvas.on(
+    "mouse:up",
+    (opt: {
+      target?: FabricObject | null;
+      isClick?: boolean;
+      scenePoint?: { x: number; y: number };
+      e?: Event;
+    }) => {
+      // Only plain CLICKS re-target the selection: a drag is a move/marquee.
+      if (opt.isClick === false) return;
+      if (!interactionAllowed()) return;
+      const evt = opt.e as MouseEvent | undefined;
+      // Alt = run directly (Fabric already selected it at mousedown);
+      // Shift/Ctrl/Meta = Fabric's native multi-selection keys.
+      if (evt && (evt.altKey || evt.shiftKey || evt.ctrlKey || evt.metaKey)) {
+        return;
+      }
+      const target = opt.target as FabricObjectWithData | null | undefined;
+      if (!target) return;
+
+      // DRILL-DOWN: the click landed on the live block selection (Fabric
+      // targets the ActiveSelection when the pointer is inside it) → select
+      // the individual run under the pointer. containsPoint composes the
+      // group transform, so it hit-tests correctly despite the members'
+      // relative coordinates. A click on the selection padding (between
+      // lines) keeps the block selected.
+      if (isLiveActiveSelection(target)) {
+        if (!blockGroupIdOfSelection(target)) return;
+        const point = opt.scenePoint;
+        if (!point) return;
+        const member = target.getObjects().find((o) => {
+          const hitTestable = o as FabricObject & {
+            containsPoint?: (p: { x: number; y: number }) => boolean;
+          };
+          return (
+            typeof hitTestable.containsPoint === "function" &&
+            hitTestable.containsPoint(point)
+          );
+        });
+        if (!member) return;
+        canvas.setActiveObject(member);
+        canvas.requestRenderAll();
+        return;
+      }
+
+      // PROMOTION: a plain click on a member run selects the WHOLE block.
+      const data = target.data;
+      const groupId = data?.paragraphGroupId;
+      if (typeof groupId !== "string" || data?.isParagraphSession === true) {
+        return;
+      }
+      if (
+        (target as FabricObject & { isEditing?: boolean }).isEditing === true
+      ) {
+        return;
+      }
+      // Drilled-in state: the previous active object was this very run (or a
+      // same-group sibling) → keep Fabric's native single-run behaviour (this
+      // is also what lets the second click enter inline editing).
+      if (prevActiveAtDown === (target as FabricObject)) return;
+      const prevData = (prevActiveAtDown as FabricObjectWithData | null)?.data;
+      if (
+        prevData?.paragraphGroupId === groupId &&
+        !isLiveActiveSelection(prevActiveAtDown)
+      ) {
+        return;
+      }
+      const members = canvas.getObjects().filter((o) => {
+        const od = (o as FabricObjectWithData).data;
+        return (
+          od?.paragraphGroupId === groupId &&
+          od?.isParagraphSession !== true &&
+          od?.isParagraphHoverOutline !== true &&
+          (o as FabricObject).selectable !== false &&
+          (o as FabricObject).visible !== false
+        );
+      });
+      if (members.length < 2) return;
+      // Same primitive as the layers-panel multi-selection (selectElements):
+      // Fabric ≥ 6 fires selection:created/updated from setActiveObject, so
+      // the store/properties panel sync through the standard handlers.
+      const selection = new fabricModule.ActiveSelection(members, { canvas });
+      canvas.setActiveObject(selection as unknown as FabricObject);
+      canvas.requestRenderAll();
+    },
+  );
+}
+
+/**
+ * Hover affordance for paragraph blocks: while the pointer is over a member of
+ * a group, a discreet outline (1px primary at ~35% opacity, no fill) is drawn
+ * around the UNION of the members' absolute bounds, so the "one click selects
+ * the whole block" behaviour is visible before the click. The outline is pure
+ * chrome: non-interactive (`selectable:false, evented:false`), excluded from
+ * export, never serialised (fabric-element-io skips `isParagraphHoverOutline`)
+ * and swept on re-render. Removed on mouse-out (kept while moving between two
+ * members of the SAME block — `nextTarget`) and on mouse-down (the real
+ * selection visuals take over). Idempotent per canvas.
+ */
+function attachParagraphHoverAffordance(
+  canvas: FabricCanvas,
+  fabricModule: FabricModule,
+): void {
+  const canvasWithMeta = canvas as unknown as {
+    _paragraphHoverAffordanceAttached?: boolean;
+  } & GigaCanvasLiveFlags;
+  if (canvasWithMeta._paragraphHoverAffordanceAttached) return;
+  canvasWithMeta._paragraphHoverAffordanceAttached = true;
+  const { Rect } = fabricModule;
+
+  // The canvas is the single source of truth for the outline (no closure
+  // state): the re-render sweep in renderElementsOverlay can remove it at any
+  // time without desyncing this attachment.
+  const findOutline = (): FabricObjectWithData | undefined =>
+    canvas
+      .getObjects()
+      .find(
+        (o) =>
+          (o as FabricObjectWithData).data?.isParagraphHoverOutline === true,
+      ) as FabricObjectWithData | undefined;
+
+  const removeOutline = (): void => {
+    const outline = findOutline();
+    if (!outline) return;
+    canvas.remove(outline as unknown as FabricObject);
+    canvas.requestRenderAll();
+  };
+
+  canvas.on(
+    "mouse:over",
+    (opt: { target?: FabricObject | null }) => {
+      if (canvasWithMeta._gigaFillSignMode === true) return;
+      const tool = canvasWithMeta._gigaCurrentTool;
+      if (typeof tool === "string" && tool !== "select") return;
+      const target = opt.target as FabricObjectWithData | null | undefined;
+      const data = target?.data;
+      const groupId = data?.paragraphGroupId;
+      if (typeof groupId !== "string" || data?.isParagraphSession === true) {
+        removeOutline();
+        return;
+      }
+      const existing = findOutline();
+      if (existing?.data?.hoverForGroupId === groupId) return; // already shown
+      if (existing) canvas.remove(existing as unknown as FabricObject);
+
+      // Union of the members' ABSOLUTE bounds (getBoundingRect composes any
+      // parent selection transform — correct even while the block is the
+      // active multi-selection).
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      for (const o of canvas.getObjects()) {
+        const od = (o as FabricObjectWithData).data;
+        if (
+          od?.paragraphGroupId !== groupId ||
+          od?.isParagraphSession === true ||
+          od?.isParagraphHoverOutline === true
+        ) {
+          continue;
+        }
+        const rect = absBoundingRectOf(o as FabricObject);
+        if (!rect) continue;
+        minX = Math.min(minX, rect.left);
+        minY = Math.min(minY, rect.top);
+        maxX = Math.max(maxX, rect.left + rect.width);
+        maxY = Math.max(maxY, rect.top + rect.height);
+      }
+      if (!Number.isFinite(minX) || !Number.isFinite(maxY)) return;
+
+      const PAD = 2; // breathing room so the outline never kisses the glyphs
+      const outline = new Rect({
+        left: minX - PAD,
+        top: minY - PAD,
+        width: maxX - minX + PAD * 2,
+        height: maxY - minY + PAD * 2,
+        // Fabric ≥ 6 defaults originX/Y to 'center' — force top-left like
+        // every other object positioned by left/top here.
+        originX: "left" as const,
+        originY: "top" as const,
+        fill: "transparent",
+        stroke: "rgba(0, 100, 200, 0.35)",
+        strokeWidth: 1,
+        // Keep a crisp 1px on screen whatever the zoom.
+        strokeUniform: true,
+        selectable: false,
+        evented: false,
+        hasControls: false,
+        hasBorders: false,
+        excludeFromExport: true,
+        objectCaching: false,
+      });
+      (outline as FabricObjectWithData).data = {
+        isParagraphHoverOutline: true,
+        hoverForGroupId: groupId,
+      };
+      canvas.add(outline as unknown as FabricObject);
+      canvas.requestRenderAll();
+    },
+  );
+
+  canvas.on(
+    "mouse:out",
+    (opt: {
+      target?: FabricObject | null;
+      nextTarget?: FabricObject | null;
+    }) => {
+      const outline = findOutline();
+      if (!outline) return;
+      // Moving between two members of the SAME block keeps the outline —
+      // Fabric hands us the entering object as `nextTarget` on the way out.
+      const nextData = (
+        opt.nextTarget as FabricObjectWithData | null | undefined
+      )?.data;
+      if (
+        nextData?.paragraphGroupId === outline.data?.hoverForGroupId &&
+        nextData?.isParagraphSession !== true
+      ) {
+        return;
+      }
+      canvas.remove(outline as unknown as FabricObject);
+      canvas.requestRenderAll();
+    },
+  );
+
+  // A click replaces the affordance with the real selection visuals.
+  canvas.on("mouse:down", () => removeOutline());
 }

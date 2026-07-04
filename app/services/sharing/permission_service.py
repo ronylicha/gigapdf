@@ -187,7 +187,7 @@ class PermissionService:
                         f"Your access to '{document.name}' changed from "
                         f"{old_permission} to {new_permission}"
                     ),
-                    metadata={
+                    extra_data={
                         "document_name": document.name,
                         "old_permission": old_permission,
                         "new_permission": new_permission,

@@ -244,6 +244,7 @@ export type { OcgLayerOp } from './hooks';
 // WebSocket
 export {
   socketClient,
+  setAuthTokenProvider,
   useSocket,
   useSocketEvent,
   useDocumentCollaboration,
@@ -252,7 +253,7 @@ export {
   useElementUpdates,
   useJobStatus,
 } from './websocket';
-export type { SocketEvent, SocketEventData } from './websocket';
+export type { SocketEvent, SocketEventData, AuthTokenProvider } from './websocket';
 
 // Providers
 export { QueryProvider, SocketProvider, useSocketContext } from './providers';
