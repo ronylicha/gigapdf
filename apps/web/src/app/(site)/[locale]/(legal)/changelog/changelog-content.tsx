@@ -15,6 +15,15 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.27.0",
+    date: "2026-07-05",
+    type: "minor",
+    changes: [
+      { type: "feature", description: "Office documents (Word, Excel, PowerPoint, OpenDocument) now convert to accessible, tagged PDFs by default — the output carries a proper structure tree (headings, paragraphs, lists, tables, figures), so it is screen-reader friendly and its text reads in the true document order. The page still looks exactly the same (engine 0.120.0)." },
+      { type: "fix", description: "Multi-level lists keep their exact markers per depth when converted: a nested \"a)\" no longer reads back as \"2.\", and sub-bullets (◦, ▪) no longer collapse to a single bullet. Each item's real marker is preserved end-to-end." },
+    ],
+  },
+  {
     version: "1.26.3",
     date: "2026-07-05",
     type: "patch",

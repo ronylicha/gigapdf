@@ -5,6 +5,19 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.27.0] - 2026-07-05
+
+### Changed
+
+- **Office documents now convert to accessible (PDF/UA-shaped) tagged PDFs by
+  default** (engine 0.120.0). Every Word / Excel / PowerPoint / OpenDocument
+  conversion carries a logical structure tree (headings, paragraphs, lists,
+  tables, figures) plus marked content, so the output is screen-reader friendly
+  and its text layer reads in the true document order — no change to how the page
+  looks. Multi-level lists keep their exact per-depth markers on the round-trip
+  (`1. / a) / i.`, `• / ◦ / ▪`): a nested `a)` no longer reads back as `2.`, and
+  sub-bullets no longer collapse to a single bullet.
+
 ## [1.26.3] - 2026-07-05
 
 ### Fixed
