@@ -15,6 +15,7 @@ import type { ToolData } from "./tools-data";
 export const TOOLS: ToolData[] = [
   {
     slug: "edit-pdf",
+    appHref: "/documents",
     name: "Edit PDF",
     category: "edit",
     metaTitle: "Edit PDF Online: Change Text & Images Free | GigaPDF",
@@ -411,6 +412,7 @@ export const TOOLS: ToolData[] = [
   },
   {
     slug: "searchable-pdf",
+    appHref: "/documents",
     name: "Searchable PDF",
     category: "ocr",
     metaTitle: "Make a Scanned PDF Searchable (OCR Layer) | GigaPDF",
@@ -663,6 +665,7 @@ export const TOOLS: ToolData[] = [
   },
   {
     slug: "annotate-pdf",
+    appHref: "/documents",
     name: "Annotate PDF",
     category: "edit",
     metaTitle: "Annotate PDF Online: Highlight & Comment | GigaPDF",
@@ -725,6 +728,7 @@ export const TOOLS: ToolData[] = [
   },
   {
     slug: "pdf-forms",
+    appHref: "/documents",
     name: "PDF Forms",
     category: "edit",
     metaTitle: "Fill Out PDF Forms Online Free | GigaPDF",
@@ -1732,6 +1736,7 @@ export const TOOLS: ToolData[] = [
   },
   {
     slug: "redact-pdf",
+    appHref: "/documents",
     name: "Redact PDF",
     category: "edit",
     metaTitle: "Redact PDF: Permanently Remove Content | GigaPDF",

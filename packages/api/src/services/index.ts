@@ -3,7 +3,6 @@
  */
 export { authService } from './auth';
 export { documentService } from './documents';
-export { pageService } from './pages';
 export { elementService } from './elements';
 export { uploadService } from './uploads';
 export { exportService } from './exports';

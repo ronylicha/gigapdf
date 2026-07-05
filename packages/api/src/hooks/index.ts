@@ -3,7 +3,6 @@
  */
 export * from './use-auth';
 export * from './use-documents';
-export * from './use-pages';
 export * from './use-elements';
 export * from './use-uploads';
 export * from './use-exports';

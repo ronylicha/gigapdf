@@ -22,7 +22,6 @@ export type { TokenStorage } from './client';
 export {
   authService,
   documentService,
-  pageService,
   elementService,
   uploadService,
   exportService,
@@ -97,20 +96,6 @@ export {
   useDocumentHistory,
   useRestoreDocumentVersion,
   documentKeys,
-
-  // Page hooks — pages are identified by page_number (integer), not a UUID
-  usePage,
-  useCreatePage,
-  useDeletePage,
-  useDuplicatePage,
-  useReorderPages,
-  useRotatePage,
-  useResizePage,
-  useExtractPages,
-  useMovePage,
-  usePagePreview,
-  usePageImage,
-  pageKeys,
 
   // Element hooks
   useElements,

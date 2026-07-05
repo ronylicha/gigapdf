@@ -15,6 +15,15 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.26.2",
+    date: "2026-07-05",
+    type: "patch",
+    changes: [
+      { type: "improvement", description: "The five editor-based tool pages (Edit, Annotate, Forms, Redact and Searchable PDF) now send their \"open editor\" button to your document library, where you upload and open a PDF — instead of the sign-up page." },
+      { type: "fix", description: "Stabilised the web test suite (it was intermittently red in CI due to test-isolation leakage), which re-enables reliable continuous integration. Plus internal housekeeping: removed dead code and modernised a test configuration." },
+    ],
+  },
+  {
     version: "1.26.1",
     date: "2026-07-05",
     type: "patch",

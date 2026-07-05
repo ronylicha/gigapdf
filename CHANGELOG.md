@@ -5,6 +5,34 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.26.2] - 2026-07-05
+
+### Fixed
+
+- **Web test suite is deterministic again.** The `apps/web` Vitest suite reused a
+  single fork across files (`isolate: false`), so module mocks (17 files mock
+  `next-intl` with different factories) and stray globals (`global.fetch`) leaked
+  between files — producing an order-dependent "rotating" set of failures
+  (share-dialog, click-outside-touch, add-page-menu…) that was red in CI but
+  green in isolation. Switched to `isolate: true` (fresh module registry + globals
+  per file) plus mock hygiene (`clearMocks`/`restoreMocks`/`unstubGlobals`/
+  `unstubEnvs`). 1335 tests now pass deterministically. This unblocks CI (the
+  auto-deploy job was gated on the chronically-red web tests).
+
+### Changed
+
+- **Editor-tool landing pages link to the app.** The five editor-based SEO tool
+  pages (Edit / Annotate / Forms / Redact / Searchable PDF) had no `appHref`, so
+  their "open editor" CTA fell back to the sign-up page — in both languages. They
+  now link to the document library (`/documents`), where you upload and open a PDF.
+
+### Internal
+
+- Removed dead `pageService` / `use-pages` from `@giga-pdf/api` (0 deployed
+  consumers — they targeted the FastAPI `/pages` routers removed in 1.26.0) and
+  their barrel exports. Migrated `packages/pdf-engine` Vitest config off the
+  removed-in-Vitest-4 `poolOptions` API.
+
 ## [1.26.1] - 2026-07-05
 
 ### Fixed

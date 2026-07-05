@@ -50,6 +50,7 @@ export interface ToolData {
 export const TOOLS: ToolData[] = [
   {
     slug: "editer-pdf",
+    appHref: "/documents",
     name: "Éditer un PDF",
     category: "edit",
     metaTitle: "Éditer un PDF en ligne gratuitement | GigaPDF",
@@ -446,6 +447,7 @@ export const TOOLS: ToolData[] = [
   },
   {
     slug: "pdf-cherchable",
+    appHref: "/documents",
     name: "PDF cherchable",
     category: "ocr",
     metaTitle: "Rendre un PDF cherchable (calque texte OCR) | GigaPDF",
@@ -698,6 +700,7 @@ export const TOOLS: ToolData[] = [
   },
   {
     slug: "annoter-pdf",
+    appHref: "/documents",
     name: "Annoter un PDF",
     category: "edit",
     metaTitle: "Annoter un PDF en ligne : notes et surlignage | GigaPDF",
@@ -760,6 +763,7 @@ export const TOOLS: ToolData[] = [
   },
   {
     slug: "formulaires-pdf",
+    appHref: "/documents",
     name: "Formulaires PDF",
     category: "edit",
     metaTitle: "Remplir un formulaire PDF en ligne | GigaPDF",
@@ -1773,6 +1777,7 @@ export const TOOLS: ToolData[] = [
   },
   {
     slug: "caviarder-pdf",
+    appHref: "/documents",
     name: "Caviarder un PDF",
     category: "edit",
     metaTitle: "Caviarder un PDF : caviardage permanent | GigaPDF",

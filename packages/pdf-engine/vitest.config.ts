@@ -7,15 +7,14 @@ export default defineConfig({
     include: ['__tests__/**/*.test.ts'],
     setupFiles: ['__tests__/vitest-setup.ts'],
     pool: 'forks',
-    poolOptions: {
-      forks: {
-        singleFork: true,
-        minForks: 1,
-        maxForks: 1,
-        execArgv: ['--max-old-space-size=1024'],
-      },
-    },
+    // Vitest 4 a retiré `test.poolOptions` (singleFork/min/maxForks/execArgv y
+    // sont désormais IGNORÉS silencieusement). Équivalent v4 : exécution
+    // séquentielle mono-worker (borne le pic mémoire des tests round-trip gros
+    // PDF) avec l'isolation par défaut (isolate: true → registre de modules
+    // frais par fichier). Le heap est hérité du parent ; passer par
+    // NODE_OPTIONS=--max-old-space-size=… au niveau du script si besoin.
     fileParallelism: false,
+    maxWorkers: 1,
     maxConcurrency: 1,
     server: {
       deps: {

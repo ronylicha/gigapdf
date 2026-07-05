@@ -20,17 +20,29 @@ export default defineConfig({
     setupFiles: ['src/hooks/__tests__/vitest-setup.ts'],
     include: ['src/**/__tests__/**/*.test.{ts,tsx}'],
     pool: 'forks',
-    // Vitest 4 removed poolOptions.forks.{singleFork,minForks,maxForks}. The
-    // equivalent isolation for tests that mutate process.env globally is:
-    //   - isolate: false  → reuse the same fork between files (was singleFork)
-    //   - fileParallelism: false → run files sequentially
-    //   - maxWorkers: 1   → cap to a single worker (was min/maxForks=1)
-    // execArgv heap-size override is not exposed in v4 InlineConfig and is no
-    // longer needed since the fork pool inherits the parent --max-old-space-size.
-    isolate: false,
+    // isolate: true → chaque fichier de test obtient un registre de modules ET
+    // des globals frais. C'est INDISPENSABLE ici : 17 fichiers mockent
+    // `next-intl` (et d'autres modules) avec des factories DIFFÉRENTES, et
+    // certains posent des globals (`global.fetch = vi.fn()`). Sous isolate:false
+    // (ancien réglage), ces mocks/globals fuitaient entre fichiers selon l'ordre
+    // d'exécution → un "set flaky rotatif" (share-dialog, click-outside-touch,
+    // add-page-menu, mobile-sheet…) rouge en CI mais vert en isolation. Le seul
+    // test qui mute process.env globalement (env.test.ts) le restaure déjà dans
+    // son propre afterEach, donc isolate:true ne casse rien.
+    // On garde l'exécution séquentielle (un seul worker) pour un pic mémoire
+    // borné sur le runner CI ; forks + isolate GC le graphe de modules entre
+    // fichiers.
+    isolate: true,
     fileParallelism: false,
     maxWorkers: 1,
     maxConcurrency: 1,
+    // Hygiène de mocks après CHAQUE test (défense en profondeur intra-fichier) :
+    // restaure les spies, vide les .mock.calls, et retire les stubs de globals
+    // et d'env posés via vi.stubGlobal / vi.stubEnv.
+    clearMocks: true,
+    restoreMocks: true,
+    unstubGlobals: true,
+    unstubEnvs: true,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
