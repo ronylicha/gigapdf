@@ -15,6 +15,14 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.26.1",
+    date: "2026-07-05",
+    type: "patch",
+    changes: [
+      { type: "fix", description: "Collaborator presence and live cursors now appear reliably on the first time you open a document. A connection race meant the editor could finish joining the collaboration room before it had wired up its listeners, so other people's presence, cursors and element locks were silently dropped until a reconnect — they are now bound on every connect." },
+    ],
+  },
+  {
     version: "1.26.0",
     date: "2026-07-05",
     type: "minor",

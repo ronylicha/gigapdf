@@ -5,6 +5,22 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.26.1] - 2026-07-05
+
+### Fixed
+
+- **Collaborator presence & live cursors on first open.** On a cold editor
+  load the socket could finish joining the collaboration room *before* the
+  presence/cursor/lock hooks had bound their listeners: `on()` only attached a
+  handler when the socket was already `connected`, and the `connect` event
+  did not re-bind. Emits (room join) still went out — so others saw you — but
+  incoming `user:join` / `cursor:move` / `element:locked` events were silently
+  dropped, so remote collaborators never appeared until a reconnect. The
+  socket client now re-binds every registered listener on each `connect`
+  (idempotent `off()`+`on()`), so presence, cursors and element locks render
+  reliably from the first load. Regression test added
+  (`socket-auth-provider.test.ts`).
+
 ## [1.26.0] - 2026-07-05
 
 ### Added — real-time collaboration is now complete

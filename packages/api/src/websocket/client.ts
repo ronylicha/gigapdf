@@ -291,6 +291,22 @@ class SocketClient {
     // Set up event listeners
     this.socket.on('connect', () => {
       console.log('[Socket] Connected');
+      // (Re)bind every registered listener on each connect. Les hooks de
+      // présence/curseur de l'éditeur s'abonnent via on() JUSTE APRÈS que
+      // joinDocument() a déclenché connect() : à cet instant le socket est
+      // encore en cours de connexion (`connected === false`), donc le garde
+      // de on() ne lie PAS le handler — il n'existe que dans `this.listeners`.
+      // Sans cette ré-attache au 'connect', ces handlers ne seraient JAMAIS
+      // liés au socket vivant : les events entrants (user:join / cursor:move /
+      // element:locked …) seraient silencieusement perdus et la présence des
+      // collaborateurs ne s'afficherait jamais. off()+on() garde l'opération
+      // idempotente (aucun double-déclenchement), y compris sur reconnexion.
+      this.listeners.forEach((callbacks, event) => {
+        callbacks.forEach((callback) => {
+          this.socket?.off(event as string, callback);
+          this.socket?.on(event as string, callback);
+        });
+      });
     });
 
     this.socket.on('disconnect', (reason) => {
@@ -299,13 +315,6 @@ class SocketClient {
 
     this.socket.on('error', (error) => {
       console.error('[Socket] Error:', error);
-    });
-
-    // Re-attach all listeners
-    this.listeners.forEach((callbacks, event) => {
-      callbacks.forEach((callback) => {
-        this.socket?.on(event, callback);
-      });
     });
 
     return this.socket;

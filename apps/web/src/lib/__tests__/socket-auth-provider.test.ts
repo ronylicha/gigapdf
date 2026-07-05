@@ -119,3 +119,62 @@ describe("SocketClient auth handshake", () => {
     expect(options.transports).toEqual(["websocket"]);
   });
 });
+
+/**
+ * Régression collaboration (cold-start) : un handler abonné via on() PENDANT
+ * que le socket se connecte (cas réel — les hooks de présence/curseur de
+ * l'éditeur s'abonnent juste après que joinDocument() a déclenché connect())
+ * doit être lié au socket vivant lorsque l'événement 'connect' survient.
+ *
+ * Avant le fix, on() ne liait le handler que si `socket.connected` (false
+ * pendant le handshake) et le 'connect' ne re-liait rien → les events entrants
+ * (user:join / cursor:move / element:locked) étaient perdus et la présence des
+ * collaborateurs ne s'affichait jamais (emits OK, listeners KO).
+ */
+describe("SocketClient — liaison des listeners au 'connect' (cold-start)", () => {
+  beforeEach(() => {
+    ioMock.mockReset();
+    setApiConfig({
+      baseURL: "https://example.test/api/v1",
+      websocketURL: "wss://example.test",
+    });
+  });
+
+  afterEach(() => {
+    socketClient.disconnect();
+  });
+
+  it("un listener abonné pendant la connexion est (re)lié quand 'connect' survient", () => {
+    // Fake socket qui capture les handlers pour pouvoir déclencher 'connect'.
+    const handlers: Record<string, (...a: unknown[]) => void> = {};
+    const fake = {
+      connected: false,
+      on: vi.fn((event: string, cb: (...a: unknown[]) => void) => {
+        handlers[event] = cb;
+      }),
+      off: vi.fn(),
+      emit: vi.fn(),
+      disconnect: vi.fn(),
+    };
+    ioMock.mockImplementation(() => fake);
+
+    // Reproduit l'ordre réel : connect() D'ABORD (socket en cours de
+    // connexion), PUIS l'abonnement — comme le fait useUserPresence.
+    socketClient.connect();
+    const onUserJoin = vi.fn();
+    socketClient.on("user:join", onUserJoin);
+
+    // Pendant la connexion, le garde de on() (connected === false) n'a pas
+    // lié le handler applicatif : seuls les handlers internes de connect()
+    // (connect/disconnect/error) sont posés.
+    expect(fake.on.mock.calls.map((c) => c[0])).not.toContain("user:join");
+
+    // L'événement 'connect' du socket doit re-lier tous les listeners.
+    fake.connected = true;
+    handlers["connect"]?.();
+
+    expect(fake.on.mock.calls.map((c) => c[0])).toContain("user:join");
+
+    socketClient.off("user:join", onUserJoin);
+  });
+});
