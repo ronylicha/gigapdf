@@ -15,6 +15,14 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.26.3",
+    date: "2026-07-05",
+    type: "patch",
+    changes: [
+      { type: "fix", description: "In the editor, a heading and the paragraph beneath it are now recognised as two separate blocks instead of one. Previously a title and its first paragraph were coalesced, so you could only select and edit them together; each is now its own editable block (engine 0.119.0)." },
+    ],
+  },
+  {
     version: "1.26.2",
     date: "2026-07-05",
     type: "patch",

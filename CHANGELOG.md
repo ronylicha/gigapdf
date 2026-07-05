@@ -5,6 +5,18 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.26.3] - 2026-07-05
+
+### Fixed
+
+- **Editor block recognition: a heading and the paragraph beneath it are now
+  separate blocks** (engine 0.119.0). The reconstruction used to coalesce a
+  heading and the body text that followed it into one block, so a title and its
+  first paragraph could only be selected and edited together. They now split on
+  the heading↔body font-size change, so each is its own editable block. The same
+  fix corrects text extraction on tagged documents (a heading no longer glues
+  onto the first line of the following paragraph).
+
 ## [1.26.2] - 2026-07-05
 
 ### Fixed
