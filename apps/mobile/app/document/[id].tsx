@@ -22,11 +22,9 @@ import {
 } from 'react-native';
 import { useLocalSearchParams, Stack, useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { useTheme } from '../../src/contexts/ThemeContext';
 import { Spacing, Typography, BorderRadius } from '../../src/constants/spacing';
-import { BASE_URL } from '../../src/services/api';
 import {
   storageService,
   formatFileSize,
@@ -52,6 +50,7 @@ export default function DocumentEditorScreen() {
 
   // Document state
   const [document, setDocument] = useState<StoredDocument | null>(null);
+  const [pdfUri, setPdfUri] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -115,6 +114,12 @@ export default function DocumentEditorScreen() {
       console.log('[Editor] Document loaded:', doc);
       setDocument(doc);
       setTotalPages(doc.page_count);
+
+      // Acquire the PDF bytes to a local file (load → authenticated download).
+      // There is no public stored-document download URL, so we cannot point the
+      // viewer at a remote URL directly.
+      const { localUri } = await storageService.downloadToFile(id);
+      setPdfUri(localUri);
     } catch (err: any) {
       console.error('[Editor] Failed to load document:', err);
       setError(err.message || 'Impossible de charger le document');
@@ -266,27 +271,23 @@ export default function DocumentEditorScreen() {
   }, [id, isModified, exportAnnotations, resetModified]);
 
   const handleDownload = useCallback(async () => {
-    if (!id || !document) return;
+    if (!document) return;
 
     try {
-      const downloadUrl = `${BASE_URL}/api/v1/storage/documents/${id}/download`;
-      const fileUri = `${FileSystem.documentDirectory}${document.name}`;
+      // The PDF is already downloaded locally on load; share that file.
+      const fileUri = pdfUri ?? (await storageService.downloadToFile(id!)).localUri;
 
-      const downloadResult = await FileSystem.downloadAsync(downloadUrl, fileUri);
-
-      if (downloadResult.status === 200) {
-        const canShare = await Sharing.isAvailableAsync();
-        if (canShare) {
-          await Sharing.shareAsync(downloadResult.uri, {
-            mimeType: 'application/pdf',
-            dialogTitle: 'Enregistrer le PDF',
-          });
-        }
+      const canShare = await Sharing.isAvailableAsync();
+      if (canShare) {
+        await Sharing.shareAsync(fileUri, {
+          mimeType: 'application/pdf',
+          dialogTitle: 'Enregistrer le PDF',
+        });
       }
     } catch (err: any) {
       Alert.alert('Erreur', 'Impossible de telecharger le document');
     }
-  }, [id, document]);
+  }, [id, document, pdfUri]);
 
   const handleShare = useCallback(async () => {
     if (!document) return;
@@ -539,35 +540,37 @@ export default function DocumentEditorScreen() {
 
         {/* PDF Viewer with Annotation Overlay */}
         <View style={styles.pdfContainer}>
-          <PDFViewer
-            documentId={id}
-            currentPage={currentPage}
-            scale={scale}
-            onPageChange={handlePageChange}
-            onLoadComplete={handlePdfLoadComplete}
-            onError={handlePdfError}
-            onPageSingleTap={handlePageTap}
-            onScaleChanged={handleScaleChanged}
-          >
-            {isEditing && (
-              <AnnotationOverlay
-                annotations={annotations}
-                currentPage={currentPage}
-                activeTool={activeTool}
-                activeColor={activeColor}
-                strokeWidth={strokeWidth}
-                opacity={1}
-                selectedAnnotationId={selectedAnnotationId}
-                onAnnotationCreate={handleAnnotationCreate}
-                onAnnotationSelect={setSelectedAnnotationId}
-                onAnnotationUpdate={handleAnnotationUpdate}
-                onTextInput={handleTextInput}
-                scale={scale}
-                pageWidth={pdfDimensions.width}
-                pageHeight={pdfDimensions.height}
-              />
-            )}
-          </PDFViewer>
+          {pdfUri ? (
+            <PDFViewer
+              sourceUri={pdfUri}
+              currentPage={currentPage}
+              scale={scale}
+              onPageChange={handlePageChange}
+              onLoadComplete={handlePdfLoadComplete}
+              onError={handlePdfError}
+              onPageSingleTap={handlePageTap}
+              onScaleChanged={handleScaleChanged}
+            >
+              {isEditing && (
+                <AnnotationOverlay
+                  annotations={annotations}
+                  currentPage={currentPage}
+                  activeTool={activeTool}
+                  activeColor={activeColor}
+                  strokeWidth={strokeWidth}
+                  opacity={1}
+                  selectedAnnotationId={selectedAnnotationId}
+                  onAnnotationCreate={handleAnnotationCreate}
+                  onAnnotationSelect={setSelectedAnnotationId}
+                  onAnnotationUpdate={handleAnnotationUpdate}
+                  onTextInput={handleTextInput}
+                  scale={scale}
+                  pageWidth={pdfDimensions.width}
+                  pageHeight={pdfDimensions.height}
+                />
+              )}
+            </PDFViewer>
+          ) : null}
         </View>
 
         {/* Page Navigation */}

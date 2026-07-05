@@ -148,8 +148,25 @@ export function getApiUrl(): string {
 // API Endpoints
 // ============================================================================
 
+/**
+ * API endpoints, grouped by backend surface.
+ *
+ * Two surfaces coexist behind `https://giga-pdf.com` (see `BASE_URL` in
+ * `api.ts`):
+ *   • `/api/v1/*`  — FastAPI (auth, GED storage, quota, sharing, session
+ *                    document + elements APIs). Reached via `apiClient`
+ *                    (baseURL already includes `/api/v1`), so paths below are
+ *                    RELATIVE to `/api/v1`.
+ *   • `/api/pdf/*` — the stateless TypeScript PDF engine (Next.js). These are
+ *                    ABSOLUTE (`${BASE_URL}/api/pdf/...`) and NOT reachable via
+ *                    `apiClient` (different base) — see the `engine` block.
+ *
+ * The pre-refactor stateful editing routes (`/documents/{id}/pages/*`,
+ * `/documents/{id}/.../annotations/*`, `/history`, `/forms`, standalone
+ * `/layers`) were REMOVED. Their current replacements are noted below.
+ */
 export const ENDPOINTS = {
-  // Authentication
+  // Authentication (FastAPI /api/v1/auth/*)
   auth: {
     login: '/auth/login',
     register: '/auth/register',
@@ -162,37 +179,38 @@ export const ENDPOINTS = {
     verifyEmail: '/auth/email/verify',
   },
 
-  // Documents
+  // Persistent document storage — the GED (FastAPI /api/v1/storage/*).
+  // This is the primary document surface used by the app.
+  storage: {
+    list: '/storage/documents',
+    get: (id: string) => `/storage/documents/${id}`,
+    upload: '/storage/documents',
+    rename: (id: string) => `/storage/documents/${id}`,
+    delete: (id: string) => `/storage/documents/${id}`,
+    move: (id: string) => `/storage/documents/${id}/move`,
+    // No public download URL: load → session id → documents.download (below).
+    load: (id: string) => `/storage/documents/${id}/load`,
+    versions: (id: string) => `/storage/documents/${id}/versions`,
+    thumbnail: (id: string) => `/storage/documents/${id}/thumbnail`,
+    duplicate: (id: string) => `/storage/documents/${id}/duplicate`,
+    layers: (id: string) => `/storage/documents/${id}/layers`,
+    tags: '/storage/documents/tags',
+    folders: '/storage/folders',
+    folder: (id: string) => `/storage/folders/${id}`,
+    folderStats: (id: string) => `/storage/folders/${id}/stats`,
+  },
+
+  // Transient editing session documents (FastAPI /api/v1/documents/*).
+  // `id` here is the session handle returned by `storage.load`.
   documents: {
-    list: '/documents',
-    get: (id: string) => `/documents/${id}`,
     upload: '/documents/upload',
-    update: (id: string) => `/documents/${id}`,
-    delete: (id: string) => `/documents/${id}`,
+    get: (id: string) => `/documents/${id}`,
     download: (id: string) => `/documents/${id}/download`,
+    delete: (id: string) => `/documents/${id}`,
     unlock: (id: string) => `/documents/${id}/unlock`,
-    extractText: (id: string) => `/documents/${id}/text/extract`,
-    merge: '/documents/merge',
-    split: (id: string) => `/documents/${id}/split`,
   },
 
-  // Pages
-  pages: {
-    list: (documentId: string) => `/documents/${documentId}/pages`,
-    get: (documentId: string, pageNum: number) =>
-      `/documents/${documentId}/pages/${pageNum}`,
-    preview: (documentId: string, pageNum: number) =>
-      `/documents/${documentId}/pages/${pageNum}/preview`,
-    add: (documentId: string) => `/documents/${documentId}/pages`,
-    delete: (documentId: string, pageNum: number) =>
-      `/documents/${documentId}/pages/${pageNum}`,
-    reorder: (documentId: string) => `/documents/${documentId}/pages/reorder`,
-    rotate: (documentId: string, pageNum: number) =>
-      `/documents/${documentId}/pages/${pageNum}/rotate`,
-    extract: (documentId: string) => `/documents/${documentId}/pages/extract`,
-  },
-
-  // Elements
+  // Scene-graph elements on a session document (FastAPI /api/v1/documents/{id}/...).
   elements: {
     list: (documentId: string, pageNum: number) =>
       `/documents/${documentId}/pages/${pageNum}/elements`,
@@ -204,25 +222,57 @@ export const ENDPOINTS = {
       `/documents/${documentId}/elements/${elementId}`,
     delete: (documentId: string, elementId: string) =>
       `/documents/${documentId}/elements/${elementId}`,
+    move: (documentId: string, elementId: string) =>
+      `/documents/${documentId}/elements/${elementId}/move`,
+    duplicate: (documentId: string, elementId: string) =>
+      `/documents/${documentId}/elements/${elementId}/duplicate`,
+    batch: (documentId: string) => `/documents/${documentId}/elements/batch`,
   },
 
-  // Annotations
-  annotations: {
-    list: (documentId: string, pageNum: number) =>
-      `/documents/${documentId}/pages/${pageNum}/annotations`,
-    listAll: (documentId: string) => `/documents/${documentId}/annotations`,
-    get: (documentId: string, annotationId: string) =>
-      `/documents/${documentId}/annotations/${annotationId}`,
-    createMarkup: (documentId: string, pageNum: number) =>
-      `/documents/${documentId}/pages/${pageNum}/annotations/markup`,
-    createNote: (documentId: string, pageNum: number) =>
-      `/documents/${documentId}/pages/${pageNum}/annotations/note`,
-    createLink: (documentId: string, pageNum: number) =>
-      `/documents/${documentId}/pages/${pageNum}/annotations/link`,
-    update: (documentId: string, annotationId: string) =>
-      `/documents/${documentId}/annotations/${annotationId}`,
-    delete: (documentId: string, annotationId: string) =>
-      `/documents/${documentId}/annotations/${annotationId}`,
+  // Quota (FastAPI /api/v1/quota/*)
+  quota: {
+    me: '/quota/me',
+    effective: '/quota/effective',
+    plans: '/quota/plans',
+  },
+
+  // Sharing (FastAPI /api/v1/sharing/*)
+  sharing: {
+    sharedWithMe: '/sharing/shared-with-me',
+    sharedByMe: '/sharing/shared-by-me',
+    share: '/sharing/share',
+    pendingInvitations: '/sharing/invitations/pending',
+    acceptInvitation: (token: string) => `/sharing/invitations/${token}/accept`,
+    declineInvitation: (token: string) => `/sharing/invitations/${token}/decline`,
+    documentShares: (documentId: string) => `/sharing/documents/${documentId}/shares`,
+    publicLink: (documentId: string) => `/sharing/documents/${documentId}/public-link`,
+    notifications: '/sharing/notifications',
+  },
+
+  // Stateless PDF engine (Next.js). ABSOLUTE URLs — prepend `BASE_URL`, NOT the
+  // `/api/v1` apiClient base. These replace the removed page/annotation/form
+  // editing routes. Multipart `file` in → PDF (or JSON) out.
+  engine: {
+    pages: '/api/pdf/pages', // add | delete | move | rotate | copy | resize
+    text: '/api/pdf/text',
+    image: '/api/pdf/image',
+    shape: '/api/pdf/shape',
+    annotations: '/api/pdf/annotations',
+    forms: '/api/pdf/forms',
+    merge: '/api/pdf/merge',
+    mergeUniversal: '/api/pdf/merge-universal',
+    split: '/api/pdf/split',
+    encrypt: '/api/pdf/encrypt',
+    flatten: '/api/pdf/flatten',
+    watermark: '/api/pdf/watermark',
+    sign: '/api/pdf/sign',
+    ocr: '/api/pdf/ocr',
+    compress: '/api/pdf/compress',
+    convert: '/api/pdf/convert',
+    preview: '/api/pdf/preview',
+    toImage: '/api/pdf/to-image',
+    imageToPdf: '/api/pdf/image-to-pdf',
+    metadata: '/api/pdf/metadata',
   },
 };
 

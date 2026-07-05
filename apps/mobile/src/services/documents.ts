@@ -1,6 +1,22 @@
 /**
  * Documents Service
- * Handles all document-related operations including upload, download, and management
+ * Handles session-document operations (upload, download, unlock).
+ *
+ * ── Migration note (2026-07, tech-debt #20) ─────────────────────────────────
+ * This service targets the FastAPI `/api/v1/documents/*` (session/processing
+ * document) surface. It is NOT imported by any screen — persistent document
+ * management is done by `storageService` (the GED, `/api/v1/storage/*`).
+ *
+ * Current route status:
+ *   ✅ Live: `upload`, `get`, `download`, `delete`, `unlock`
+ *            (`/documents/upload`, `/documents/{id}`, `/documents/{id}/download`,
+ *             `/documents/{id}`, `/documents/{id}/unlock`).
+ *   ❌ REMOVED (no `/api/v1/documents/*` equivalent) — do not rely on them:
+ *      `list` (`GET /documents` → use `storageService.listDocuments`),
+ *      `merge`/`split`/`compress`/`optimize`/`convert`/`watermark`/`protect`/
+ *      `metadata`/`text/*`/`duplicate`/`activity`/`from-template`/`share`/
+ *      `restore`/`force` → use the stateless PDF engine (`/api/pdf/*`),
+ *      `storageService`, or `sharingService` instead.
  */
 
 import { apiClient, createFormData } from './api';

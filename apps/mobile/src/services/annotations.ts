@@ -1,6 +1,19 @@
 /**
  * Annotations Service
- * Handles all annotation-related operations (markup, notes, links, highlights)
+ * Markup / notes / links / highlights.
+ *
+ * ── Migration note (2026-07, tech-debt #20) ─────────────────────────────────
+ * The FastAPI annotation routes (`/api/v1/documents/{id}/.../annotations/*`)
+ * were REMOVED (2026-06-13). Every method in this service therefore targets a
+ * DEAD route and is not imported by any screen.
+ *
+ * Current replacement: the stateless PDF engine `POST /api/pdf/annotations`
+ * (multipart PDF in → PDF out), then persist via
+ * `storageService.saveVersion(storedDocumentId, ...)`. On-device, in-canvas
+ * markup is handled locally by `useAnnotations` + `AnnotationOverlay`.
+ *
+ * This file is retained for reference and future migration; do not wire it to
+ * screens as-is.
  */
 
 import { apiClient } from './api';

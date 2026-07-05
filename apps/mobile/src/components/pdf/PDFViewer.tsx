@@ -13,13 +13,18 @@ import {
 } from 'react-native';
 import Pdf from 'react-native-pdf';
 import { useTheme } from '../../contexts/ThemeContext';
-import { BASE_URL } from '../../services/api';
 import { Spacing, Typography } from '../../constants/spacing';
 
 const { width: screenWidth } = Dimensions.get('window');
 
 export interface PDFViewerProps {
-  documentId: string;
+  /**
+   * Local `file://` URI of the PDF to render. The owning screen resolves this
+   * via `storageService.downloadToFile()` (load → authenticated download),
+   * because there is no public stored-document download URL and
+   * react-native-pdf cannot attach the Bearer token itself.
+   */
+  sourceUri: string;
   currentPage: number;
   onPageChange: (page: number) => void;
   onLoadComplete: (numberOfPages: number, width: number, height: number) => void;
@@ -33,7 +38,7 @@ export interface PDFViewerProps {
 }
 
 export const PDFViewer: React.FC<PDFViewerProps> = ({
-  documentId,
+  sourceUri,
   currentPage,
   onPageChange,
   onLoadComplete,
@@ -52,10 +57,10 @@ export const PDFViewer: React.FC<PDFViewerProps> = ({
   const [pageCount, setPageCount] = useState(0);
   const [pdfDimensions, setPdfDimensions] = useState({ width: 0, height: 0 });
 
-  // PDF source URL
+  // PDF source — a local file URI resolved by the owning screen.
   const source = {
-    uri: `${BASE_URL}/api/v1/storage/documents/${documentId}/download`,
-    cache: true,
+    uri: sourceUri,
+    cache: false,
   };
 
   const handleLoadComplete = useCallback(

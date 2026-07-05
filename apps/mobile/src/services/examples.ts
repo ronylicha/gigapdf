@@ -1,6 +1,23 @@
 /**
  * Usage Examples for GigaPDF API Services
- * Practical examples with React Query hooks
+ * Practical examples with React Query hooks.
+ *
+ * ── Migration note (2026-07, tech-debt #20) ─────────────────────────────────
+ * These hooks are ILLUSTRATIVE and not imported by any screen. Their route
+ * status against the CURRENT backend:
+ *
+ *  ✅ Current / working:
+ *     • Auth hooks (useLogin/useRegister/useLogout/useCurrentUser)
+ *     • usePageRotate / usePageDelete — now routed through the migrated
+ *       `pagesService` (stateless PDF engine + stored-document versions).
+ *
+ *  ⚠️ Legacy scaffolding (the stateful editing API they call was REMOVED —
+ *     `pagesService.list/get/getPreview/reorder`, `documentsService.*`,
+ *     `elementsService.*`, `annotationsService.*` now throw or hit dead
+ *     routes). For real usage prefer:
+ *       • Document management → `storageService` (GED, `/api/v1/storage/*`)
+ *       • Sharing            → `sharingService` (`/api/v1/sharing/*`)
+ *       • PDF editing         → the stateless engine (`/api/pdf/*`)
  */
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';

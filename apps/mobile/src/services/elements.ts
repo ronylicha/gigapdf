@@ -1,6 +1,20 @@
 /**
  * Elements Service
- * Handles all element-related operations (text, images, signatures, shapes, etc.)
+ * Scene-graph element operations on a SESSION document.
+ *
+ * ── Migration note (2026-07, tech-debt #20) ─────────────────────────────────
+ * Elements live in the editing session (Redis scene graph). The `documentId`
+ * here must be a SESSION document id (from `storageService.loadSession`), NOT a
+ * stored-document id. This service is not imported by any screen.
+ *
+ * Current route status (FastAPI `/api/v1/documents/{id}/...`):
+ *   ✅ Live: `list`, `create` (`/pages/{n}/elements`), `get`, `update`,
+ *            `delete`, `move`, `duplicate`, batch (`/elements/batch`).
+ *   ❌ REMOVED (no current endpoint) — `deleteMultiple`, `bringToFront`,
+ *      `sendToBack`, `bringForward`, `sendBackward`, `group`, `ungroup`,
+ *      `align`, `distribute`, `flip`, `copyStyle`, `replaceImage`, `toggle`…
+ *      Z-order / grouping / alignment are client-side scene-graph concerns in
+ *      the current web editor and have no mobile REST equivalent.
  */
 
 import { apiClient, createFormData } from './api';

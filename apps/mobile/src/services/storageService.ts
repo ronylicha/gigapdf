@@ -4,7 +4,8 @@
  * Compatible with FastAPI backend /api/v1/storage/ endpoints
  */
 
-import { apiClient } from './api';
+import { apiClient, BASE_URL, tokenManager } from './api';
+import { File, Paths } from 'expo-file-system';
 
 // ============================================================================
 // Types for Storage API
@@ -46,6 +47,26 @@ export interface DocumentVersion {
   created_at: string;
   file_size_bytes: number;
   page_count: number;
+}
+
+/**
+ * An active editing session opened from a stored document via
+ * `POST /storage/documents/{id}/load`. The returned `sessionDocumentId` is a
+ * short-lived handle usable with the FastAPI Document APIs (notably
+ * `GET /documents/{id}/download`).
+ */
+export interface LoadedSession {
+  sessionDocumentId: string;
+  storedDocumentId: string;
+  name: string;
+  pageCount: number;
+}
+
+/** A stored document downloaded to a local cache file. */
+export interface DownloadedDocument {
+  /** Local `file://` URI of the downloaded PDF (usable by react-native-pdf and FormData). */
+  localUri: string;
+  session: LoadedSession;
 }
 
 export interface DocumentsListParams {
@@ -218,14 +239,97 @@ export const storageService = {
   },
 
   /**
-   * Get document download URL
+   * Open a stored document into an active editing session.
+   *
+   * Current backend: `POST /api/v1/storage/documents/{id}/load` returns a
+   * transient `document_id` (the session handle) usable with the FastAPI
+   * Document APIs. This replaces the removed direct-download endpoint.
    */
-  async getDocumentDownloadUrl(documentId: string, version?: number): Promise<string> {
-    const versionParam = version ? `?version=${version}` : '';
-    const response = await apiClient.get<{ download_url: string }>(
-      `/storage/documents/${documentId}/download${versionParam}`
+  async loadSession(storedDocumentId: string): Promise<LoadedSession> {
+    const response = await apiClient.post<{
+      document_id: string;
+      stored_document_id: string;
+      name: string;
+      page_count: number;
+    }>(`/storage/documents/${storedDocumentId}/load`);
+
+    const data = response.data!;
+    return {
+      sessionDocumentId: data.document_id,
+      storedDocumentId: data.stored_document_id ?? storedDocumentId,
+      name: data.name,
+      pageCount: data.page_count,
+    };
+  },
+
+  /**
+   * Download the latest bytes of a stored document to a local cache file.
+   *
+   * There is no public GET download URL under `/storage`; the current flow is
+   * `load` (→ session id) then `GET /api/v1/documents/{sessionId}/download`
+   * with a Bearer token. The result is a `file://` URI ready for
+   * react-native-pdf rendering, sharing, or as multipart input to the PDF
+   * engine.
+   */
+  async downloadToFile(
+    storedDocumentId: string,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<DownloadedDocument> {
+    const session = await this.loadSession(storedDocumentId);
+    const token = await tokenManager.getAccessToken();
+
+    const safeName =
+      session.name?.replace(/[^\w.-]+/g, '_').slice(0, 80) || `${storedDocumentId}.pdf`;
+    const destination = new File(
+      Paths.cache,
+      `gigapdf_${storedDocumentId}_${Date.now()}_${safeName}`
     );
-    return response.data!.download_url;
+
+    const downloaded = await File.downloadFileAsync(
+      `${BASE_URL}/api/v1/documents/${session.sessionDocumentId}/download`,
+      destination,
+      {
+        idempotent: true,
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        signal: options.signal,
+      }
+    );
+
+    return { localUri: downloaded.uri, session };
+  },
+
+  /**
+   * Persist a modified PDF (a local `file://` URI) as a new version of a
+   * stored document via `POST /api/v1/storage/documents/{id}/versions`.
+   */
+  async saveVersion(
+    storedDocumentId: string,
+    fileUri: string,
+    comment?: string
+  ): Promise<DocumentVersion> {
+    const form = new FormData();
+    const name = fileUri.split('/').pop() || 'document.pdf';
+    form.append('file', { uri: fileUri, name, type: 'application/pdf' } as unknown as Blob);
+    if (comment) form.append('comment', comment);
+
+    const response = await apiClient.uploadFile<DocumentVersion>(
+      `/storage/documents/${storedDocumentId}/versions`,
+      form
+    );
+    return response.data!;
+  },
+
+  /**
+   * Resolve the transient session download URL for a stored document.
+   *
+   * @deprecated There is no stable public download URL. Prefer
+   * {@link downloadToFile} which handles the load→download flow and auth.
+   * This helper returns the session URL from a fresh `load`; fetching it still
+   * requires an `Authorization: Bearer` header and the session is short-lived.
+   */
+  async getDocumentDownloadUrl(storedDocumentId: string): Promise<string> {
+    const session = await this.loadSession(storedDocumentId);
+    return `${BASE_URL}/api/v1/documents/${session.sessionDocumentId}/download`;
   },
 
   // ==========================================================================

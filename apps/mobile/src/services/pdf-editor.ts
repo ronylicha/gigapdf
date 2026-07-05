@@ -1,8 +1,25 @@
 /**
  * PDF Editor Service for GigaPDF
- * Handles all PDF editing operations via the GigaPDF API
+ * Comprehensive editing facade (legacy scaffolding).
  *
- * API Base: https://giga-pdf.com/api/v1
+ * ── Migration note (2026-07, tech-debt #20) ─────────────────────────────────
+ * This service was written against the pre-refactor stateful editing API and
+ * targets many REMOVED routes. It is NOT imported by any screen.
+ *
+ * Route status:
+ *   ❌ REMOVED — `/documents/{id}/history/*` (undo/redo/goto), `/forms/*`,
+ *      standalone `/documents/{id}/layers/*`, `/text/search|replace|extract`,
+ *      `/pages/*`, `/annotations/*`.
+ *   ➡️ Current replacements:
+ *      • Page ops              → `pagesService` (engine `/api/pdf/pages` + versions)
+ *      • Text / annotations / forms / shapes / images → stateless engine
+ *        (`/api/pdf/text|annotations|forms|shape|image`) then `saveVersion`
+ *      • Document layers       → `/api/v1/storage/documents/{id}/layers` (GET/PUT)
+ *      • Element CRUD          → `elementsService` (session document)
+ *      • Undo/redo/history     → client-side editor state (no server history API)
+ *
+ * Retained for reference and incremental migration; do not wire to screens
+ * as-is.
  */
 
 import apiClient from './api';

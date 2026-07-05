@@ -10,10 +10,16 @@ export { isApiException, getErrorMessage, getValidationErrors, createFormData } 
 // Authentication
 export { default as authService, socialAuthService, twoFactorAuthService } from './auth';
 
-// Documents
+// Storage (GED) — current FastAPI /api/v1/storage/* surface (used by screens)
+export { storageService } from './storageService';
+
+// Sharing — current FastAPI /api/v1/sharing/* surface (used by screens)
+export { sharingService } from './sharingService';
+
+// Documents (legacy session-document service — mostly superseded by storageService)
 export { default as documentsService } from './documents';
 
-// Pages
+// Pages — migrated to the stateless PDF engine + stored-document versions
 export { default as pagesService } from './pages';
 
 // Elements
