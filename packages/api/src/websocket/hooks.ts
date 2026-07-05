@@ -321,6 +321,45 @@ export const useElementUpdates = (
 };
 
 /**
+ * Hook to listen for per-element soft-lock events.
+ *
+ * The server broadcasts `element:locked` / `element:unlocked` only to the OTHER
+ * members of the room (skip_sid=emitter), so a client never receives the echo
+ * of its own lock — the stored locks are, by construction, held by others. The
+ * broadcasts are room-scoped server-side; when they carry a `document_id` we
+ * still honour it as defence in depth (mismatched ids are dropped).
+ */
+export const useElementLocks = (
+  documentId: string | null,
+  onLocked?: (data: SocketEventData['element:locked']) => void,
+  onUnlocked?: (data: SocketEventData['element:unlocked']) => void
+) => {
+  useSocketEvent(
+    'element:locked',
+    useCallback(
+      (data) => {
+        if (data.document_id && data.document_id !== documentId) return;
+        onLocked?.(data);
+      },
+      [documentId, onLocked]
+    ),
+    !!documentId
+  );
+
+  useSocketEvent(
+    'element:unlocked',
+    useCallback(
+      (data) => {
+        if (data.document_id && data.document_id !== documentId) return;
+        onUnlocked?.(data);
+      },
+      [documentId, onUnlocked]
+    ),
+    !!documentId
+  );
+};
+
+/**
  * Hook to listen for job status updates
  */
 export const useJobStatus = (

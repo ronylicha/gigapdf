@@ -5,15 +5,7 @@ export default defineConfig({
     globals: true,
     environment: 'jsdom',
     include: ['src/**/__tests__/**/*.test.ts', 'src/**/__tests__/**/*.test.tsx'],
-    // TODO(tech-debt): use-embedded-fonts.test.tsx OOMs on CI even with
-    // 4GB heap (pre-existing — fails on main too). Skipped here, tracked
-    // for follow-up cleanup PR. Likely a memory leak in the FontFace
-    // mock or the hook's effect cleanup.
-    exclude: [
-      '**/node_modules/**',
-      '**/dist/**',
-      'src/hooks/__tests__/use-embedded-fonts.test.tsx',
-    ],
+    exclude: ['**/node_modules/**', '**/dist/**'],
     setupFiles: ['src/__tests__/vitest-setup.ts'],
     pool: 'forks',
     isolate: false,

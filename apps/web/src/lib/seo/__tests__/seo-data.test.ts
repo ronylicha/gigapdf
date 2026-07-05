@@ -93,6 +93,30 @@ describe("tools-data", () => {
 
     expect(duplicates).toEqual([]);
   });
+
+  it("expose des appHref internes valides vers les outils de l'app", () => {
+    const bySlug = new Map(TOOLS.map((tool) => [tool.slug, tool]));
+
+    // Un outil fonctionnel connu pointe vers sa route d'app réelle : la page
+    // outil (hero + CtaSection) propose alors un CTA direct vers l'outil.
+    expect(bySlug.get("fusionner-pdf")?.appHref).toBe("/merge");
+
+    // Tout appHref défini est un chemin d'app ABSOLU et NON préfixé par la
+    // locale : les routes (app)/* ne sont pas localisées et sont consommées via
+    // un NextLink brut (jamais via le Link i18n qui ajouterait /en). Une valeur
+    // relative ou localisée produirait un CTA 404.
+    for (const tool of TOOLS) {
+      if (tool.appHref === undefined) continue;
+      expect(
+        tool.appHref.startsWith("/"),
+        `appHref non absolu: ${tool.slug}`,
+      ).toBe(true);
+      expect(
+        tool.appHref.startsWith("/en/"),
+        `appHref préfixé par la locale: ${tool.slug}`,
+      ).toBe(false);
+    }
+  });
 });
 
 describe("solutions-data", () => {

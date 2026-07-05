@@ -81,7 +81,11 @@ import { useDocument } from "@/hooks/use-document";
 import { useDocumentSave } from "@/hooks/use-document-save";
 import { useCollaboration } from "@/hooks/use-collaboration";
 import { usePageThumbnails } from "@/hooks/use-page-thumbnails";
-import { useEmbeddedFonts, buildDocumentFontOptions } from "@giga-pdf/editor";
+import {
+  useEmbeddedFonts,
+  buildDocumentFontOptions,
+  useCollaborationStore,
+} from "@giga-pdf/editor";
 import { getAuthToken } from "@/lib/api";
 import { api, type ElementCreateRequest } from "@/lib/api";
 import {
@@ -629,6 +633,7 @@ export default function EditorPage() {
     error,
     documentId,
     goToPage,
+    reload,
     isDirty,
     setDirty,
     addPage: addPageLocal,
@@ -1269,7 +1274,131 @@ export default function EditorPage() {
     }
   }, [handleConfirmRename, handleCancelRename]);
 
-  // Collaboration temps réel (présence, curseurs, émissions update/delete).
+  // ====== Collaboration temps réel — propagation binaire + verrous ==========
+
+  // --- Reconstruction binaire d'un pair (reload) ---------------------------
+  // Un collaborateur a persisté une NOUVELLE version S3 (createDocumentVersion :
+  // texte baké, ops de page, apply-elements, fill&sign, restore). On doit
+  // recharger le binaire pour la voir. GARDE anti-destructive : si une édition
+  // locale est en cours (dirty / save en vol / opérations en attente), on
+  // n'écrase JAMAIS la saisie — on affiche une bannière non-bloquante et
+  // l'utilisateur recharge quand il veut ; sinon on recharge (debouncé pour
+  // coalescer les rafales). `reload()` (useDocument) rejoue le pipeline de load
+  // complet : nouvelle session S3 → parse → refetch binaire → merge Redis
+  // (une session fraîche est OBLIGATOIRE — la session courante pointe l'ancienne
+  // version). L'émetteur ne se recharge jamais lui-même (filtre client_id).
+  const [remoteBinaryUpdatePending, setRemoteBinaryUpdatePending] =
+    useState(false);
+  const remoteReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const isActivelyEditing = isDirty || saving || pendingChanges > 0;
+  const isActivelyEditingRef = useRef(isActivelyEditing);
+  isActivelyEditingRef.current = isActivelyEditing;
+
+  const performRemoteReload = useCallback(() => {
+    if (remoteReloadTimerRef.current) {
+      clearTimeout(remoteReloadTimerRef.current);
+      remoteReloadTimerRef.current = null;
+    }
+    setRemoteBinaryUpdatePending(false);
+    void reload();
+  }, [reload]);
+
+  const handleDocumentBinaryUpdate = useCallback(() => {
+    // Édition en cours → ne pas écraser : bannière + reload à la demande.
+    if (isActivelyEditingRef.current) {
+      setRemoteBinaryUpdatePending(true);
+      return;
+    }
+    if (remoteReloadTimerRef.current) {
+      clearTimeout(remoteReloadTimerRef.current);
+    }
+    remoteReloadTimerRef.current = setTimeout(() => {
+      remoteReloadTimerRef.current = null;
+      // Re-vérifier au tir : l'utilisateur a pu commencer à éditer pendant
+      // le debounce.
+      if (isActivelyEditingRef.current) {
+        setRemoteBinaryUpdatePending(true);
+        return;
+      }
+      void reload();
+    }, 800);
+  }, [reload]);
+
+  useEffect(() => {
+    return () => {
+      if (remoteReloadTimerRef.current) {
+        clearTimeout(remoteReloadTimerRef.current);
+      }
+    };
+  }, []);
+
+  // --- Verrous per-élément (soft-lock coopératif) --------------------------
+  // Bridge socket → store d'édition : un verrou d'un AUTRE utilisateur peuple
+  // `useCollaborationStore` (lu par le canvas pour griser l'objet). Le serveur
+  // n'émet jamais l'écho de nos propres verrous (skip_sid) : tout verrou reçu
+  // est détenu par un tiers. TTL client de secours : le serveur expire les
+  // verrous après ~5 min SANS diffuser d'unlock, et un pair qui crashe sans
+  // `disconnect` ne l'émet jamais → auto-unlock local depuis `expires_at`.
+  const collabLockElement = useCollaborationStore((s) => s.lockElement);
+  const collabUnlockElement = useCollaborationStore((s) => s.unlockElement);
+  const lockExpiryTimersRef = useRef<
+    Map<string, ReturnType<typeof setTimeout>>
+  >(new Map());
+
+  const clearLockTimer = useCallback((elementId: string) => {
+    const timers = lockExpiryTimersRef.current;
+    const timer = timers.get(elementId);
+    if (timer) {
+      clearTimeout(timer);
+      timers.delete(elementId);
+    }
+  }, []);
+
+  const handleElementLocked = useCallback(
+    (data: SocketEventData["element:locked"]) => {
+      const elementId = data.element_id;
+      if (!elementId) return;
+      collabLockElement(
+        elementId,
+        data.locked_by_user_id,
+        data.locked_by_user_name ?? "",
+      );
+      clearLockTimer(elementId);
+      const ttlMs = data.expires_at
+        ? new Date(data.expires_at).getTime() - Date.now()
+        : 5 * 60 * 1000;
+      const timer = setTimeout(
+        () => {
+          lockExpiryTimersRef.current.delete(elementId);
+          collabUnlockElement(elementId);
+        },
+        Math.max(1000, ttlMs),
+      );
+      lockExpiryTimersRef.current.set(elementId, timer);
+    },
+    [collabLockElement, collabUnlockElement, clearLockTimer],
+  );
+
+  const handleElementUnlocked = useCallback(
+    (data: SocketEventData["element:unlocked"]) => {
+      const elementId = data.element_id;
+      if (!elementId) return;
+      clearLockTimer(elementId);
+      collabUnlockElement(elementId);
+    },
+    [collabUnlockElement, clearLockTimer],
+  );
+
+  useEffect(() => {
+    const timers = lockExpiryTimersRef.current;
+    return () => {
+      timers.forEach((timer) => clearTimeout(timer));
+      timers.clear();
+    };
+  }, []);
+
   // Room = storedDocumentId (le [id] de la route, commun à tous les
   // collaborateurs) — JAMAIS le documentId de session (id Redis recréé PAR
   // UTILISATEUR à chaque /load : deux utilisateurs n'atterriraient jamais
@@ -1282,12 +1411,61 @@ export default function EditorPage() {
     sendCursorPosition,
     collaboratorCount,
     isConnected,
+    emitBinaryUpdate,
     emitElementUpdate,
     emitElementDelete,
+    emitElementLock,
+    emitElementUnlock,
   } = useCollaboration({
     documentId: storedDocumentId ?? null,
     enabled: !!storedDocumentId,
+    onDocumentBinaryUpdate: handleDocumentBinaryUpdate,
+    onElementLocked: handleElementLocked,
+    onElementUnlocked: handleElementUnlocked,
   });
+
+  // Émettre une notification de reconstruction binaire APRÈS chaque save réussi
+  // (createDocumentVersion → nouvelle version S3). `lastSaved` change de
+  // référence à chaque save. La version = timestamp du save (token monotone
+  // pour le debounce côté pair). L'émetteur ne se recharge jamais lui-même.
+  useEffect(() => {
+    if (!lastSaved || !storedDocumentId) return;
+    emitBinaryUpdate(lastSaved.getTime());
+  }, [lastSaved, storedDocumentId, emitBinaryUpdate]);
+
+  // Verrouiller les éléments sélectionnés (diff sélection précédente/courante :
+  // lock des nouveaux, unlock des retirés). Réutilise le flux de sélection
+  // existant (canvas → onSelectionChanged → selectElements → selectedElementIds).
+  const lockedByMeRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!storedDocumentId) return;
+    const next = new Set(selectedElementIds);
+    const prev = lockedByMeRef.current;
+    for (const id of next) {
+      if (!prev.has(id)) emitElementLock(id);
+    }
+    for (const id of prev) {
+      if (!next.has(id)) emitElementUnlock(id);
+    }
+    lockedByMeRef.current = next;
+  }, [selectedElementIds, storedDocumentId, emitElementLock, emitElementUnlock]);
+
+  // Libérer tous mes verrous au démontage (best-effort — le disconnect/leave
+  // serveur les libère aussi, c'est le mécanisme primaire). Ref pour ne libérer
+  // qu'au VRAI démontage ; garde `isConnected` pour ne pas relancer une
+  // connexion socket au teardown (emit auto-connecte sinon).
+  const emitElementUnlockRef = useRef(emitElementUnlock);
+  emitElementUnlockRef.current = emitElementUnlock;
+  useEffect(() => {
+    const locked = lockedByMeRef;
+    const unlock = emitElementUnlockRef;
+    return () => {
+      if (socketClient.isConnected()) {
+        for (const id of locked.current) unlock.current(id);
+      }
+      locked.current = new Set();
+    };
+  }, []);
 
   // --- Application des événements de collaboration distants ---
   // Abonnement direct via useElementUpdates (et non via les callbacks de
@@ -5157,6 +5335,21 @@ export default function EditorPage() {
         className="hidden"
         onChange={handleImageFileChange}
       />
+
+      {/* Bannière collaboration : un pair a reconstruit le binaire PDF (nouvelle
+          version) pendant une édition locale — reload à la demande, non
+          destructif (la garde évite d'écraser la saisie). */}
+      {remoteBinaryUpdatePending ? (
+        <div
+          role="status"
+          className="fixed left-1/2 top-3 z-50 flex -translate-x-1/2 items-center gap-3 rounded-md border border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900 shadow-md dark:border-amber-700 dark:bg-amber-950 dark:text-amber-100"
+        >
+          <span>{t("collab.documentUpdated")}</span>
+          <Button size="sm" variant="outline" onClick={performRemoteReload}>
+            {t("collab.reload")}
+          </Button>
+        </div>
+      ) : null}
 
       {/* Header */}
       <header className="flex items-center justify-between gap-2 border-b px-2 py-2 md:px-4">

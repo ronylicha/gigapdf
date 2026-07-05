@@ -19,7 +19,10 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { api, getAuthToken, StoredDocument } from "@/lib/api";
-import { extractDocumentBlocks } from "@/components/editor/lib/extract-text";
+import {
+  extractDocumentBlocks,
+  extractDocumentText,
+} from "@/components/editor/lib/extract-text";
 import { clientLogger } from "@/lib/client-logger";
 import { ImportDialog } from "@/components/dashboard/import-dialog";
 import {
@@ -208,69 +211,36 @@ async function renderPdfThumbnail(
 }
 
 /**
- * Extract the plain text of a PDF via POST /api/pdf/parse (extractText only,
- * everything else disabled). NOTE: /api/pdf/text is an element add/update
- * route, NOT an extractor — parse is the actual extraction contract. The
- * text content of every parsed text element is concatenated per page.
- * Best-effort: returns null on any failure and never throws.
+ * Extract the plain text of a PDF entirely in the browser through the shared
+ * GigaPDF WASM engine (`extractDocumentText` → `doc.toText()`) — the SAME single
+ * engine instance already used below for the positioned-block index.
+ *
+ * This replaces the previous network round-trip to POST /api/pdf/parse, which
+ * re-uploaded the WHOLE file just to read its text. The client already holds the
+ * bytes, so extraction is now local: no request, no second full-file upload, and
+ * — crucially — it no longer sits a network hop AHEAD of the save on the import's
+ * critical path (parse → save → thumbnail became local extract → save →
+ * thumbnail, one fewer round-trip). The engine and its text semantics
+ * (`toText()`) match the server route, so the stored `extracted_text` (full-text
+ * search material) is unchanged.
+ *
+ * Best-effort: returns null on any failure and for scanned/text-less PDFs, never
+ * throws — a missing text layer must not fail an import. `parentSignal`
+ * short-circuits an already-cancelled batch before the (local, non-abortable)
+ * extraction starts.
  */
 async function extractPdfText(
   pdfFile: File,
   parentSignal?: AbortSignal,
 ): Promise<string | null> {
-  // Time-boxed: a hung parse request must never freeze the import pipeline.
-  const { signal, dispose } = withTimeoutSignal(parentSignal, ENRICHMENT_TIMEOUT_MS);
+  if (parentSignal?.aborted) return null;
   try {
-    const fd = new FormData();
-    fd.append("file", pdfFile);
-    fd.append("extractText", "true");
-    fd.append("extractImages", "false");
-    fd.append("extractDrawings", "false");
-    fd.append("extractAnnotations", "false");
-    fd.append("extractFormFields", "false");
-    fd.append("extractBookmarks", "false");
-
-    const res = await fetch("/api/pdf/parse", {
-      method: "POST",
-      credentials: "include",
-      body: fd,
-      signal,
-    });
-    if (!res.ok) {
-      clientLogger.warn("documents.text-extract-failed", res.status);
-      return null;
-    }
-
-    const json = (await res.json()) as {
-      success?: boolean;
-      data?: {
-        pages?: Array<{
-          elements?: Array<{ type?: string; content?: string }>;
-        }>;
-      };
-    };
-    if (!json.success || !json.data?.pages) return null;
-
-    const text = json.data.pages
-      .map((page) =>
-        (page.elements ?? [])
-          .filter(
-            (element) =>
-              element.type === "text" && typeof element.content === "string",
-          )
-          .map((element) => element.content)
-          .join(" "),
-      )
-      .filter((pageText) => pageText.length > 0)
-      .join("\n\n")
-      .trim();
-
-    return text ? text.slice(0, EXTRACTED_TEXT_MAX_CHARS) : null;
+    const text = await extractDocumentText(await pdfFile.arrayBuffer());
+    const trimmed = text.trim();
+    return trimmed ? trimmed.slice(0, EXTRACTED_TEXT_MAX_CHARS) : null;
   } catch (err) {
     clientLogger.warn("documents.text-extract-failed", err);
     return null;
-  } finally {
-    dispose();
   }
 }
 
@@ -714,17 +684,19 @@ export default function DocumentsPage() {
       const pdf = isPdfFile(fileToStore);
 
       try {
-        // PDF-only enrichment, kicked off in parallel with the upload. Both
-        // helpers are best-effort (resolve to null, never reject) AND
-        // time-boxed (ENRICHMENT_TIMEOUT_MS), so they can neither fail nor
-        // hang the import; non-PDFs skip them entirely. For Office files
-        // these run on the freshly converted PDF (`fileToStore`).
+        // PDF-only enrichment; both best-effort (resolve to null, never reject),
+        // so neither can fail the import. Non-PDFs skip them; for Office files
+        // they run on the freshly converted PDF (`fileToStore`).
+        //
+        // The thumbnail is a time-boxed NETWORK render (ENRICHMENT_TIMEOUT_MS),
+        // kicked off FIRST so it streams in the background alongside everything
+        // below. The text extraction now runs LOCALLY in the shared WASM engine
+        // (no /api/pdf/parse round-trip, no second full-file upload): it is
+        // awaited only to feed the save's `extracted_text` (full-text search)
+        // and to pick the index path, and — being local — no longer adds a
+        // network hop ahead of the save.
         const thumbnailPromise = pdf ? renderPdfThumbnail(fileToStore, signal) : null;
-        const extractedTextPromise = pdf ? extractPdfText(fileToStore, signal) : null;
-
-        const extractedText = extractedTextPromise
-          ? await extractedTextPromise
-          : null;
+        const extractedText = pdf ? await extractPdfText(fileToStore, signal) : null;
 
         // Store the document: the original bytes for already-PDF / unconverted
         // formats, or the freshly converted PDF for Office/RTF, Markdown/CSV and

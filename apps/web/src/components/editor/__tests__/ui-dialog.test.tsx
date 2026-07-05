@@ -14,13 +14,19 @@
  * - consumer `className` still merges (twMerge) so width overrides like
  *   `sm:max-w-5xl` replace the default cap without losing the base margin.
  */
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, beforeAll } from "vitest";
 import { render, screen, cleanup } from "@testing-library/react";
 import {
   Dialog,
   DialogContent,
   DialogTitle,
 } from "../../../../../../packages/ui/src/components/ui/dialog";
+import {
+  CommandDialog,
+  CommandEmpty,
+  CommandInput,
+  CommandList,
+} from "../../../../../../packages/ui/src/components/ui/command";
 
 afterEach(cleanup);
 
@@ -76,5 +82,52 @@ describe("DialogContent (shared @giga-pdf/ui dialog)", () => {
     expect(cls).not.toContain("overflow-y-auto");
     expect(cls).toContain("p-0");
     expect(cls).not.toContain("p-6");
+  });
+});
+
+describe("CommandDialog (a11y — Radix DialogTitle requirement)", () => {
+  // cmdk relies on browser APIs jsdom doesn't implement (active-item
+  // scrollIntoView + a ResizeObserver). Stub the missing ones so the command
+  // palette renders in the test environment.
+  beforeAll(() => {
+    if (!Element.prototype.scrollIntoView) {
+      Element.prototype.scrollIntoView = () => {};
+    }
+    if (typeof globalThis.ResizeObserver === "undefined") {
+      globalThis.ResizeObserver = class {
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      } as unknown as typeof ResizeObserver;
+    }
+  });
+
+  function renderCommand(props?: { title?: string; description?: string }) {
+    render(
+      <CommandDialog open {...(props ?? {})}>
+        <CommandInput placeholder="Search" />
+        <CommandList>
+          <CommandEmpty>No results</CommandEmpty>
+        </CommandList>
+      </CommandDialog>,
+    );
+  }
+
+  it("renders a visually-hidden but accessible default DialogTitle", () => {
+    renderCommand();
+    const title = screen.getByText("Command Menu");
+    // Present in the DOM for screen readers, hidden from sighted users.
+    expect(title.className).toContain("sr-only");
+    // Radix names the dialog via aria-labelledby → the title's id.
+    expect(screen.getByRole("dialog").getAttribute("aria-labelledby")).toBe(
+      title.id,
+    );
+  });
+
+  it("uses a caller-provided title/description, still visually hidden", () => {
+    renderCommand({ title: "Command palette", description: "Search tools" });
+    expect(screen.getByText("Command palette").className).toContain("sr-only");
+    expect(screen.getByText("Search tools").className).toContain("sr-only");
+    expect(screen.queryByText("Command Menu")).toBeNull();
   });
 });

@@ -1630,6 +1630,10 @@
     "pendingChanges": "pending changes",
     "pageIndicator": "Page {current} of {total}",
     "collaborators": "{count, plural, =0 {No collaborators} one {1 collaborator} other {{count} collaborators}}",
+    "collab": {
+      "documentUpdated": "The document was updated by a collaborator.",
+      "reload": "Reload"
+    },
     "connection": {
       "connected": "Connected",
       "disconnected": "Disconnected"

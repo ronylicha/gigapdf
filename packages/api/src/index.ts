@@ -251,6 +251,7 @@ export {
   useDocumentUpdates,
   usePageUpdates,
   useElementUpdates,
+  useElementLocks,
   useJobStatus,
 } from './websocket';
 export type { SocketEvent, SocketEventData, AuthTokenProvider } from './websocket';

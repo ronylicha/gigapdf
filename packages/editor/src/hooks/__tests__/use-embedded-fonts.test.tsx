@@ -18,7 +18,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { renderHook, act, waitFor } from '@testing-library/react';
+import { renderHook, act, waitFor, cleanup } from '@testing-library/react';
 import { useEmbeddedFonts } from '../use-embedded-fonts';
 import { FontCache } from '../../utils/font-cache';
 import { fontFaceSet } from '../../__tests__/vitest-setup';
@@ -172,6 +172,16 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Leak-proof teardown. The editor suite runs with vitest `isolate: false`,
+  // so the module registry AND the jsdom `document` (hence `document.fonts`)
+  // are SHARED across every test file. Any React root or registered FontFace
+  // left mounted here would otherwise accumulate for the whole run. RTL
+  // auto-cleanup already unmounts roots; calling cleanup() explicitly is
+  // idempotent and keeps teardown robust regardless of auto-cleanup wiring.
+  // Clearing the FontFace set drops every FontFace this file registered so the
+  // next file starts from an empty document.fonts.
+  cleanup();
+  fontFaceSet._fonts.clear();
   vi.unstubAllEnvs();
   vi.clearAllMocks();
 });

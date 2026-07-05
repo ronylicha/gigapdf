@@ -15,6 +15,18 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.26.0",
+    date: "2026-07-05",
+    type: "minor",
+    changes: [
+      { type: "feature", description: "Real-time collaboration is now complete: when a collaborator saves a change that rebuilds the PDF (text edit, page operation, fill & sign, restore), the others reload the new version automatically — or, if they are mid-edit, see a non-destructive \"document updated — reload\" banner instead of losing work." },
+      { type: "feature", description: "Per-element locks: when someone selects an element, everyone else sees it greyed out with a name badge and cannot edit it until they deselect. Locks release on deselect, disconnect or a short timeout, and are replayed to anyone who joins mid-session." },
+      { type: "improvement", description: "Faster uploads: importing a PDF no longer re-uploads the whole file to the server just to read its text — extraction now happens locally in the browser engine, removing a full-file network round-trip from the upload's critical path." },
+      { type: "improvement", description: "Conversion fidelity (engine 0.118.0): closes the seven items deferred from the previous release — numbered lists survive the tagged PDF path, spreadsheet frozen panes / cell rotation and right-to-left cells round-trip, ODT first-page/even-odd headers, table-cell diagonals paint in the PDF, charts fall back to their data table, and slides render at their true positions in model→PDF." },
+      { type: "improvement", description: "Housekeeping: removed seven deprecated unused API routers, cleaned the in-memory PDF engine, fixed accessibility warnings (table headers, command palette), linked marketing tool pages to their real tools, and reintegrated two long-excluded tests into CI." },
+    ],
+  },
+  {
     version: "1.25.0",
     date: "2026-07-04",
     type: "minor",

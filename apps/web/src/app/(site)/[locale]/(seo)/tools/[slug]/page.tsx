@@ -324,7 +324,11 @@ export default async function ToolPage({ params }: ToolPageProps) {
         )}
       </section>
 
-      <CtaSection title={strings.cta(tool.name)} locale={locale} />
+      <CtaSection
+        title={strings.cta(tool.name)}
+        locale={locale}
+        appHref={tool.appHref}
+      />
     </div>
   );
 }

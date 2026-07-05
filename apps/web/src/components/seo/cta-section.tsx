@@ -5,6 +5,7 @@
  * automatique selon la locale courante).
  */
 
+import NextLink from "next/link";
 import { ArrowRight } from "lucide-react";
 import { GithubIcon as Github } from "@/components/icons/github-icon";
 import { Button } from "@giga-pdf/ui";
@@ -50,9 +51,17 @@ interface CtaSectionProps {
   /** Phrase d'accroche contextuelle au-dessus des boutons. */
   title: string;
   locale: SeoLocale;
+  /**
+   * Lien interne optionnel vers l'outil fonctionnel de l'app (ex: "/merge").
+   * Présent → le bouton « Ouvrir l'éditeur » pointe directement vers l'outil
+   * (route d'app NON préfixée par la locale, via NextLink brut — comme le CTA
+   * d'en-tête de la page outil). Absent → repli sur l'inscription (comportement
+   * historique).
+   */
+  appHref?: string;
 }
 
-export function CtaSection({ title, locale }: CtaSectionProps) {
+export function CtaSection({ title, locale, appHref }: CtaSectionProps) {
   const copy = COPY[locale];
 
   return (
@@ -70,7 +79,11 @@ export function CtaSection({ title, locale }: CtaSectionProps) {
             </Link>
           </Button>
           <Button asChild variant="outline" size="lg">
-            <Link href="/register">{copy.openEditor}</Link>
+            {appHref ? (
+              <NextLink href={appHref}>{copy.openEditor}</NextLink>
+            ) : (
+              <Link href="/register">{copy.openEditor}</Link>
+            )}
           </Button>
         </div>
       </div>

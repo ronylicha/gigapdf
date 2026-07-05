@@ -79,6 +79,9 @@ def _make_fake_manager(active_users: list | None = None) -> MagicMock:
     manager.remove_session = AsyncMock(return_value=_make_collab_session())
     manager.get_active_users = AsyncMock(return_value=active_users or [])
     manager.get_document_locks = AsyncMock(return_value=[])
+    # disconnect/leave capture the socket's held locks before removal to
+    # broadcast element:unlocked to the room (v1.26 soft-locks).
+    manager.get_locked_element_ids = AsyncMock(return_value=[])
     manager.update_cursor = AsyncMock()
     return manager
 

@@ -10,22 +10,15 @@ from app.api.v1 import (
     activity,
     api_keys,
     billing,
-    bookmarks,
     documents,
     elements,
     embed,
-    forms,
-    history,
     jobs,
-    layers,
     logs,
-    modify,
-    pages,
     plans,
     public_billing,
     quota,
     search,
-    security,
     sharing,
     storage,
     tenant_documents,
@@ -42,51 +35,9 @@ api_router.include_router(
 )
 
 api_router.include_router(
-    pages.router,
-    prefix="/documents/{document_id}/pages",
-    tags=["Pages"],
-)
-
-api_router.include_router(
     elements.router,
     prefix="/documents/{document_id}",
     tags=["Elements"],
-)
-
-api_router.include_router(
-    history.router,
-    prefix="/documents/{document_id}/history",
-    tags=["History"],
-)
-
-api_router.include_router(
-    forms.router,
-    prefix="/documents",
-    tags=["Forms"],
-)
-
-api_router.include_router(
-    layers.router,
-    prefix="/documents",
-    tags=["Layers"],
-)
-
-api_router.include_router(
-    bookmarks.router,
-    prefix="/documents",
-    tags=["Bookmarks"],
-)
-
-api_router.include_router(
-    security.router,
-    prefix="/documents",
-    tags=["Security"],
-)
-
-api_router.include_router(
-    modify.router,
-    prefix="/documents",
-    tags=["PDF Modification"],
 )
 
 api_router.include_router(

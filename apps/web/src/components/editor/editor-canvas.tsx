@@ -16,6 +16,11 @@ import type {
 } from "@giga-pdf/types";
 import type { Canvas as FabricCanvas, FabricObject } from "fabric";
 import { clientLogger } from "@/lib/client-logger";
+// Collaboration soft-locks: the store is populated by page.tsx from socket
+// events (element:locked / element:unlocked of OTHER users). This canvas mirrors
+// the lock set onto its Fabric objects (grey + non-interactive + a name badge)
+// so a user cannot edit an element another collaborator is editing.
+import { useCollaborationStore } from "@giga-pdf/editor";
 // Shared PDF-background builder — the same index-0 FabricImage construction the
 // continuous-view PageCanvasHost uses, so the logic lives in one place.
 import { addPdfBackground, backgroundRenderScale } from "./lib/pdf-background";
@@ -608,6 +613,22 @@ interface FabricObjectWithData extends FabricObject {
   data?: { elementId?: string; [key: string]: unknown };
 }
 
+// Deterministic per-user colour for a collaboration lock badge. ElementLockInfo
+// carries no colour, so we derive a stable one from the locker's user id (same
+// palette family as the presence/cursor colours).
+const COLLAB_LOCK_COLORS = [
+  "#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6", "#EC4899",
+  "#06B6D4", "#F97316", "#14B8A6", "#6366F1", "#84CC16", "#F43F5E",
+] as const;
+
+function collabLockColor(userId: string): string {
+  let hash = 0;
+  for (let i = 0; i < userId.length; i += 1) {
+    hash = (hash * 31 + userId.charCodeAt(i)) >>> 0;
+  }
+  return COLLAB_LOCK_COLORS[hash % COLLAB_LOCK_COLORS.length]!;
+}
+
 /**
  * Lower a single canvas/scene point (origin top-left, Y-down — PDF points at
  * scale 1, the `page.dimensions` space) to PDF user space (origin bottom-left,
@@ -893,6 +914,175 @@ export function EditorCanvas({
       isUpdatingHistoryRef.current = false;
     }
   }, []);
+
+  // --- Collaboration soft-locks: mirror the lock set onto Fabric objects -----
+  // `elementLocks` holds the locks held by OTHER users (page.tsx bridges the
+  // socket events into the store). We mirror them onto the CURRENT page's
+  // objects: a locked object becomes non-interactive + greyed, with a coloured
+  // overlay and a name badge. Idempotent — a `__collabLocked` marker plus a
+  // saved restore snapshot let us apply once and restore exactly on unlock.
+  // Runs inside begin/endProgrammaticApply so the badge/overlay adds never emit
+  // element events (handleObjectAdded is gated on isUpdatingHistoryRef).
+  const elementLocks = useCollaborationStore((s) => s.elementLocks);
+  const elementLocksRef = useRef(elementLocks);
+  elementLocksRef.current = elementLocks;
+
+  const applyCollabLocks = useCallback(() => {
+    const canvas = fabricRef.current;
+    if (!canvas) return;
+    const locks = elementLocksRef.current;
+    const fabricModule = fabricModuleRef.current;
+
+    beginProgrammaticApply();
+    try {
+      // 1) Drop badges/overlays whose element is no longer locked.
+      const badges = canvas
+        .getObjects()
+        .filter(
+          (o) =>
+            typeof (o as FabricObjectWithData).data?.__collabLockBadgeFor ===
+            "string",
+        );
+      for (const badge of badges) {
+        const forId = (badge as FabricObjectWithData).data
+          ?.__collabLockBadgeFor as string;
+        if (!locks.has(forId)) canvas.remove(badge);
+      }
+
+      // 2) Reconcile each real element object (snapshot: we add objects below).
+      const objects = [...canvas.getObjects()];
+      for (const obj of objects) {
+        const data = (obj as FabricObjectWithData).data;
+        const elementId = data?.elementId;
+        if (!elementId) continue;
+        if (
+          data?.__collabLockBadgeFor ||
+          data?.isPdfBackground ||
+          data?.isHideMask ||
+          data?.redactionMark
+        ) {
+          continue;
+        }
+
+        const lock = locks.get(elementId);
+        const marked = data?.__collabLocked === true;
+        const fo = obj as FabricObject;
+
+        if (lock && !marked) {
+          (obj as FabricObjectWithData).data = {
+            ...data,
+            __collabLocked: true,
+            __collabLockRestore: {
+              selectable: fo.selectable,
+              evented: fo.evented,
+              hasControls: fo.hasControls,
+              hasBorders: fo.hasBorders,
+              opacity: fo.opacity,
+            },
+          };
+          // Can't keep editing an object a peer just locked.
+          const isSelected = canvas
+            .getActiveObjects()
+            .some(
+              (a) => (a as FabricObjectWithData).data?.elementId === elementId,
+            );
+          if (isSelected) canvas.discardActiveObject();
+          fo.set({
+            selectable: false,
+            evented: false,
+            hasControls: false,
+            hasBorders: false,
+            opacity: (fo.opacity ?? 1) * 0.5,
+          });
+
+          // Colour overlay + name badge (best-effort — needs the fabric module).
+          if (fabricModule) {
+            try {
+              const bb = fo.getBoundingRect();
+              const color = collabLockColor(lock.lockedBy);
+              const overlay = new fabricModule.Rect({
+                left: bb.left,
+                top: bb.top,
+                width: bb.width,
+                height: bb.height,
+                originX: "left",
+                originY: "top",
+                fill: color,
+                opacity: 0.12,
+                selectable: false,
+                evented: false,
+                hoverCursor: "default",
+              });
+              (overlay as FabricObjectWithData).data = {
+                __collabLockBadgeFor: elementId,
+                __collabLock: true,
+              };
+              canvas.add(overlay);
+              const label = lock.lockedByName || "…";
+              const badge = new fabricModule.Text(` 🔒 ${label} `, {
+                left: bb.left,
+                top: Math.max(0, bb.top - 16),
+                originX: "left",
+                originY: "top",
+                fontSize: 12,
+                fontFamily: "sans-serif",
+                fill: "#ffffff",
+                backgroundColor: color,
+                selectable: false,
+                evented: false,
+                hoverCursor: "default",
+              });
+              (badge as FabricObjectWithData).data = {
+                __collabLockBadgeFor: elementId,
+                __collabLock: true,
+              };
+              canvas.add(badge);
+            } catch (err) {
+              clientLogger.warn(
+                "[EditorCanvas] collab lock badge failed:",
+                err,
+              );
+            }
+          }
+        } else if (!lock && marked) {
+          const restore = data?.__collabLockRestore as
+            | {
+                selectable?: boolean;
+                evented?: boolean;
+                hasControls?: boolean;
+                hasBorders?: boolean;
+                opacity?: number;
+              }
+            | undefined;
+          fo.set({
+            selectable: restore?.selectable ?? true,
+            evented: restore?.evented ?? true,
+            hasControls: restore?.hasControls ?? true,
+            hasBorders: restore?.hasBorders ?? true,
+            opacity: restore?.opacity ?? 1,
+          });
+          const rest = { ...(data as Record<string, unknown>) };
+          delete rest.__collabLocked;
+          delete rest.__collabLockRestore;
+          (obj as FabricObjectWithData).data = rest;
+        }
+      }
+
+      canvas.requestRenderAll();
+    } finally {
+      endProgrammaticApply();
+    }
+  }, [beginProgrammaticApply, endProgrammaticApply]);
+
+  // `loadPage` (memoised `[]`) reads the latest reconciler through this ref,
+  // exactly like `renderElementsOverlayRef`.
+  const applyCollabLocksRef = useRef(applyCollabLocks);
+  applyCollabLocksRef.current = applyCollabLocks;
+
+  // Live reconcile whenever the lock set changes (peer lock / unlock / expiry).
+  useEffect(() => {
+    applyCollabLocks();
+  }, [elementLocks, applyCollabLocks]);
 
   // --- Architecture zoom/pan (CHOIX DOCUMENTÉ) -----------------------------
   // viewportTransform Fabric = SCALE PUR [z,0,0,z,0,0] + canvas DOM
@@ -1761,6 +1951,10 @@ export function EditorCanvas({
       // éléments du scene graph — ils ne doivent ni être queués/bakés ni
       // remontés à page.tsx. Leur application passe par redactPii (moteur).
       if ((e.target as FabricObjectWithData).data?.redactionMark) return;
+      // Ignorer les décorations de verrou collaboratif (overlay + badge de nom
+      // posés par applyCollabLocks) : ce ne sont pas des éléments du scene graph
+      // (défense en profondeur — elles sont déjà ajoutées sous begin/end).
+      if ((e.target as FabricObjectWithData).data?.__collabLock) return;
       // A coalesced paragraph Textbox (e.g. a duplicated paragraph) decomposes
       // into its line runs so each is queued as its own add — a multi-line
       // `content` would otherwise lose every line but the first at bake time.
@@ -2882,6 +3076,12 @@ export function EditorCanvas({
       } else {
         canvas.renderAll();
       }
+
+      // Re-apply collaborative soft-locks onto the freshly-built objects: the
+      // badges/overlays were wiped by canvas.clear() above, but the store still
+      // holds the peers' locks for elements on this page. Inside the
+      // programmatic-apply window so the badge adds never emit element events.
+      applyCollabLocksRef.current?.();
 
       endProgrammaticApply();
     },

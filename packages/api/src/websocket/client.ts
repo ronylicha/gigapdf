@@ -15,6 +15,13 @@ export type SocketEvent =
   | 'element:update'
   | 'element:delete'
   | 'element:bulk-update'
+  // Per-element soft-locks. Emitted with underscore names (the server binds
+  // element_lock / element_unlock via @sio.event, i.e. function-name based),
+  // received with colon names (element:locked / element:unlocked broadcasts).
+  | 'element_lock'
+  | 'element_unlock'
+  | 'element:locked'
+  | 'element:unlocked'
   | 'cursor:move'
   | 'user:join'
   | 'user:leave'
@@ -28,8 +35,20 @@ export interface SocketEventData {
   'error': Error;
   'document:update': {
     document_id: string;
-    user_id: string;
-    changes: unknown;
+    user_id?: string;
+    /** Scene-graph change payload (overlay edits). Absent for binary updates. */
+    changes?: unknown;
+    /**
+     * Update kind. `"binary"` means the emitter persisted a NEW document
+     * version to S3 (createDocumentVersion) — peers must reload the binary,
+     * not merge a scene-graph change. Absent/`"scene"` keeps the legacy
+     * changes-merge semantics.
+     */
+    type?: 'binary' | 'scene';
+    /** Monotonic-ish version token (emitter-side timestamp) for debouncing. */
+    version?: number | string;
+    /** Identifiant du client émetteur (anti-écho) — estampillé par emit. */
+    client_id?: string;
   };
   'document:delete': {
     document_id: string;
@@ -79,6 +98,33 @@ export interface SocketEventData {
     document_id: string;
     elements: Array<{ id: string; changes: unknown }>;
     user_id: string;
+  };
+  // --- Per-element soft-locks (cooperative, advisory — not a transaction) ---
+  // Emitted by the client when a user selects an element; the server binds
+  // these via @sio.event so the wire names use underscores.
+  'element_lock': {
+    document_id: string;
+    element_id: string;
+    /** Estampillé par emit (anti-écho) — le serveur l'ignore. */
+    client_id?: string;
+  };
+  'element_unlock': {
+    document_id: string;
+    element_id: string;
+    client_id?: string;
+  };
+  // Broadcast by the server to the other members of the room (skip_sid=emitter).
+  'element:locked': {
+    element_id: string;
+    locked_by_user_id: string;
+    locked_by_user_name: string;
+    /** ISO-8601 server expiry — drives the client-side TTL backstop. */
+    expires_at: string;
+    document_id?: string;
+  };
+  'element:unlocked': {
+    element_id: string;
+    document_id?: string;
   };
   'cursor:move': {
     document_id: string;

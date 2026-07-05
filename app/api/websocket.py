@@ -235,7 +235,14 @@ async def disconnect(sid: str):
             logger.info(f"Socket {sid} disconnected (no active document)")
             return
 
-        # Remove collaboration session
+        # Capture the element locks this socket still holds BEFORE removing the
+        # session — remove_session releases them in the DB but does not report
+        # which ones, and the client relies on element:unlocked to un-grey.
+        released_element_ids = await collaboration_manager.get_locked_element_ids(
+            sid
+        )
+
+        # Remove collaboration session (also releases its element locks)
         collab_session = await collaboration_manager.remove_session(sid)
 
         if collab_session:
@@ -253,6 +260,18 @@ async def disconnect(sid: str):
                 room=room,
                 skip_sid=sid,
             )
+
+            # Release the disconnected user's soft-locks for everyone still in
+            # the room. Without this, peers keep the element greyed out until
+            # the 5-minute server-side expiry (which is itself silent) or their
+            # own client TTL backstop fires.
+            for element_id in released_element_ids:
+                await sio.emit(
+                    "element:unlocked",
+                    {"element_id": element_id, "document_id": document_id},
+                    room=room,
+                    skip_sid=sid,
+                )
 
             logger.info(
                 f"User {user_id} left document {document_id} (socket: {sid})"
@@ -373,6 +392,29 @@ async def _join_document_impl(sid: str, data: dict) -> dict:
                 to=sid,
             )
 
+        # Lock backfill: the client does not consume the join ack (it builds
+        # collaboration state purely from broadcast events), so replay the
+        # already-held element locks to the newcomer as "element:locked" events
+        # — the same shape the live element_lock handler broadcasts — so the
+        # editor greys them out on arrival instead of only after the next
+        # lock/unlock. ElementLock rows carry no display name; resolve it from
+        # the active users, falling back to a neutral label.
+        user_name_by_id = {u.user_id: u.user_name for u in active_users}
+        for lock in active_locks:
+            await sio.emit(
+                "element:locked",
+                {
+                    "element_id": lock.element_id,
+                    "locked_by_user_id": lock.locked_by_user_id,
+                    "locked_by_user_name": user_name_by_id.get(
+                        lock.locked_by_user_id, "Unknown"
+                    ),
+                    "expires_at": lock.expires_at.isoformat(),
+                    "document_id": document_id,
+                },
+                to=sid,
+            )
+
         logger.info(
             f"User {user_id} joined document {document_id} (socket: {sid})"
         )
@@ -451,7 +493,12 @@ async def _leave_document_impl(sid: str, data: dict) -> dict:
 
             session["document_id"] = None
 
-        # Remove collaboration session
+        # Capture held locks before removal (see the disconnect handler).
+        released_element_ids = await collaboration_manager.get_locked_element_ids(
+            sid
+        )
+
+        # Remove collaboration session (also releases its element locks)
         collab_session = await collaboration_manager.remove_session(sid)
 
         if collab_session:
@@ -472,6 +519,15 @@ async def _leave_document_impl(sid: str, data: dict) -> dict:
                 },
                 room=room,
             )
+
+            # Release the leaver's soft-locks for the rest of the room.
+            for element_id in released_element_ids:
+                await sio.emit(
+                    "element:unlocked",
+                    {"element_id": element_id, "document_id": document_id},
+                    room=room,
+                    skip_sid=sid,
+                )
 
             logger.info(
                 f"User {collab_session.user_id} left document {document_id}"
@@ -561,6 +617,7 @@ async def element_lock(sid: str, data: dict) -> dict:
                     "locked_by_user_id": user_id,
                     "locked_by_user_name": collab_session.user_name,
                     "expires_at": lock.expires_at.isoformat(),
+                    "document_id": document_id,
                 },
                 room=room,
                 skip_sid=sid,
@@ -635,6 +692,7 @@ async def element_unlock(sid: str, data: dict) -> dict:
                 "element:unlocked",
                 {
                     "element_id": element_id,
+                    "document_id": document_id,
                 },
                 room=room,
                 skip_sid=sid,

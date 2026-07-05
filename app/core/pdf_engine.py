@@ -1,17 +1,23 @@
 """
-Main PDF engine.
+In-process PDF document store and structural page engine.
 
-# DEPRECATED: Use @giga-pdf/pdf-engine via Next.js API routes instead.
-#
-# This module previously used PyMuPDF (AGPL) for PDF manipulation.
-# All PDF rendering, page manipulation, and editing operations are now
-# handled by the TypeScript pdf-engine package at packages/pdf-engine.
-#
-# Python only retains: OCR block ingestion (store_ocr_blocks; OCR itself is
-# performed by the host-side gigapdf-ocr-rten service, not this backend),
-# Celery workers, FastAPI endpoints that do NOT perform PDF processing.
-#
-# TODO: Route all PDF manipulation calls to the TS engine via HTTP.
+This module owns an in-memory map of raw PDF bytes keyed by ``document_id``
+(:class:`PDFEngine`) that backs the editing-session layer. It is wired into
+:class:`app.services.document_service.DocumentService` (as ``self.engine``) and
+the session repositories (``document_repo`` / ``redis_document_repo``), which
+wrap the stored bytes in :class:`LegacyDocumentProxy` when rehydrating a
+session. Live consumers reach it through the ``/api/v1`` documents, embed and
+storage routers, the Celery upload/paging tasks, and the
+``tests/integration/test_storage_integration.py`` suite.
+
+Structural, low-level operations are performed server-side with pikepdf
+(MIT-licensed): open/validate, add / delete / reorder / rotate pages, and
+read/write document metadata plus per-page dimensions.
+
+Rich rendering and content editing — rasterisation, text/element extraction,
+in-place text editing, encryption, forms — are intentionally NOT handled here.
+They live in the TypeScript ``@giga-pdf/pdf-engine`` package, exposed through the
+Next.js ``/api/pdf/*`` routes, and are deliberately not duplicated in Python.
 """
 
 import io
@@ -34,14 +40,16 @@ logger = logging.getLogger(__name__)
 
 class PDFEngine:
     """
-    Core PDF manipulation engine.
+    In-memory store of PDF document bytes with structural page operations.
 
-    DEPRECATED: All PDF operations are now handled by @giga-pdf/pdf-engine (TypeScript).
-    This class is retained as a compatibility shim so that existing Celery tasks and
-    session management continue to work during the migration period.
+    Holds raw PDF bytes keyed by ``document_id`` and exposes structural
+    operations (open/validate, add/delete/reorder/rotate pages, read/write
+    metadata, per-page dimensions) implemented with pikepdf.
 
-    The internal document store now holds raw bytes instead of fitz.Document objects.
-    PDF binary data is managed via pikepdf when needed for legacy operations.
+    A single module-level instance (:data:`pdf_engine`) is shared by
+    :class:`app.services.document_service.DocumentService` and the document
+    session repositories. Rich rendering/editing lives in the TypeScript engine
+    (``/api/pdf/*``) — see the module docstring.
     """
 
     def __init__(self):
@@ -55,12 +63,11 @@ class PDFEngine:
         password: str | None = None,
     ) -> tuple[str, "LegacyDocumentProxy"]:
         """
-        Open a PDF document from bytes, file path, or stream.
+        Open and validate a PDF from bytes or a file path; store its raw bytes.
 
-        DEPRECATED: PDF processing is now handled by @giga-pdf/pdf-engine (TypeScript).
-        This method stores raw bytes and returns a LegacyDocumentProxy for backward compat.
-
-        TODO: Replace callers with HTTP calls to the TS pdf-engine service.
+        Validates the file (and any password) with pikepdf, registers the bytes
+        under a new ``document_id`` and returns a :class:`LegacyDocumentProxy`
+        over them.
 
         Args:
             source: PDF data as bytes, file path, or Path object.
@@ -123,10 +130,7 @@ class PDFEngine:
 
     def get_document(self, document_id: str) -> "LegacyDocumentProxy":
         """
-        Get an opened document by ID.
-
-        DEPRECATED: PDF processing is now handled by @giga-pdf/pdf-engine (TypeScript).
-        Returns a LegacyDocumentProxy over stored bytes for backward compatibility.
+        Return a :class:`LegacyDocumentProxy` over the stored bytes for a document.
 
         Args:
             document_id: Document identifier.
@@ -172,19 +176,16 @@ class PDFEngine:
         permissions: int = -1,
     ) -> bytes:
         """
-        Save a document to bytes or file.
+        Return the stored PDF bytes, optionally writing them to ``output_path``.
 
-        DEPRECATED: PDF serialization is now handled by @giga-pdf/pdf-engine (TypeScript).
-        Returns the stored raw bytes. Encryption parameters from PyMuPDF constants are ignored;
-        use the TS engine for encryption.
-
-        TODO: Route encryption to the TS engine via HTTP.
+        The document is kept as already-serialized bytes, so this returns them
+        as-is. Encryption is not applied here (it is handled by the TypeScript
+        engine via ``/api/pdf/*``); the encryption-related parameters are
+        accepted only for signature compatibility and are ignored.
 
         Args:
             document_id: Document identifier.
-            output_path: Optional file path to save to.
-            (remaining args kept for backward compatibility but encryption via pikepdf
-             requires the TS engine for full feature parity)
+            output_path: Optional file path to write the bytes to.
 
         Returns:
             bytes: PDF data as bytes.
@@ -199,35 +200,6 @@ class PDFEngine:
                 f.write(pdf_bytes)
 
         return pdf_bytes
-
-    def get_page(self, document_id: str, page_number: int) -> "LegacyPageProxy":
-        """
-        Get a specific page from a document.
-
-        DEPRECATED: Page operations are now handled by @giga-pdf/pdf-engine (TypeScript).
-
-        Args:
-            document_id: Document identifier.
-            page_number: Page number (1-indexed).
-
-        Returns:
-            LegacyPageProxy: Lightweight proxy for backward compatibility.
-        """
-        if document_id not in self._documents:
-            raise KeyError(f"Document not found: {document_id}")
-
-        pdf_bytes = self._documents[document_id]
-        with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
-            page_count = len(pdf.pages)
-            if page_number < 1 or page_number > page_count:
-                raise IndexError(f"Page {page_number} not found (1-{page_count})")
-            # Extract basic dimensions from MediaBox
-            page = pdf.pages[page_number - 1]
-            media_box = page.MediaBox
-            width = float(media_box[2]) - float(media_box[0])
-            height = float(media_box[3]) - float(media_box[1])
-
-        return LegacyPageProxy(page_number, width, height)
 
     def reorder_pages(self, document_id: str, new_order: list[int]) -> None:
         """
@@ -330,17 +302,6 @@ class PDFEngine:
 
         self._documents[document_id] = output.getvalue()
         logger.info(f"Deleted page {page_number} from document {document_id}")
-
-    def move_page(self, document_id: str, from_page: int, to_page: int) -> None:
-        """
-        Move a page to a different position.
-
-        DEPRECATED: Page operations are now handled by @giga-pdf/pdf-engine (TypeScript).
-        TODO: Route this call to the TS engine via HTTP.
-        """
-        logger.warning(
-            "PDFEngine.move_page() is deprecated. Use @giga-pdf/pdf-engine via Next.js API routes."
-        )
 
     def rotate_page(self, document_id: str, page_number: int, angle: int) -> None:
         """
@@ -492,31 +453,6 @@ class PDFEngine:
                 )
             return dimensions
 
-    def get_page_dimensions(self, document_id: str, page_number: int) -> dict[str, float]:
-        """
-        Get page dimensions via pikepdf.
-
-        Args:
-            document_id: Document identifier.
-            page_number: Page number (1-indexed).
-
-        Returns:
-            dict: Page dimensions {width, height, rotation}.
-        """
-        if document_id not in self._documents:
-            raise KeyError(f"Document not found: {document_id}")
-
-        pdf_bytes = self._documents[document_id]
-        with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
-            page = pdf.pages[page_number - 1]
-            media_box = page.MediaBox
-            width = float(media_box[2]) - float(media_box[0])
-            height = float(media_box[3]) - float(media_box[1])
-            # Rotation stored in /Rotate key
-            rotate = int(page.get("/Rotate", 0))
-
-        return {"width": width, "height": height, "rotation": rotate}
-
     def clear_all(self) -> None:
         """Clear all stored document bytes from memory."""
         self._documents.clear()
@@ -525,11 +461,12 @@ class PDFEngine:
 
 class LegacyDocumentProxy:
     """
-    Lightweight proxy replacing fitz.Document for backward compatibility.
+    Lightweight handle over a document's PDF bytes used by the session layer.
 
-    DEPRECATED: This class exists only to prevent import errors in code that
-    was written against fitz.Document. All real PDF operations must go through
-    @giga-pdf/pdf-engine (TypeScript).
+    Wraps the raw bytes stored in :class:`PDFEngine` and exposes the small
+    surface the session repositories and :class:`DocumentService` rely on:
+    ``tobytes()``, ``metadata``, ``is_encrypted`` and ``select()`` (page
+    reordering, delegated to :meth:`PDFEngine.reorder_pages`).
     """
 
     def __init__(self, document_id: str, pdf_bytes: bytes, page_count: int, is_encrypted: bool):
@@ -578,17 +515,17 @@ class LegacyDocumentProxy:
 
     @permissions.setter
     def permissions(self, value: int) -> None:
-        """Setter kept for backward compatibility; actual encryption handled by TS engine."""
+        """No-op setter kept for signature compatibility; PDF encryption is handled by the TypeScript engine (/api/pdf/*)."""
         logger.warning(
-            "Setting permissions via LegacyDocumentProxy is a no-op. "
-            "Use @giga-pdf/pdf-engine for PDF encryption."
+            "Setting permissions via LegacyDocumentProxy is a no-op; "
+            "PDF encryption is handled by the TypeScript engine (/api/pdf/*)."
         )
 
     def set_metadata(self, metadata: dict) -> None:
-        """No-op metadata setter for backward compatibility."""
+        """No-op; use :meth:`PDFEngine.set_metadata` to persist document metadata."""
         logger.warning(
-            "LegacyDocumentProxy.set_metadata() is a no-op. "
-            "Use PDFEngine.set_metadata() or @giga-pdf/pdf-engine."
+            "LegacyDocumentProxy.set_metadata() is a no-op; "
+            "use PDFEngine.set_metadata() to persist metadata."
         )
 
     def select(self, page_indices: list[int]) -> None:
@@ -610,10 +547,10 @@ class LegacyDocumentProxy:
 
 class LegacyPageProxy:
     """
-    Lightweight proxy replacing fitz.Page for backward compatibility.
+    Lightweight value object describing a page's number, size and rotation.
 
-    DEPRECATED: Exists only to satisfy type signatures in code written against
-    fitz.Page. Real page rendering belongs in @giga-pdf/pdf-engine (TypeScript).
+    Returned by :meth:`PDFEngine.add_page` to report the inserted page's
+    geometry. Rendering belongs to the TypeScript engine (``/api/pdf/*``).
     """
 
     def __init__(self, page_number: int, width: float, height: float, rotation: int = 0):

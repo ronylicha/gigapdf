@@ -5,6 +5,41 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.26.0] - 2026-07-05
+
+### Added — real-time collaboration is now complete
+
+- **Live document sync.** When a collaborator saves a change that rebuilds the
+  PDF (text edit, page operation, apply-elements, fill & sign, restore), the
+  others reload the new version automatically — or, if they are mid-edit, see a
+  non-destructive "document updated — reload" banner instead of losing work.
+- **Per-element locks.** When someone selects an element, everyone else sees it
+  greyed out with a name badge and cannot edit it until they deselect. Locks
+  release on deselect, disconnect, or a short timeout, and are replayed to
+  anyone who joins mid-session.
+
+### Changed — faster uploads
+
+- Importing a PDF no longer re-uploads the whole file to the server just to
+  read its text: extraction now happens locally in the browser engine, removing
+  a full-file network round-trip from the upload's critical path.
+
+### Changed — conversion fidelity (engine 0.118.0)
+
+- Closes the seven fidelity items deferred from the previous engine release:
+  numbered lists survive the tagged PDF path, spreadsheet frozen panes / cell
+  rotation and right-to-left cells round-trip, ODT first-page/even-odd headers,
+  table-cell diagonals paint in the PDF, charts fall back to their data table
+  when they can't be plotted, and slides render at their true positions in
+  model→PDF conversion.
+
+### Housekeeping
+
+- Removed seven deprecated, unused API routers; cleaned the in-memory PDF
+  engine; hoisted table headers to fix accessibility warnings; the command
+  palette and marketing tool pages gained accessibility labels and direct
+  tool links; two long-excluded tests were reintegrated into CI.
+
 ## [1.25.0] - 2026-07-04
 
 ### Added — real-time collaboration

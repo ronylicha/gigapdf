@@ -164,6 +164,45 @@ class CollaborationManager:
 
             return collab_session
 
+    async def get_locked_element_ids(
+        self,
+        socket_id: str,
+    ) -> list[str]:
+        """
+        List the element ids currently locked by a socket's session.
+
+        Used at disconnect/leave to tell the room which locks are about to be
+        released: :meth:`remove_session` deletes the ``ElementLock`` rows but
+        does not report which elements were held, and the periodic
+        ``cleanup_*`` tasks expire locks silently (no broadcast). Capturing the
+        ids BEFORE removal lets the caller emit ``element:unlocked`` so peers
+        release the visual lock immediately instead of waiting on their client
+        TTL backstop.
+
+        Args:
+            socket_id: WebSocket connection identifier.
+
+        Returns:
+            list[str]: Element ids held by this socket's session (empty when the
+            socket has no active session or holds no locks).
+        """
+        async with get_db_session() as session:
+            result = await session.execute(
+                select(CollaborationSession.id).where(
+                    CollaborationSession.socket_id == socket_id
+                )
+            )
+            session_id = result.scalar_one_or_none()
+            if not session_id:
+                return []
+
+            locks = await session.execute(
+                select(ElementLock.element_id).where(
+                    ElementLock.locked_by_session_id == session_id
+                )
+            )
+            return list(locks.scalars().all())
+
     async def update_cursor(
         self,
         socket_id: str,

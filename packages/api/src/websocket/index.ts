@@ -11,5 +11,6 @@ export {
   useDocumentUpdates,
   usePageUpdates,
   useElementUpdates,
+  useElementLocks,
   useJobStatus,
 } from './hooks';

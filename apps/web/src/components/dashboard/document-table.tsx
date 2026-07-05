@@ -132,6 +132,65 @@ interface DocumentTableProps {
   onSelect?: (item: SelectionItem) => void;
 }
 
+/**
+ * Sort-direction indicator for a column header. Declared at module scope
+ * (react-hooks/static-components) so it is not re-created on every render.
+ */
+function SortIcon({
+  field,
+  sortField,
+  sortDirection,
+}: {
+  field: SortField;
+  sortField: SortField;
+  sortDirection: SortDirection;
+}) {
+  if (sortField !== field) {
+    return <ArrowUpDown className="ml-2 h-4 w-4 text-muted-foreground" />;
+  }
+  return sortDirection === "asc" ? (
+    <ArrowUp className="ml-2 h-4 w-4" />
+  ) : (
+    <ArrowDown className="ml-2 h-4 w-4" />
+  );
+}
+
+/**
+ * Clickable, sortable column header. Declared at module scope
+ * (react-hooks/static-components); the active sort state and the sort callback
+ * are threaded in as props.
+ */
+function SortableHeader({
+  field,
+  sortField,
+  sortDirection,
+  onSort,
+  children,
+}: {
+  field: SortField;
+  sortField: SortField;
+  sortDirection: SortDirection;
+  onSort: (field: SortField) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <TableHead>
+      <Button
+        variant="ghost"
+        className="h-8 px-2 hover:bg-muted/50"
+        onClick={() => onSort(field)}
+      >
+        {children}
+        <SortIcon
+          field={field}
+          sortField={sortField}
+          sortDirection={sortDirection}
+        />
+      </Button>
+    </TableHead>
+  );
+}
+
 export function DocumentTable({
   documents,
   folders = [],
@@ -436,39 +495,9 @@ export function DocumentTable({
     setRenameDialogOpen(true);
   };
 
-  const SortIcon = ({ field }: { field: SortField }) => {
-    if (sortField !== field) {
-      return <ArrowUpDown className="ml-2 h-4 w-4 text-muted-foreground" />;
-    }
-    return sortDirection === "asc" ? (
-      <ArrowUp className="ml-2 h-4 w-4" />
-    ) : (
-      <ArrowDown className="ml-2 h-4 w-4" />
-    );
-  };
-
   const isItemSelected = (type: "document" | "folder", id: string) => {
     return selectedItems.some(item => item.type === type && item.id === id);
   };
-
-  const SortableHeader = ({
-    field,
-    children,
-  }: {
-    field: SortField;
-    children: React.ReactNode;
-  }) => (
-    <TableHead>
-      <Button
-        variant="ghost"
-        className="h-8 px-2 hover:bg-muted/50"
-        onClick={() => onSort(field)}
-      >
-        {children}
-        <SortIcon field={field} />
-      </Button>
-    </TableHead>
-  );
 
   if (documents.length === 0 && folders.length === 0) {
     return null;
@@ -481,10 +510,38 @@ export function DocumentTable({
           <TableHeader>
             <TableRow>
               {selectionMode && <TableHead className="w-[50px]"></TableHead>}
-              <SortableHeader field="name">{t("table.name")}</SortableHeader>
-              <SortableHeader field="size">{t("table.size")}</SortableHeader>
-              <SortableHeader field="createdAt">{t("table.created")}</SortableHeader>
-              <SortableHeader field="updatedAt">{t("table.modified")}</SortableHeader>
+              <SortableHeader
+                field="name"
+                sortField={sortField}
+                sortDirection={sortDirection}
+                onSort={onSort}
+              >
+                {t("table.name")}
+              </SortableHeader>
+              <SortableHeader
+                field="size"
+                sortField={sortField}
+                sortDirection={sortDirection}
+                onSort={onSort}
+              >
+                {t("table.size")}
+              </SortableHeader>
+              <SortableHeader
+                field="createdAt"
+                sortField={sortField}
+                sortDirection={sortDirection}
+                onSort={onSort}
+              >
+                {t("table.created")}
+              </SortableHeader>
+              <SortableHeader
+                field="updatedAt"
+                sortField={sortField}
+                sortDirection={sortDirection}
+                onSort={onSort}
+              >
+                {t("table.modified")}
+              </SortableHeader>
               <TableHead className="w-[100px]">{t("table.actions")}</TableHead>
             </TableRow>
           </TableHeader>

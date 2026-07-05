@@ -239,3 +239,163 @@ describe("useCollaboration — room = storedDocumentId", () => {
     });
   });
 });
+
+describe("useCollaboration — propagation binaire + verrous", () => {
+  beforeEach(() => {
+    spies = installSpies();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("emitBinaryUpdate émet document:update {type:'binary'} sur le storedDocumentId", () => {
+    const { result } = renderHook(() =>
+      useCollaboration({ documentId: STORED_DOCUMENT_ID, enabled: true }),
+    );
+
+    act(() => {
+      result.current.emitBinaryUpdate(1720180800000);
+    });
+
+    expect(spies.emit).toHaveBeenCalledWith("document:update", {
+      document_id: STORED_DOCUMENT_ID,
+      type: "binary",
+      version: 1720180800000,
+    });
+  });
+
+  it("réception : document:update {type:'binary'} déclenche onDocumentBinaryUpdate (pas onDocumentUpdate)", () => {
+    const onDocumentBinaryUpdate = vi.fn();
+    const onDocumentUpdate = vi.fn();
+    renderHook(() =>
+      useCollaboration({
+        documentId: STORED_DOCUMENT_ID,
+        enabled: true,
+        onDocumentBinaryUpdate,
+        onDocumentUpdate,
+      }),
+    );
+
+    act(() => {
+      dispatch("document:update", {
+        document_id: STORED_DOCUMENT_ID,
+        type: "binary",
+        version: 42,
+      });
+    });
+
+    expect(onDocumentBinaryUpdate).toHaveBeenCalledWith({
+      documentId: STORED_DOCUMENT_ID,
+      version: 42,
+    });
+    // Le chemin binaire ne doit PAS être confondu avec un diff de scene graph.
+    expect(onDocumentUpdate).not.toHaveBeenCalled();
+  });
+
+  it("réception : document:update sans type → onDocumentUpdate (scene graph), pas de reload", () => {
+    const onDocumentBinaryUpdate = vi.fn();
+    const onDocumentUpdate = vi.fn();
+    renderHook(() =>
+      useCollaboration({
+        documentId: STORED_DOCUMENT_ID,
+        enabled: true,
+        onDocumentBinaryUpdate,
+        onDocumentUpdate,
+      }),
+    );
+
+    act(() => {
+      dispatch("document:update", {
+        document_id: STORED_DOCUMENT_ID,
+        changes: { foo: "bar" },
+        user_id: "user-b",
+      });
+    });
+
+    expect(onDocumentUpdate).toHaveBeenCalledWith({ foo: "bar" });
+    expect(onDocumentBinaryUpdate).not.toHaveBeenCalled();
+  });
+
+  it("émet element_lock / element_unlock (underscore) avec le storedDocumentId", () => {
+    const { result } = renderHook(() =>
+      useCollaboration({ documentId: STORED_DOCUMENT_ID, enabled: true }),
+    );
+
+    act(() => {
+      result.current.emitElementLock("el-1");
+      result.current.emitElementUnlock("el-1");
+    });
+
+    expect(spies.emit).toHaveBeenCalledWith("element_lock", {
+      document_id: STORED_DOCUMENT_ID,
+      element_id: "el-1",
+    });
+    expect(spies.emit).toHaveBeenCalledWith("element_unlock", {
+      document_id: STORED_DOCUMENT_ID,
+      element_id: "el-1",
+    });
+  });
+
+  it("réception : element:locked / element:unlocked appellent les callbacks", () => {
+    const onElementLocked = vi.fn();
+    const onElementUnlocked = vi.fn();
+    renderHook(() =>
+      useCollaboration({
+        documentId: STORED_DOCUMENT_ID,
+        enabled: true,
+        onElementLocked,
+        onElementUnlocked,
+      }),
+    );
+
+    act(() => {
+      dispatch("element:locked", {
+        element_id: "el-1",
+        locked_by_user_id: "user-b",
+        locked_by_user_name: "Bob",
+        expires_at: "2026-07-05T12:05:00Z",
+        document_id: STORED_DOCUMENT_ID,
+      });
+    });
+    expect(onElementLocked).toHaveBeenCalledWith(
+      expect.objectContaining({
+        element_id: "el-1",
+        locked_by_user_id: "user-b",
+        locked_by_user_name: "Bob",
+      }),
+    );
+
+    act(() => {
+      dispatch("element:unlocked", {
+        element_id: "el-1",
+        document_id: STORED_DOCUMENT_ID,
+      });
+    });
+    expect(onElementUnlocked).toHaveBeenCalledWith(
+      expect.objectContaining({ element_id: "el-1" }),
+    );
+  });
+
+  it("réception : un verrou d'une AUTRE room n'atteint pas le callback", () => {
+    const onElementLocked = vi.fn();
+    renderHook(() =>
+      useCollaboration({
+        documentId: STORED_DOCUMENT_ID,
+        enabled: true,
+        onElementLocked,
+      }),
+    );
+
+    act(() => {
+      dispatch("element:locked", {
+        element_id: "el-1",
+        locked_by_user_id: "user-b",
+        locked_by_user_name: "Bob",
+        expires_at: "2026-07-05T12:05:00Z",
+        document_id: SESSION_DOCUMENT_ID,
+      });
+    });
+    expect(onElementLocked).not.toHaveBeenCalled();
+  });
+});
