@@ -15,6 +15,16 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.27.1",
+    date: "2026-07-06",
+    type: "patch",
+    changes: [
+      { type: "fix", description: "Exporting a PDF to Word, Excel, PowerPoint, HTML or Markdown keeps its formatting and images again. Documents converted since 1.27.0 (and PDFs authored as tagged/accessible by Word) exported as bare text — images dropped, one style bleeding over whole paragraphs, table layout lost. Exports now always rebuild from the full visual layout; the accessibility tags still drive text extraction and reading order (engine 0.120.1)." },
+      { type: "fix", description: "Editing a paragraph no longer flattens its mixed formatting: fixing one word in a line that mixes bold or colored fragments used to restyle the whole line and erase the other fragments on save. The edit is now surgical — only the fragment you changed is rewritten, everything else keeps its exact typography and position." },
+      { type: "fix", description: "Opening a paragraph for editing no longer reorganises its lines. The edit box now sizes itself to the document's real line measure, so lines stay put when the box opens and a single keystroke can no longer trigger a destructive re-layout of the paragraph." },
+    ],
+  },
+  {
     version: "1.27.0",
     date: "2026-07-05",
     type: "minor",

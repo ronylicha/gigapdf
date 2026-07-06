@@ -5,6 +5,31 @@ All notable changes to GigaPDF are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.27.1] - 2026-07-06
+
+### Fixed
+
+- **PDF→Office/HTML/Markdown exports no longer lose formatting and images on
+  converted documents** (engine 0.120.1). 1.27.0's accessible (tagged)
+  conversions exposed an engine regression: exporting any tagged PDF — every
+  document converted from Office since 1.27.0, and PDFs authored as tagged by
+  Word — collapsed to bare text (images dropped, styles fused and bleeding
+  across whole paragraphs, table metrics lost). Exports now always reconstruct
+  from the full visual layout; the accessibility tags keep driving text
+  extraction and reading order, unchanged.
+- **Editing a paragraph no longer flattens its mixed formatting.** Fixing one
+  word in a line that mixes styles (a bold or colored fragment) used to bake
+  the whole line into the first fragment's style and erase the others,
+  deforming the layout on save. The edit is now surgical: only the fragment
+  you actually changed is rewritten — every other fragment keeps its exact
+  typography and position.
+- **Opening a paragraph for editing no longer reorganises its lines.** When
+  the editing font measured wider than the PDF's, a line could wrap into two
+  the moment the edit box opened — and the first keystroke then committed a
+  destructive re-layout of the whole paragraph (uniform style, stacked lines).
+  The edit box now sizes itself so lines match the document at open; wrapping
+  only applies to text you actually type past the measure.
+
 ## [1.27.0] - 2026-07-05
 
 ### Changed
