@@ -21,6 +21,7 @@ import {
   fabricObjectToElements,
   readFormFieldValue,
   commitParagraphSession,
+  mapLineEditToSingleRun,
   refreshParagraphSessionAfterCommit,
 } from "../fabric-element-io";
 import type { TextElement } from "@giga-pdf/types";
@@ -844,7 +845,10 @@ describe("commitParagraphSession", () => {
     expect(fabricObjectToElements(obj)).toEqual([]);
   });
 
-  it("UPDATE: an edited multi-run line puts the FULL line text on its first run and erases the siblings", () => {
+  it("UPDATE: an edit contained in ONE run rewrites ONLY that run — siblings keep their typography", () => {
+    // "DUPONT" → "MARTIN": the whole diff sits inside run `b`. The commit must
+    // NOT flatten the line onto run `a` (which would stamp `a`'s style over
+    // the text and erase `b` — the "editing loses the mixed formatting" bug).
     const obj = sessionTextbox("Nom : MARTIN\nLigne deux", [
       [
         { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
@@ -855,20 +859,79 @@ describe("commitParagraphSession", () => {
     const commit = commitParagraphSession(obj);
     expect(commit.kind).toBe("update");
     const els = (commit as { elements: TextElement[] }).elements;
-    // Line 2 untouched → ZERO write for it; line 1 → replace + erase.
-    expect(els).toHaveLength(2);
-    expect(els[0]!.elementId).toBe("a");
-    expect(els[0]!.index).toBe(1);
-    expect(els[0]!.content).toBe("Nom : MARTIN");
+    // ONE surgical write: run b gets its new text; run a is not even emitted.
+    expect(els).toHaveLength(1);
+    expect(els[0]!.elementId).toBe("b");
+    expect(els[0]!.index).toBe(2);
+    expect(els[0]!.content).toBe("MARTIN");
     // The run keeps its OWN stashed style (lossless replaceText routing).
     expect(els[0]!.style.originalFont).toBe("ABCDEF+TimesNewRoman");
     expect(els[0]!.style.fontSize).toBe(10);
-    expect(els[1]!.elementId).toBe("b");
-    expect(els[1]!.index).toBe(2);
-    expect(els[1]!.content).toBe("");
     // Source bounds preserved (block not moved).
-    expect(els[0]!.bounds).toMatchObject({ x: 40, y: 100 });
-    expect(els[1]!.bounds).toMatchObject({ x: 95, y: 100 });
+    expect(els[0]!.bounds).toMatchObject({ x: 95, y: 100 });
+  });
+
+  it("UPDATE: an edit SPANNING several runs falls back to the coarse first-run rewrite", () => {
+    // "Nom : DUPONT" → "NoXXXUPONT": the edited window covers the end of run
+    // `a`, the injected join space and the start of run `b` — no single run
+    // contains it, so the historical full-line-on-first-run rewrite applies.
+    const obj = sessionTextbox("NoXXXUPONT\nLigne deux", [
+      [
+        { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
+        { elementId: "b", index: 2, x: 95, y: 100, width: 60, content: "DUPONT" },
+      ],
+      [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+    ]);
+    const commit = commitParagraphSession(obj);
+    expect(commit.kind).toBe("update");
+    const els = (commit as { elements: TextElement[] }).elements;
+    expect(els).toHaveLength(2);
+    expect(els[0]!.elementId).toBe("a");
+    expect(els[0]!.content).toBe("NoXXXUPONT");
+    expect(els[1]!.elementId).toBe("b");
+    expect(els[1]!.content).toBe("");
+  });
+
+  it("UPDATE: a pure insertion at a run boundary appends to the run ending there", () => {
+    // Caret right after "Nom :" (end of run a) → the "!" belongs to run a.
+    const obj = sessionTextbox("Nom :! DUPONT\nLigne deux", [
+      [
+        { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
+        { elementId: "b", index: 2, x: 95, y: 100, width: 60, content: "DUPONT" },
+      ],
+      [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+    ]);
+    const commit = commitParagraphSession(obj);
+    expect(commit.kind).toBe("update");
+    const els = (commit as { elements: TextElement[] }).elements;
+    expect(els).toHaveLength(1);
+    expect(els[0]!.elementId).toBe("a");
+    expect(els[0]!.content).toBe("Nom :!");
+  });
+
+  it("UPDATE: a single-run edit on a MOVED block also re-emits the siblings verbatim (moveElement)", () => {
+    const obj = sessionTextbox(
+      "Nom : MARTIN\nLigne deux",
+      [
+        [
+          { elementId: "a", index: 1, x: 40, y: 100, width: 50, content: "Nom :" },
+          { elementId: "b", index: 2, x: 95, y: 100, width: 60, content: "DUPONT" },
+        ],
+        [{ elementId: "c", index: 3, x: 40, y: 114, width: 200, content: "Ligne deux" }],
+      ],
+      { left: 50, top: 120 }, // +10 / +20 vs sessionOrigin
+    );
+    const commit = commitParagraphSession(obj);
+    expect(commit.kind).toBe("update");
+    const els = (commit as { elements: TextElement[] }).elements;
+    // Line 1: surgical rewrite of b + verbatim move of a; line 2: pure move.
+    expect(els.map((e) => [e.elementId, e.content])).toEqual([
+      ["a", "Nom :"],
+      ["b", "MARTIN"],
+      ["c", "Ligne deux"],
+    ]);
+    expect(els.map((e) => e.bounds.x)).toEqual([50, 105, 50]);
+    expect(els.map((e) => e.bounds.y)).toEqual([120, 120, 134]);
   });
 
   it("UPDATE: a pure block MOVE emits every run verbatim with translated bounds", () => {
@@ -978,7 +1041,52 @@ describe("commitParagraphSession", () => {
     refreshParagraphSessionAfterCommit(obj, commit);
     // Committed → the box is now UNCHANGED against its refreshed baseline.
     expect(commitParagraphSession(obj)).toEqual({ kind: "unchanged" });
+    // The snapshot mirrors the SURGICAL commit: run b carries the new text,
+    // run a is untouched (not flattened onto the first run).
     const lineRuns = obj.data!.lineRuns as Array<Array<{ content: string }>>;
-    expect(lineRuns[0]!.map((r) => r.content)).toEqual(["Nom : MARTIN", ""]);
+    expect(lineRuns[0]!.map((r) => r.content)).toEqual(["Nom :", "MARTIN"]);
+  });
+});
+
+describe("mapLineEditToSingleRun", () => {
+  const line = [
+    {
+      elementId: "a",
+      bounds: { x: 0, y: 0, width: 50, height: 12 },
+      content: "Nom :",
+      style: {} as never,
+    },
+    {
+      elementId: "b",
+      bounds: { x: 55, y: 0, width: 60, height: 12 },
+      content: "DUPONT",
+      style: {} as never,
+    },
+  ];
+
+  it("maps an edit fully inside a run to that run", () => {
+    expect(
+      mapLineEditToSingleRun(line as never, "Nom : DUPONT", "Nom : DURAND"),
+    ).toEqual({ runIndex: 1, content: "DURAND" });
+  });
+
+  it("returns null when the edit spans runs (through the join space)", () => {
+    expect(
+      mapLineEditToSingleRun(line as never, "Nom : DUPONT", "NoXXXUPONT"),
+    ).toBeNull();
+  });
+
+  it("returns null when the baseline diverges from the snapshot", () => {
+    expect(
+      mapLineEditToSingleRun(line as never, "Autre texte", "Autre textes"),
+    ).toBeNull();
+  });
+
+  it("emptying a whole run (window starts in the join space) falls back", () => {
+    // "Nom : DUPONT" → "Nom :" removes " DUPONT" — the window opens on the
+    // injected join space, which belongs to no run.
+    expect(
+      mapLineEditToSingleRun(line as never, "Nom : DUPONT", "Nom :"),
+    ).toBeNull();
   });
 });

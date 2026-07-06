@@ -2891,6 +2891,35 @@ export function beginParagraphEditSession(
     );
   }
 
+  // Anti-wrap at session open: the browser session font often measures wider
+  // than the PDF glyphs, so a source line can spill past the frame width and
+  // Fabric re-wraps it into TWO visual lines the moment the box opens. The
+  // user sees the paragraph "reorganise" (formatting lost during editing) and
+  // — worse — the first keystroke would commit as a destructive REFLOW
+  // (visual lines ≠ logical lines → every source run removed and re-added at
+  // a uniform dominant style) even though nothing was restructured. Widen the
+  // box just enough (bounded) so visual === logical at open; wrapping only
+  // kicks in for text the user actually types past that measure.
+  {
+    const tbx = tb as unknown as {
+      textLines?: string[];
+      set: (props: Record<string, unknown>) => void;
+      initDimensions?: () => void;
+    };
+    tbx.initDimensions?.();
+    const expected = lineTexts.length;
+    let w = width;
+    for (
+      let i = 0;
+      i < 12 && (tbx.textLines?.length ?? expected) > expected;
+      i += 1
+    ) {
+      w *= 1.08;
+      tbx.set({ width: w });
+      tbx.initDimensions?.();
+    }
+  }
+
   // Session snapshot: per-line source runs (with their engine index + full
   // style) so the commit maps edited lines back onto the sources losslessly;
   // `paragraphRuns` keeps the legacy flat shape so the existing block-delete

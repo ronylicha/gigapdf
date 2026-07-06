@@ -1006,6 +1006,120 @@ function dominantSessionLineStyle(
 }
 
 /**
+ * The char range each run of one session line occupies inside its joined
+ * baseline text — the EXACT `joinLineRunContents` reconstruction (a single
+ * space is injected between two pieces only when neither side carries the
+ * whitespace; injected join spaces belong to NO run; empty runs occupy no
+ * range). Returns `null` per empty run.
+ */
+function lineRunCharRanges(
+  line: SessionLineRunSnapshot[],
+): Array<{ start: number; end: number } | null> {
+  const ranges: Array<{ start: number; end: number } | null> = [];
+  let out = "";
+  for (const run of line) {
+    const piece = run.content || "";
+    if (piece.length === 0) {
+      ranges.push(null);
+      continue;
+    }
+    if (out.length > 0 && !/\s$/.test(out) && !/^\s/.test(piece)) out += " ";
+    ranges.push({ start: out.length, end: out.length + piece.length });
+    out += piece;
+  }
+  return ranges;
+}
+
+/**
+ * When the whole edit of a changed session line fits INSIDE one source run,
+ * return that run's index + its new content — the commit then rewrites ONLY
+ * that run (lossless `replaceText`) and leaves every sibling's typography
+ * (bold word, colored fragment, other font) completely untouched: the typical
+ * "fix one word" edit no longer flattens the line's mixed formatting onto the
+ * first run's style, nor erases the siblings.
+ *
+ * The edited window is the minimal prefix/suffix diff between the baseline
+ * and the new line text. A pure insertion at a run boundary prefers the run
+ * the caret sits inside, then the run ending exactly at the caret (append).
+ * `null` ⇒ the edit spans several runs / lands in an injected join space /
+ * the snapshot diverges from the baseline — the caller falls back to the
+ * coarse first-run rewrite.
+ */
+export function mapLineEditToSingleRun(
+  line: SessionLineRunSnapshot[],
+  oldText: string,
+  newText: string,
+): { runIndex: number; content: string } | null {
+  if (line.length === 0 || oldText === newText) return null;
+  const ranges = lineRunCharRanges(line);
+  // Safety: the reconstruction must match the stashed baseline byte for byte,
+  // else the ranges are meaningless (stale/foreign snapshot).
+  let joined = "";
+  for (const run of line) {
+    const piece = run.content || "";
+    if (piece.length === 0) continue;
+    if (joined.length > 0 && !/\s$/.test(joined) && !/^\s/.test(piece)) {
+      joined += " ";
+    }
+    joined += piece;
+  }
+  if (joined !== oldText) return null;
+
+  // Minimal edited window via common prefix / suffix.
+  let p = 0;
+  const maxP = Math.min(oldText.length, newText.length);
+  while (p < maxP && oldText[p] === newText[p]) p += 1;
+  let s = 0;
+  const maxS = maxP - p;
+  while (
+    s < maxS &&
+    oldText[oldText.length - 1 - s] === newText[newText.length - 1 - s]
+  ) {
+    s += 1;
+  }
+  const oldEnd = oldText.length - s; // window in old: [p, oldEnd)
+  const newEnd = newText.length - s; // replacement in new: [p, newEnd)
+
+  let target = -1;
+  if (oldEnd > p) {
+    // Non-empty window: exactly the run whose range fully covers it.
+    for (let k = 0; k < line.length; k += 1) {
+      const r = ranges[k];
+      if (r && r.start <= p && oldEnd <= r.end) {
+        target = k;
+        break;
+      }
+    }
+  } else {
+    // Pure insertion at caret `p`: prefer strictly inside a run, then the run
+    // ending exactly at the caret (append), then the one starting there.
+    for (let k = 0; k < line.length && target < 0; k += 1) {
+      const r = ranges[k];
+      if (r && r.start < p && p < r.end) target = k;
+    }
+    for (let k = 0; k < line.length && target < 0; k += 1) {
+      const r = ranges[k];
+      if (r && r.end === p) target = k;
+    }
+    for (let k = 0; k < line.length && target < 0; k += 1) {
+      const r = ranges[k];
+      if (r && r.start === p) target = k;
+    }
+  }
+  if (target < 0) return null;
+
+  const r = ranges[target]!;
+  const piece = line[target]!.content || "";
+  const localStart = p - r.start;
+  const localEndOld = oldEnd - r.start;
+  const content =
+    piece.slice(0, localStart) +
+    newText.slice(p, newEnd) +
+    piece.slice(localEndOld);
+  return { runIndex: target, content };
+}
+
+/**
  * Map a paragraph edit session's live Textbox back onto its SOURCE runs — the
  * pure decision + construction of the edit-intent commit:
  *
@@ -1013,10 +1127,13 @@ function dominantSessionLineStyle(
  *     `{kind:"unchanged"}` — the caller restores the per-run objects, ZERO
  *     writes;
  *   - SAME LINE COUNT → `{kind:"update"}`: line i ↔ source line i. A CHANGED
- *     line puts its full new text on the line's FIRST run (`replaceText`) and
- *     erases the siblings (`content:""`); an UNCHANGED line is skipped
- *     entirely (zero write) unless the block moved, in which case its runs are
- *     emitted verbatim with translated bounds (pure `moveElement`);
+ *     line whose whole edit fits inside ONE source run rewrites ONLY that run
+ *     (see {@link mapLineEditToSingleRun} — mixed bold/colored siblings keep
+ *     their typography); an edit spanning runs falls back to the coarse
+ *     rewrite (full new text on the line's FIRST run, siblings erased). An
+ *     UNCHANGED line is skipped entirely (zero write) unless the block moved,
+ *     in which case its runs are emitted verbatim with translated bounds
+ *     (pure `moveElement`);
  *   - LINE COUNT CHANGED (Enter / join / wrap at the frame width) →
  *     `{kind:"reflow"}`: every source run is removed and one new run is added
  *     per re-wrapped VISUAL line (Fabric's `textLines`), stacked from the box
@@ -1073,12 +1190,35 @@ export function commitParagraphSession(
       const lineChanged = logicalLines[i] !== baseline[i];
       if (!lineChanged && !moved) continue; // untouched line — zero write
       if (lineChanged) {
-        // Full new line text on the FIRST run; siblings erased.
-        elements.push(
-          sessionRunToElement(tb, line[0]!, logicalLines[i] ?? "", dx, dy),
+        const single = mapLineEditToSingleRun(
+          line,
+          baseline[i] ?? "",
+          logicalLines[i] ?? "",
         );
-        for (let j = 1; j < line.length; j += 1) {
-          elements.push(sessionRunToElement(tb, line[j]!, "", dx, dy));
+        if (single) {
+          // Surgical rewrite: only the edited run changes; every sibling
+          // keeps its own typography (bold/colored fragments survive). When
+          // the block also moved, siblings are emitted verbatim (moveElement).
+          for (let j = 0; j < line.length; j += 1) {
+            if (j === single.runIndex) {
+              elements.push(
+                sessionRunToElement(tb, line[j]!, single.content, dx, dy),
+              );
+            } else if (moved) {
+              elements.push(
+                sessionRunToElement(tb, line[j]!, line[j]!.content, dx, dy),
+              );
+            }
+          }
+        } else {
+          // Edit spans runs — coarse fallback: full new line text on the
+          // FIRST run; siblings erased.
+          elements.push(
+            sessionRunToElement(tb, line[0]!, logicalLines[i] ?? "", dx, dy),
+          );
+          for (let j = 1; j < line.length; j += 1) {
+            elements.push(sessionRunToElement(tb, line[j]!, "", dx, dy));
+          }
         }
       } else {
         // Pure move: every run keeps its own content (→ moveElement).
@@ -1158,6 +1298,17 @@ export function refreshParagraphSessionAfterCommit(
       lineRuns.forEach((line, i) => {
         const newText = logicalLines[i];
         if (newText === undefined || newText === baseline[i]) return;
+        // Mirror the commit's decision (same pure mapping, same inputs): a
+        // single-run edit updates ONLY that run's snapshot; the coarse
+        // fallback matches the first-run rewrite + sibling erases.
+        const single = mapLineEditToSingleRun(line, baseline[i] ?? "", newText);
+        if (single) {
+          line[single.runIndex] = {
+            ...line[single.runIndex]!,
+            content: single.content,
+          };
+          return;
+        }
         if (line[0]) line[0] = { ...line[0], content: newText };
         for (let j = 1; j < line.length; j += 1) {
           line[j] = { ...line[j]!, content: "" };
