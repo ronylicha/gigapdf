@@ -72,7 +72,7 @@
   },
   "dependencies": {
     "@giga-pdf/types": "workspace:*",
-    "@qrcommunication/gigapdf-lib": "0.120.1"
+    "@qrcommunication/gigapdf-lib": "0.121.0"
   },
   "devDependencies": {
     "@giga-pdf/eslint-config": "workspace:*",

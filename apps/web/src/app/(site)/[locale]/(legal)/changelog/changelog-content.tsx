@@ -15,6 +15,14 @@ interface ChangelogEntry {
 
 const changelog: ChangelogEntry[] = [
   {
+    version: "1.27.2",
+    date: "2026-07-06",
+    type: "patch",
+    changes: [
+      { type: "fix", description: "Exporting a PDF to Word/Office now preserves the page LAYOUT, not just the content (engine 0.121.0). A typical letter used to export visually destroyed: re-flowed into two phantom columns, body text turned into headings, a blank first page, tripled line spacing, doubled gaps pushing the footer onto a second page, and the logo at the bottom. Exports now keep one column, true spacing, the image at its real position — and centred titles or right-aligned dates and signatures keep their alignment." },
+    ],
+  },
+  {
     version: "1.27.1",
     date: "2026-07-06",
     type: "patch",
