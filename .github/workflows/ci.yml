@@ -30,7 +30,7 @@ jobs:
         # → v6's @pnpm/exe bootstrap works. No version input: pnpm reads
         # packageManager (pnpm@10.28.0) from package.json (single source of truth).
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'pnpm'
@@ -59,7 +59,7 @@ jobs:
         # → v6's @pnpm/exe bootstrap works. No version input: pnpm reads
         # packageManager (pnpm@10.28.0) from package.json (single source of truth).
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'pnpm'
@@ -89,7 +89,7 @@ jobs:
         # → v6's @pnpm/exe bootstrap works. No version input: pnpm reads
         # packageManager (pnpm@10.28.0) from package.json (single source of truth).
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'pnpm'
@@ -120,7 +120,7 @@ jobs:
         # → v6's @pnpm/exe bootstrap works. No version input: pnpm reads
         # packageManager (pnpm@10.28.0) from package.json (single source of truth).
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'pnpm'
@@ -225,7 +225,7 @@ jobs:
         # → v6's @pnpm/exe bootstrap works. No version input: pnpm reads
         # packageManager (pnpm@10.28.0) from package.json (single source of truth).
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'pnpm'
