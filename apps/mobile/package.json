@@ -20,7 +20,7 @@
     "@tanstack/react-query": "^5.101.0",
     "axios": "^1.18.0",
     "better-auth": "^1.6.18",
-    "expo": "~56.0.12",
+    "expo": "~56.0.17",
     "expo-auth-session": "~56.0.14",
     "expo-blur": "~56.0.3",
     "expo-constants": "~56.0.18",
