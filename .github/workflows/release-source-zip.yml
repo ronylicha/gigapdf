@@ -29,7 +29,7 @@ jobs:
     steps:
       - name: Checkout the release commit
         # No `ref:` — on a `release` event github.sha is the tagged commit.
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Build source archive
         id: archive
