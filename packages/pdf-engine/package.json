@@ -78,11 +78,11 @@
     "@giga-pdf/eslint-config": "workspace:*",
     "@giga-pdf/typescript-config": "workspace:*",
     "@types/node": "^25.9.3",
-    "@vitest/coverage-v8": "^4.1.9",
+    "@vitest/coverage-v8": "^4.1.11",
     "pdfjs-dist": "5.7.284",
     "tsup": "^8.5.1",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=20.0.0"
